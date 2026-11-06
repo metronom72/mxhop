@@ -11,9 +11,12 @@ categories = ["email", "network-programming"]
 
 [dependencies]
 anyhow = "1.0.104"
+arc-swap = "1.9.3"
 clap = { version = "4.6.7", features = ["derive", "env"] }
 hickory-resolver = { version = "0.26.3", default-features = false, features = ["tokio", "system-config"] }
+ring = "0.17.14"
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pki-types = "1.15.1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 thiserror = "2.0.21"
@@ -25,4 +28,4 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 webpki-roots = "1.0.11"
 
 [dev-dependencies]
-rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "pem", "ring"] }
+rcgen = "0.14.10"

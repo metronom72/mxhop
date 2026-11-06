@@ -6,13 +6,15 @@ use clap::{Parser, Subcommand};
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
-use mxhop::config::{self, Config};
+use mxhop::config::{self, Config, Problem};
 use mxhop::dns::Hickory;
 use mxhop::routing::Mailbox;
+use mxhop::server::accept_loop;
 use mxhop::smtp::client::{self, Delivery, Outbound, Tcp, Verdict};
-use mxhop::smtp::session::{self, SessionConfig};
+use mxhop::smtp::session::SessionConfig;
 use mxhop::spool::Spool;
 use mxhop::telemetry;
+use mxhop::tls::Holder;
 
 /// Where the file lives when nobody says otherwise.
 const DEFAULT_CONFIG: &str = "/etc/mxhop/mxhop.toml";
@@ -82,12 +84,7 @@ fn load(cli: &Cli) -> Option<Config> {
     match config::load_file(&cli.config) {
         Ok(config) => Some(config),
         Err(problems) => {
-            for problem in &problems {
-                match problem.line {
-                    Some(line) => eprintln!("{shown}:{line}: {}", problem.message),
-                    None => eprintln!("{shown}: {}", problem.message),
-                }
-            }
+            report(cli, &problems);
             eprintln!(
                 "{shown}: {} {} found",
                 problems.len(),
@@ -103,17 +100,55 @@ fn check(cli: &Cli) -> ExitCode {
         return ExitCode::FAILURE;
     };
 
+    // `check` answers "would `run` start?", and `run` refuses to start on a
+    // certificate it cannot read — so the files are read here too, not just
+    // their paths inspected.
+    let tls = match open_tls(&config) {
+        Ok(tls) => tls,
+        Err(problem) => {
+            report(cli, &[problem]);
+            return ExitCode::FAILURE;
+        }
+    };
+
     let domains: Vec<&str> = config.router.domains().collect();
     println!(
-        "{}: ok — {} on {}, {} {} for {}",
+        "{}: ok — {} on {}, {} {} for {}{}",
         cli.config.display(),
         config.hostname,
         config.listen,
         config.router.alias_count(),
         plural(config.router.alias_count(), "alias", "aliases"),
         domains.join(", "),
+        match &tls {
+            Some(holder) => format!(", STARTTLS with {}", holder.paths().certificate.display()),
+            None => ", no TLS".to_string(),
+        },
     );
     ExitCode::SUCCESS
+}
+
+/// Reads the certificate, if one is configured, and turns a file problem into
+/// a [`Problem`] at the line of the `[tls]` table.
+fn open_tls(config: &Config) -> Result<Option<Arc<Holder>>, Problem> {
+    let Some(paths) = config.tls.clone() else {
+        return Ok(None);
+    };
+    let line = paths.line;
+    Holder::open(paths).map(Some).map_err(|e| Problem {
+        line,
+        message: e.to_string(),
+    })
+}
+
+fn report(cli: &Cli, problems: &[Problem]) {
+    let shown = cli.config.display();
+    for problem in problems {
+        match problem.line {
+            Some(line) => eprintln!("{shown}:{line}: {}", problem.message),
+            None => eprintln!("{shown}: {}", problem.message),
+        }
+    }
 }
 
 async fn run(cli: &Cli) -> ExitCode {
@@ -121,6 +156,19 @@ async fn run(cli: &Cli) -> ExitCode {
         return ExitCode::FAILURE;
     };
     telemetry::init(cli.log.as_deref(), cli.log_json);
+
+    // A `[tls]` block whose files cannot be read stops the service. There is
+    // no previous certificate to fall back to, and starting plaintext-only
+    // would downgrade every sender silently for months — the outage that
+    // looks like silence. An MX that is down for a minute loses nothing:
+    // senders retry.
+    let tls = match open_tls(&config) {
+        Ok(tls) => tls,
+        Err(problem) => {
+            error!("{}", problem.message);
+            return ExitCode::FAILURE;
+        }
+    };
 
     let spool = match Spool::open(&config.spool_dir).await {
         Ok(spool) => Arc::new(spool),
@@ -142,40 +190,77 @@ async fn run(cli: &Cli) -> ExitCode {
     let session_config = Arc::new(SessionConfig::from_config(&config));
     let router = Arc::new(config.router.clone());
     let queued = spool.queued().await.map(|q| q.len()).unwrap_or(0);
+    // The address the listener actually got, not the one that was asked for:
+    // with port 0 they differ, and the honest one is the one a client can
+    // connect to.
+    let address = listener
+        .local_addr()
+        .map_or_else(|_| config.listen.to_string(), |a| a.to_string());
     info!(
-        address = %config.listen,
+        %address,
         hostname = %config.hostname,
         domains = config.router.domains().count(),
         aliases = config.router.alias_count(),
         queued,
+        tls = tls.is_some(),
         "mxhop is accepting mail"
     );
 
-    loop {
-        let (stream, peer) = match listener.accept().await {
-            Ok(accepted) => accepted,
-            Err(e) => {
-                // One failed accept is not a reason to stop serving.
-                warn!("accept failed: {e}");
-                continue;
-            }
-        };
+    if let Some(holder) = tls.clone() {
+        spawn_reload_on_hangup(holder);
+    } else {
+        spawn_reload_on_hangup_without_tls();
+    }
 
-        let session_config = Arc::clone(&session_config);
-        let router = Arc::clone(&router);
-        let spool = Arc::clone(&spool);
-        tokio::spawn(async move {
-            let peer = peer.to_string();
-            match session::serve(stream, peer.clone(), &session_config, &router, &spool).await {
-                Ok(outcome) => info!(
-                    %peer,
-                    accepted = outcome.accepted,
-                    quit = outcome.quit,
-                    "session ended"
+    accept_loop(listener, session_config, router, spool, tls).await;
+    ExitCode::SUCCESS
+}
+
+/// Rereads the certificate on every SIGHUP. Shaped as one call so that the
+/// alias table can join it later: that needs the `Router` behind its own
+/// `ArcSwap` and a policy for a changed `listen` or `spool_dir` mid-run,
+/// which is a task of its own.
+fn spawn_reload_on_hangup(holder: Arc<Holder>) {
+    let Some(mut hangups) = hangups() else {
+        return;
+    };
+    tokio::spawn(async move {
+        while hangups.recv().await.is_some() {
+            match holder.reload() {
+                Ok(fingerprint) => info!(
+                    certificate = %holder.paths().certificate.display(),
+                    sha256 = %fingerprint,
+                    "TLS certificate reloaded; new connections use it"
                 ),
-                Err(e) => warn!(%peer, "session failed: {e}"),
+                // The running service keeps serving: `reload` never stores a
+                // half-built configuration, and a renewal caught mid-write is
+                // a file that will be whole in a second.
+                Err(e) => warn!("TLS reload failed: {e}; keeping the certificate loaded before"),
             }
-        });
+        }
+    });
+}
+
+fn spawn_reload_on_hangup_without_tls() {
+    let Some(mut hangups) = hangups() else {
+        return;
+    };
+    tokio::spawn(async move {
+        while hangups.recv().await.is_some() {
+            info!("SIGHUP: nothing to reload, no [tls] block");
+        }
+    });
+}
+
+fn hangups() -> Option<tokio::signal::unix::Signal> {
+    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+        Ok(signal) => Some(signal),
+        Err(e) => {
+            // Without the handler the default action for SIGHUP would kill the
+            // process, so this is worth saying out loud rather than ignoring.
+            warn!("cannot listen for SIGHUP, so the certificate cannot be reloaded: {e}");
+            None
+        }
     }
 }
 
