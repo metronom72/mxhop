@@ -31,6 +31,19 @@ pub struct Config {
     pub spool_dir: PathBuf,
     pub max_message_bytes: u64,
     pub router: Router,
+    /// Where the certificate lives, when one is configured at all. Absent
+    /// means plaintext only, which is a supported way to run an MX.
+    pub tls: Option<TlsPaths>,
+}
+
+/// The two PEM files, and the line of the `[tls]` table so that a problem
+/// found when they are *read* — which happens outside `load_str` — can still
+/// be reported where the operator typed it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsPaths {
+    pub certificate: PathBuf,
+    pub key: PathBuf,
+    pub line: Option<usize>,
 }
 
 /// One thing wrong with the file, and where.
@@ -122,6 +135,27 @@ pub fn load_str(src: &str) -> Result<Config, Vec<Problem>> {
         }
         Some(v) => *v.get_ref(),
     };
+
+    let tls = raw.tls.as_ref().map(|tls| {
+        for (what, path) in [("certificate", &tls.certificate), ("key", &tls.key)] {
+            if !path.get_ref().is_absolute() {
+                problems.push(at(
+                    src,
+                    path.span(),
+                    format!(
+                        "tls.{what} must be an absolute path: {} is read again on SIGHUP, \
+                         from whatever directory the service is in by then",
+                        path.get_ref().display()
+                    ),
+                ));
+            }
+        }
+        TlsPaths {
+            certificate: tls.certificate.get_ref().clone(),
+            key: tls.key.get_ref().clone(),
+            line: line_of_text(src, "[tls]"),
+        }
+    });
 
     if raw.domains.is_empty() {
         problems.push(Problem {
@@ -270,6 +304,7 @@ pub fn load_str(src: &str) -> Result<Config, Vec<Problem>> {
         spool_dir,
         max_message_bytes,
         router,
+        tls,
     })
 }
 
@@ -384,6 +419,14 @@ struct Raw {
     max_message_bytes: Option<Spanned<u64>>,
     #[serde(default)]
     domains: BTreeMap<String, RawDomain>,
+    tls: Option<RawTls>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTls {
+    certificate: Spanned<PathBuf>,
+    key: Spanned<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -869,5 +912,55 @@ hi = "me-at-gmail.com"
         assert_eq!(found.len(), 1);
         assert!(found[0].message.contains("cannot be read"), "{found:#?}");
         assert_eq!(found[0].line, None, "there is no line to point at");
+    }
+
+    /// TLS is opportunistic: an MX that refused plaintext would lose mail, and
+    /// a configuration without a `[tls]` block has to stay a valid one.
+    #[test]
+    fn a_tls_block_is_optional() {
+        let c = load_str(MINIMAL).expect("minimal configuration should load");
+        assert!(c.tls.is_none());
+    }
+
+    #[test]
+    fn a_tls_block_is_read_with_the_line_it_is_on() {
+        let src = format!(
+            "{MINIMAL}\n[tls]\ncertificate = \"/etc/ssl/mx.crt\"\nkey = \"/etc/ssl/mx.key\"\n"
+        );
+        let c = load_str(&src).expect("a tls block should load");
+        let tls = c.tls.expect("tls should be configured");
+
+        assert_eq!(tls.certificate, PathBuf::from("/etc/ssl/mx.crt"));
+        assert_eq!(tls.key, PathBuf::from("/etc/ssl/mx.key"));
+        assert_eq!(
+            tls.line,
+            Some(line_with(&src, "[tls]")),
+            "a file problem found later has to be reportable at a line"
+        );
+    }
+
+    /// A relative path works at startup and then breaks on the first SIGHUP,
+    /// because the reload reads it again from whatever directory systemd left
+    /// the service in.
+    #[test]
+    fn tls_paths_must_be_absolute() {
+        let src = format!("{MINIMAL}\n[tls]\ncertificate = \"mx.crt\"\nkey = \"mx.key\"\n");
+        let found = problems(&src);
+
+        assert_eq!(found.len(), 2, "both paths are wrong: {found:#?}");
+        assert!(found[0].contains("tls.certificate"), "{}", found[0]);
+        assert!(found[0].contains("read again on SIGHUP"), "{}", found[0]);
+        assert!(found[1].contains("tls.key"), "{}", found[1]);
+    }
+
+    #[test]
+    fn a_tls_block_needs_both_files() {
+        let src = format!("{MINIMAL}\n[tls]\ncertificate = \"/etc/ssl/mx.crt\"\n");
+        let p = only_problem(&src);
+
+        assert!(
+            p.contains("key"),
+            "a certificate without its key cannot serve a handshake: {p}"
+        );
     }
 }
