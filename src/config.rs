@@ -30,6 +30,7 @@ pub struct Config {
     pub listen: SocketAddr,
     pub spool_dir: PathBuf,
     pub max_message_bytes: u64,
+    pub outbound: Outbound,
     pub router: Router,
     /// Where the certificate lives, when one is configured at all. Absent
     /// means plaintext only, which is a supported way to run an MX.
@@ -44,6 +45,16 @@ pub struct TlsPaths {
     pub certificate: PathBuf,
     pub key: PathBuf,
     pub line: Option<usize>,
+}
+
+/// How mxhop hands mail on. Everything here has a default that is safe to
+/// leave alone, which is why the whole table is optional.
+#[derive(Debug, Clone, Default)]
+pub struct Outbound {
+    /// Whether to deliver over IPv6 to a host that also has an A record.
+    /// Off by default: receivers check the sender's reverse DNS, and a
+    /// VPS's IPv6 PTR record is the one nobody sets up.
+    pub ipv6: bool,
 }
 
 /// One thing wrong with the file, and where.
@@ -303,6 +314,9 @@ pub fn load_str(src: &str) -> Result<Config, Vec<Problem>> {
         listen: listen.expect("checked above"),
         spool_dir,
         max_message_bytes,
+        outbound: Outbound {
+            ipv6: raw.outbound.is_some_and(|o| o.ipv6),
+        },
         router,
         tls,
     })
@@ -417,6 +431,7 @@ struct Raw {
     listen: Spanned<String>,
     spool_dir: Spanned<PathBuf>,
     max_message_bytes: Option<Spanned<u64>>,
+    outbound: Option<RawOutbound>,
     #[serde(default)]
     domains: BTreeMap<String, RawDomain>,
     tls: Option<RawTls>,
@@ -427,6 +442,13 @@ struct Raw {
 struct RawTls {
     certificate: Spanned<PathBuf>,
     key: Spanned<PathBuf>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawOutbound {
+    #[serde(default)]
+    ipv6: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -516,6 +538,37 @@ hi = "me@gmail.com"
         assert_eq!(c.spool_dir, PathBuf::from("/var/lib/mxhop/spool"));
         assert_eq!(c.max_message_bytes, DEFAULT_MAX_MESSAGE_BYTES);
         assert!(c.router.route("example.com", "hi").is_some());
+    }
+
+    #[test]
+    fn outbound_delivery_stays_on_ipv4_unless_the_file_says_otherwise() {
+        // Gmail answers an IPv6 sender whose PTR does not match with
+        // 550-5.7.25, so the safe setting is the one an operator gets by not
+        // mentioning it.
+        assert!(!load_str(MINIMAL).expect("the minimal file").outbound.ipv6);
+    }
+
+    #[test]
+    fn outbound_ipv6_can_be_turned_on() {
+        let src = format!("{MINIMAL}\n[outbound]\nipv6 = true\n");
+        assert!(
+            load_str(&src)
+                .expect("ipv6 = true should load")
+                .outbound
+                .ipv6
+        );
+    }
+
+    #[test]
+    fn a_misspelled_outbound_key_is_refused_rather_than_ignored() {
+        // A setting silently ignored because of a typo is the worst kind:
+        // the operator believes IPv6 is off, and it is.
+        let src = format!("{MINIMAL}\n[outbound]\nipv_6 = true\n");
+        assert!(
+            only_problem(&src).contains("ipv_6"),
+            "{}",
+            only_problem(&src)
+        );
     }
 
     #[test]
