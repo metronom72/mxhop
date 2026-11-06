@@ -581,11 +581,29 @@ where
     let verdict = policy::reply_for(&outcomes, &envelope.id);
     let delivered = (200..300).contains(&verdict.reply.code);
 
+    // Every copy that is being thrown away, named one line at a time. The
+    // sending server has been told 250 and cannot be told otherwise, and
+    // there is no DSN generator yet, so this log line is the only record
+    // these recipients' mail ever existed — one line each rather than a
+    // count, because an operator asked "did my mail to b@ arrive?" has to be
+    // able to grep for `b@`.
+    for (mailbox, reply) in &verdict.lost {
+        error!(
+            %peer,
+            id = %envelope.id,
+            recipient = %mailbox,
+            "this copy was permanently refused and is lost: part of the message was \
+             delivered, so the sending server was told 250 and will not send it again, \
+             and mxhop cannot send a bounce of its own yet: {reply}"
+        );
+    }
+
     if verdict.hold.is_empty() {
         info!(
             %peer,
             id = %envelope.id,
             domains = plan.groups.len(),
+            lost = verdict.lost.len(),
             "relayed: {}",
             verdict.reply
         );
@@ -596,9 +614,24 @@ where
     // again — which makes the rest ours. It is written to the spool before
     // the 250 goes out, in that order: a crash in between then leaves the
     // sending server still holding the message rather than nobody holding it.
+    // One reason per held recipient, in the same order as `to`: two
+    // recipients at two hosts are stuck for two different reasons, and an
+    // operator reading the sidecar has to be able to tell which belongs to
+    // which.
     let held = Envelope {
-        to: verdict.hold.iter().map(ToString::to_string).collect(),
-        last_reply: verdict.held_reason.as_ref().map(ToString::to_string),
+        to: verdict
+            .hold
+            .iter()
+            .map(|(mailbox, _)| mailbox.to_string())
+            .collect(),
+        last_reply: Some(
+            verdict
+                .hold
+                .iter()
+                .map(|(mailbox, reply)| format!("{mailbox}: {reply}"))
+                .collect::<Vec<_>>()
+                .join("; "),
+        ),
         ..envelope.clone()
     };
     match spool.store(&held, &body).await {
@@ -611,10 +644,7 @@ where
             held = held.to.join(", "),
             "part of the message was not delivered and is held in the queue with no \
              retry: {}",
-            verdict
-                .held_reason
-                .as_ref()
-                .map_or_else(|| "no reason recorded".to_string(), ToString::to_string)
+            held.last_reply.as_deref().unwrap_or("no reason recorded")
         ),
         // The sender is still told 250: the copies that did arrive have
         // arrived, and asking for the message again would deliver those

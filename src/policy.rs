@@ -336,12 +336,24 @@ pub struct Verdict {
     /// The single reply the sending server reads.
     pub reply: Reply,
     /// The recipients whose copy has not been delivered and has not been
-    /// refused either, so the message has to be kept for them.
-    pub hold: Vec<Mailbox>,
-    /// What the destination said about the held recipients, for the operator
-    /// reading `queue/` and for the envelope's own record. Nothing acts on
-    /// it: there is no retry queue yet.
-    pub held_reason: Option<Reply>,
+    /// refused either, so the message has to be kept for them — each with
+    /// what its own destination said, for the operator reading `queue/` and
+    /// for the envelope's own record. Nothing acts on it: there is no retry
+    /// queue yet.
+    ///
+    /// One reply per recipient rather than one for the batch: two held
+    /// recipients at two hosts are stuck for two different reasons, and the
+    /// operator looking at one of them needs that one's answer.
+    pub hold: Vec<(Mailbox, Reply)>,
+    /// The recipients whose copy is being thrown away: permanently refused in
+    /// a mixed outcome, where the sending server has already been told 250
+    /// and cannot be told otherwise. Each with the destination's own reply,
+    /// because that sentence is the only record this copy will ever have.
+    ///
+    /// Held in neither sense of the word — `hold` is for copies somebody may
+    /// still deliver. These are gone; the caller's job is to say so loudly
+    /// enough that the loss is findable afterwards.
+    pub lost: Vec<(Mailbox, Reply)>,
 }
 
 /// Collapses every destination's answer into the one reply SMTP allows.
@@ -374,17 +386,33 @@ pub fn reply_for(outcomes: &[Outcome], id: &str) -> Verdict {
         // the retry-queue milestone picks them up. Permanently refused ones
         // are a known hole: the sender has been told 250 and cannot be told
         // otherwise, and only a DSN of our own could report the failure.
-        // There is no DSN generator yet, so those copies are lost — logged at
-        // error level by the caller, and not papered over here by pretending
-        // a 550 is retryable.
+        // There is no DSN generator yet, so those copies are lost — but they
+        // come back in `lost` so the caller can name each one at error level,
+        // rather than being dropped on the floor here and not papered over by
+        // pretending a 550 is retryable either.
+        //
+        // A judgement call: the alternative was to put them in `queue/` with
+        // their 550 in `last_reply`, which would make the loss visible to
+        // `ls` instead of only to a log. It was not taken because `queue/`
+        // has no way to mark an entry as not-to-be-retried, so the
+        // retry-queue milestone — which exists to drain that directory —
+        // would pick these up and retry a permanent refusal for ever. A
+        // directory whose entries mean two opposite things is worse than a
+        // log line, and the loss stays findable either way.
         return Verdict {
             reply: Reply {
                 code: 250,
                 enhanced: Some("2.0.0".into()),
                 text: format!("delivered as {id}"),
             },
-            hold: deferred.iter().map(|(_, _, m)| (*m).clone()).collect(),
-            held_reason: deferred.first().map(|(_, reply, _)| (*reply).clone()),
+            hold: deferred
+                .iter()
+                .map(|(_, reply, m)| ((*m).clone(), (*reply).clone()))
+                .collect(),
+            lost: refused
+                .iter()
+                .map(|(_, reply, m)| ((*m).clone(), (*reply).clone()))
+                .collect(),
         };
     }
 
@@ -400,10 +428,20 @@ pub fn reply_for(outcomes: &[Outcome], id: &str) -> Verdict {
             (false, true) => 1,
         }
     };
-    let best = refused
-        .iter()
-        .chain(deferred.iter())
-        .max_by_key(|entry| worth(entry));
+    // When nothing is undecided the code follows the sentence, so the most
+    // informative reply of all of them is the right one. When something *is*
+    // undecided the code is forced down to 4xx (below), and then only a
+    // deferral's sentence can agree with it: a 451 quoting `no such user`
+    // tells the sender to retry something that will never be accepted. The
+    // permanent sentence is dropped rather than added as a second line
+    // because it belongs to a recipient the sender cannot help by retrying,
+    // which is the only thing a 4xx asks them to do; the copy it belongs to
+    // is reported through `lost` instead.
+    let best = if deferred.is_empty() {
+        refused.iter().max_by_key(|entry| worth(entry))
+    } else {
+        deferred.iter().max_by_key(|entry| worth(entry))
+    };
 
     let reply = match best {
         None => Reply {
@@ -450,7 +488,7 @@ pub fn reply_for(outcomes: &[Outcome], id: &str) -> Verdict {
     Verdict {
         reply,
         hold: Vec::new(),
-        held_reason: None,
+        lost: Vec::new(),
     }
 }
 
@@ -1156,18 +1194,64 @@ mod tests {
             verdict
                 .hold
                 .iter()
-                .map(ToString::to_string)
+                .map(|(mailbox, _)| mailbox.to_string())
                 .collect::<Vec<_>>(),
             vec!["b@fast.test"]
+        );
+    }
+
+    /// Two held recipients at two different hosts have two different
+    /// reasons, and the operator reading `queue/` needs the one belonging to
+    /// the recipient in front of them. Keeping only the first deferral's
+    /// reply meant the second host's answer never reached the envelope, so a
+    /// message stuck for two unrelated causes looked stuck for one.
+    #[test]
+    fn each_held_recipient_keeps_its_own_reason() {
+        let verdict = reply_for(
+            &[
+                outcome(
+                    "mx.gmail.test",
+                    &[("a@gmail.test", client::Verdict::Accepted)],
+                ),
+                outcome(
+                    "mx.fast.test",
+                    &[(
+                        "b@fast.test",
+                        client::Verdict::Deferred(their(451, "4.3.2", "mailbox is busy")),
+                    )],
+                ),
+                outcome(
+                    "mx.slow.test",
+                    &[(
+                        "c@slow.test",
+                        client::Verdict::Deferred(their(421, "4.4.5", "disk is full")),
+                    )],
+                ),
+            ],
+            "an-id",
+        );
+
+        assert_eq!(
+            verdict
+                .hold
+                .iter()
+                .map(|(mailbox, reply)| format!("{mailbox}: {reply}"))
+                .collect::<Vec<_>>(),
+            vec![
+                "b@fast.test: 451 4.3.2 mailbox is busy",
+                "c@slow.test: 421 4.4.5 disk is full",
+            ]
         );
     }
 
     /// A permanent refusal in a mixed outcome is the known hole: the sender
     /// has been told 250, so only a DSN of our own could report it, and there
     /// is no DSN generator yet. It must not be held — retrying a 550 forever
-    /// is worse — so it is dropped, loudly.
+    /// is worse — but the copy that is thrown away has to be *named*, with
+    /// the destination's own sentence, or the loss leaves no trace anywhere
+    /// and there is nothing for anyone to find afterwards.
     #[test]
-    fn a_refusal_in_a_mixed_outcome_is_not_held() {
+    fn a_refusal_in_a_mixed_outcome_is_named_as_lost() {
         let verdict = reply_for(
             &[
                 outcome(
@@ -1190,11 +1274,26 @@ mod tests {
             verdict.hold.is_empty(),
             "a permanently refused recipient is not retried, it is lost until DSNs exist"
         );
+        assert_eq!(
+            verdict
+                .lost
+                .iter()
+                .map(|(mailbox, reply)| format!("{mailbox}: {reply}"))
+                .collect::<Vec<_>>(),
+            vec!["b@fast.test: 550 5.1.1 no such user"],
+            "the recipient and the destination's own words, because this copy is \
+             about to be thrown away and these are the only record of it"
+        );
     }
 
     /// When several destinations refuse, the sender gets one sentence. The
-    /// one worth sending is the one that says something: a 550 from the
-    /// destination beats a 451 we wrote ourselves.
+    /// one worth sending is the one that says something: a destination's own
+    /// refusal beats a deferral mxhop wrote for itself when nothing answered.
+    ///
+    /// Both recipients are refused, so there is nothing undecided and the
+    /// code is free to follow the sentence. Written with one of them deferred
+    /// this test demanded the contradiction `a_downgraded_code_does_not_carry_
+    /// a_permanent_sentence` exists to forbid.
     #[test]
     fn the_most_informative_refusal_is_the_one_relayed() {
         let verdict = reply_for(
@@ -1203,7 +1302,7 @@ mod tests {
                     "mx.a.test",
                     &[(
                         "a@gmail.test",
-                        client::Verdict::Deferred(their(451, "4.4.1", "mxhop: nobody answered")),
+                        client::Verdict::Refused(their(550, "5.0.0", "mxhop: nobody answered")),
                     )],
                 ),
                 outcome(
@@ -1217,13 +1316,57 @@ mod tests {
             "an-id",
         );
 
-        assert_eq!(
-            verdict.reply.code, 451,
-            "one deferral means the whole message is still retryable"
-        );
+        assert_eq!(verdict.reply.code, 550);
         assert!(
             verdict.reply.text.contains("we do not like you"),
             "the destination's own sentence is the informative one: {}",
+            verdict.reply
+        );
+        assert!(
+            verdict.reply.text.contains("mx.b.test said"),
+            "and it is attributed, or the sender cannot tell our words from theirs: {}",
+            verdict.reply
+        );
+    }
+
+    /// A 451 must not carry a sentence that says never. When the code is
+    /// forced down to 4xx by an undecided recipient, the sender's only
+    /// possible action is to retry, and relaying a permanent refusal's words
+    /// under it tells them to retry something that will never be accepted —
+    /// `451 4.4.1 ... said: no such user` reads as a contradiction and
+    /// Postfix's own log line repeats it to the postmaster that way.
+    #[test]
+    fn a_downgraded_code_does_not_carry_a_permanent_sentence() {
+        let verdict = reply_for(
+            &[
+                outcome(
+                    "mx.a.test",
+                    &[(
+                        "a@gmail.test",
+                        client::Verdict::Refused(their(550, "5.1.1", "no such user")),
+                    )],
+                ),
+                outcome(
+                    "mx.b.test",
+                    &[(
+                        "b@fast.test",
+                        client::Verdict::Deferred(their(451, "4.3.2", "greylisted, come back")),
+                    )],
+                ),
+            ],
+            "an-id",
+        );
+
+        assert_eq!(verdict.reply.code, 451);
+        assert!(
+            verdict.reply.text.contains("greylisted"),
+            "the sentence has to be one that a retry can satisfy: {}",
+            verdict.reply
+        );
+        assert!(
+            !verdict.reply.text.contains("no such user"),
+            "the permanent sentence belongs to a recipient the sender cannot help \
+             by retrying, and under a 451 it only contradicts the code: {}",
             verdict.reply
         );
     }
