@@ -17,7 +17,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::time::timeout;
 use tokio_rustls::TlsAcceptor;
-use tracing::{error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
 use crate::envelope::{Envelope, now_unix_ms};
@@ -309,7 +309,7 @@ where
             Ok(command) => command,
             Err(e) => {
                 say(reader.get_mut(), &e.to_string()).await?;
-                if too_many_errors(reader, state, config).await? {
+                if too_many_errors(reader, state, config, peer).await? {
                     return Ok(Step::Done);
                 }
                 continue;
@@ -354,7 +354,7 @@ where
                     say(reader.get_mut(), "503 5.5.1 TLS is already active").await?;
                 } else if tls.is_none() {
                     say(reader.get_mut(), "502 5.5.1 STARTTLS is not offered here").await?;
-                    if too_many_errors(reader, state, config).await? {
+                    if too_many_errors(reader, state, config, peer).await? {
                         return Ok(Step::Done);
                     }
                 } else {
@@ -385,6 +385,38 @@ where
                         ),
                     )
                     .await?;
+                } else if let Some(problem) = srs
+                    .zip(sender.as_deref())
+                    .and_then(|(srs, from)| srs.wrappable(from).err())
+                {
+                    // Refused here, not forwarded unprotected. `command`
+                    // accepts addresses `Mailbox::parse` does not —
+                    // `bob@localhost`, `user@[192.0.2.1]`, `"a b"@x.test` —
+                    // and with SRS configured those used to be accepted,
+                    // found unwrappable at the final dot, and handed to the
+                    // destination with the original sender intact: the SPF
+                    // failure and the backscatter path SRS exists to remove,
+                    // silently, on exactly the addresses nobody tests with.
+                    //
+                    // A refusal at `MAIL FROM` is the strict choice and it is
+                    // the right one, because the sending server is still
+                    // holding the message: it gets a sentence it can report
+                    // to whoever wrote it, rather than a message delivered to
+                    // junk and a bounce sent to a stranger. The senders this
+                    // affects are ones mxhop could never have protected.
+                    //
+                    // Only when SRS is configured: without an `[srs]` table
+                    // there is nothing to rewrite, and an operator who never
+                    // asked for SRS must not get a stricter MX than they had.
+                    say(
+                        reader.get_mut(),
+                        &format!(
+                            "550 5.1.7 sender {} {problem}, and mail from it cannot be \
+                             forwarded with a rewritten envelope sender",
+                            sender.as_deref().unwrap_or("<>")
+                        ),
+                    )
+                    .await?;
                 } else {
                     state.from = Some(sender);
                     state.recipients.clear();
@@ -405,7 +437,30 @@ where
                     .await?;
                 } else {
                     let reply = decide_recipient(router, srs, &address, &mut state.recipients);
+                    let refused = reply.starts_with('5');
                     say(reader.get_mut(), &reply).await?;
+                    // A refused recipient costs the client an error, like
+                    // every other refusal. It did not, and that made the SRS
+                    // domain a relay with a two-minute setup time: guessing
+                    // the MAC is an online attack, one guess per `RCPT TO`,
+                    // and 20 000 pipelined guesses in one session drew 20 000
+                    // refusals, no disconnect, and 380 000 guesses a second
+                    // against the release binary — the whole 38^4 space of a
+                    // four-character MAC in seconds. postsrsd has the same
+                    // MAC length and survives because Postfix's
+                    // `smtpd_hard_error_limit`, `smtpd_error_sleep_time` and
+                    // anvil are in front of it; mxhop has this counter.
+                    //
+                    // The same counter bounds the older and quieter attack:
+                    // reading an alias table by guessing names at a domain in
+                    // `[domains]`, where every guess was likewise free.
+                    //
+                    // `5` and not `4`: a 452 means mxhop's own per-message
+                    // recipient cap, which is our limit and not the client's
+                    // mistake, and the client is being asked to come back.
+                    if refused && too_many_errors(reader, state, config, peer).await? {
+                        return Ok(Step::Done);
+                    }
                 }
             }
 
@@ -493,7 +548,7 @@ where
 
             Command::Unknown(_) => {
                 say(reader.get_mut(), "500 5.5.2 command not recognised").await?;
-                if too_many_errors(reader, state, config).await? {
+                if too_many_errors(reader, state, config, peer).await? {
                     return Ok(Step::Done);
                 }
             }
@@ -590,23 +645,72 @@ where
     // rule about who a message is copied to stays a pure function of its
     // arguments, and this is the one decision that does not fit that.
     //
-    // `rewrite` returning `None` means "leave it exactly as it is", which is
-    // the null sender and an address already at our own SRS domain.
-    let sender = match srs {
-        Some(srs) => match srs.rewrite(plan.sender.as_deref(), crate::srs::today()) {
+    // Written as three arms rather than as `rewrite(...).unwrap_or(sender)`,
+    // because the comment that said `None` meant "the null sender or our own
+    // domain" was not true: `rewrite` also returns `None` for a sender
+    // `Mailbox::parse` refuses, and that case was silently forwarded
+    // unprotected. Each `None` now has a name.
+    let sender = match (srs, plan.sender.as_deref()) {
+        // No `[srs]` table: the sender goes out exactly as it arrived, which
+        // is what every deployment that never configured SRS expects.
+        (None, _) => plan.sender.clone(),
+
+        // The null sender. A bounce has nothing to rewrite and must acquire
+        // nothing: an address in a bounce's envelope is an address that
+        // bounce can itself be bounced to.
+        (Some(_), None) => None,
+
+        (Some(srs), Some(from)) => match srs.rewrite(Some(from), crate::srs::today()) {
             Some(rewritten) => {
                 info!(
                     id = %envelope.id,
-                    from = %plan.sender.as_deref().unwrap_or("<>"),
+                    from = %from,
                     srs = %rewritten,
                     "rewrote the envelope sender so the destination's SPF check \
                      is made against a domain that names this host"
                 );
+                // See `Srs::rewrite`: an over-long wrapped sender is sent
+                // anyway rather than dropped or truncated, because the
+                // alternative is the SPF failure and backscatter this exists
+                // to remove. The decision is deliberate, so the one thing it
+                // must not be is invisible — a receiver that refuses the
+                // length answers the `MAIL FROM`, and this is the line that
+                // says which sender it was.
+                let local = rewritten.rsplit_once('@').map_or("", |(l, _)| l);
+                if local.len() > crate::srs::MAX_LOCAL_PART_OCTETS {
+                    warn!(
+                        id = %envelope.id,
+                        srs = %rewritten,
+                        octets = local.len(),
+                        limit = crate::srs::MAX_LOCAL_PART_OCTETS,
+                        "the rewritten sender's local part is longer than a receiver \
+                         is obliged to accept; a destination that refuses it will \
+                         refuse this MAIL FROM"
+                    );
+                }
                 Some(rewritten)
             }
-            None => plan.sender.clone(),
+            // One case left, and only one: a sender already at our own SRS
+            // domain, which is left alone because wrapping it again adds a
+            // layer per hop until the local part stops being an address. A
+            // sender that is not a `Mailbox` cannot reach here — the
+            // `MAIL FROM` arm refuses it while the sending server still holds
+            // the message — and the `warn` is there because if that ever
+            // stops being true, this is the bug that hands a destination an
+            // unprotected sender, and last time it did so in silence.
+            None => {
+                if !srs.is_ours(from.rsplit_once('@').map_or("", |(_, d)| d)) {
+                    warn!(
+                        id = %envelope.id,
+                        from = %from,
+                        "handing on a sender mxhop could not wrap: it should have been \
+                         refused at MAIL FROM, and the destination will now check SPF \
+                         against a domain that does not name this host"
+                    );
+                }
+                Some(from.to_string())
+            }
         },
-        None => plan.sender.clone(),
     };
 
     // One `Arc` for every group: the body is handed to each delivery without
@@ -743,12 +847,23 @@ async fn too_many_errors<S>(
     reader: &mut BufReader<S>,
     state: &mut State,
     config: &SessionConfig,
+    peer: &str,
 ) -> Result<bool, WireError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     state.errors += 1;
     if state.errors >= config.max_errors {
+        // One line per cut session, naming the peer, at `warn`. This is the
+        // line an operator looking for a sweep should be able to find: the
+        // per-address refusals are at `debug` precisely because a sweep is
+        // thousands of them, and the single line that says a session was cut
+        // off is both rarer and the one worth a firewall rule.
+        warn!(
+            peer = %peer,
+            errors = state.errors,
+            "cutting the session off after too many refused commands"
+        );
         say(reader.get_mut(), "421 4.7.0 too many errors, goodbye").await?;
         return Ok(true);
     }
@@ -790,11 +905,27 @@ fn decide_recipient(
                 "250 2.1.5 recipient accepted".to_string()
             }
             Err(refusal) => {
-                // Worth a line at info: this is either a real bounce arriving
-                // after the window, which is mail somebody loses, or somebody
-                // trying the SRS domain as an open relay. An operator cannot
-                // tell those apart without the reason.
-                info!(srs = %address, "refusing an address at the srs domain: {refusal}");
+                // Two levels, because the two cases are different kinds of
+                // news. An expired address is a real bounce arriving after
+                // the window — mail somebody loses, nobody is told about, and
+                // an operator can only find in this log — so it gets `info`,
+                // one line, and the address.
+                //
+                // Everything else is a forgery or a guess, and a sweep is
+                // thousands of them in one session: at `info` that is
+                // thousands of lines in which the operator's own mail is
+                // buried, and a log that fills a disk is an outage an
+                // attacker chose. Those go to `debug`, where the one line
+                // worth reading is the `warn` from `too_many_errors` naming
+                // the peer whose session was cut off.
+                match refusal {
+                    crate::srs::Refusal::Expired => {
+                        info!(srs = %address, "refusing an address at the srs domain: {refusal}")
+                    }
+                    _ => {
+                        debug!(srs = %address, "refusing an address at the srs domain: {refusal}")
+                    }
+                }
                 refusal.reply().to_string()
             }
         };
@@ -1114,6 +1245,15 @@ mod tests {
             .unwrap();
         // One character of the MAC, flipped. Everything else about the
         // address is exactly what we would have issued.
+        //
+        // The MAC runs from index 5 to the next `=`, and the index flipped
+        // below has to land inside it or the test proves nothing about the
+        // signature. Asserted rather than trusted, because the MAC's length
+        // has been changed once already.
+        assert!(
+            honest[5..].find('=').expect("a MAC terminator") + 5 > 6,
+            "index 6 has to be inside the MAC of {honest}"
+        );
         let mut forged: Vec<char> = honest.chars().collect();
         forged[6] = if forged[6] == 'A' { 'B' } else { 'A' };
         let forged: String = forged.into_iter().collect();
@@ -1190,6 +1330,123 @@ mod tests {
             seen[0].from, None,
             "and it keeps its own null sender: a bounce that acquired one \
              could be bounced again"
+        );
+    }
+
+    /// **The rate-limit test.** A refused `RCPT` has to cost the client
+    /// something, because guessing an SRS MAC is an online attack and a
+    /// refused `RCPT` is one guess. Before this, 20 000 pipelined guesses in
+    /// a single session drew 20 000 × 550 and no disconnect — measured
+    /// against the release binary at 380 000 guesses a second. The same count
+    /// also bounds the older alias dictionary attack, where every guess at a
+    /// name in `[domains]` was likewise free.
+    #[tokio::test]
+    async fn a_session_that_collects_max_errors_refused_recipients_is_disconnected() {
+        let srs = test_srs();
+        // Four is `max_errors` in the test config; the fourth refusal is the
+        // one that trips it.
+        let talk = talk_srs(
+            &srs,
+            "EHLO mail.elsewhere.test\r\n\
+             MAIL FROM:<>\r\n\
+             RCPT TO:<SRS0=aaaaaaaa=AA=victim.test=one@srs.mx.test>\r\n\
+             RCPT TO:<SRS0=bbbbbbbb=AA=victim.test=two@srs.mx.test>\r\n\
+             RCPT TO:<SRS0=cccccccc=AA=victim.test=three@srs.mx.test>\r\n\
+             RCPT TO:<SRS0=dddddddd=AA=victim.test=four@srs.mx.test>\r\n\
+             RCPT TO:<SRS0=eeeeeeee=AA=victim.test=five@srs.mx.test>\r\n\
+             QUIT\r\n",
+        )
+        .await;
+
+        assert_eq!(
+            talk.codes(),
+            vec!["220", "250", "250", "550", "550", "550", "550", "421"],
+            "the fourth refused recipient has to end the session, \
+             not earn a fifth guess: {}",
+            talk.out
+        );
+        assert!(
+            talk.relay.seen.lock().unwrap().is_empty(),
+            "and nothing may leave this host"
+        );
+    }
+
+    /// The other side of the limit: an ordinary sender who typos one address
+    /// out of several must not be cut off. The error limit is there to make a
+    /// sweep expensive, and a sweep is not three mistakes.
+    #[tokio::test]
+    async fn refusals_below_the_limit_do_not_end_the_session() {
+        let talk = talk(
+            "EHLO mail.elsewhere.test\r\n\
+             MAIL FROM:<sender@elsewhere.test>\r\n\
+             RCPT TO:<nobody@example.com>\r\n\
+             RCPT TO:<also-nobody@example.com>\r\n\
+             RCPT TO:<hi@example.com>\r\n\
+             QUIT\r\n",
+        )
+        .await;
+
+        assert_eq!(
+            talk.codes(),
+            vec!["220", "250", "250", "550", "550", "250", "221"],
+            "two refusals under a limit of four must leave the session alone, \
+             and the good recipient after them must still be accepted: {}",
+            talk.out
+        );
+    }
+
+    /// A sender mxhop cannot wrap is refused while the sending server still
+    /// holds the message.
+    ///
+    /// `command::address` is looser than `Mailbox::parse`: it takes
+    /// `bob@localhost`, an address literal and a quoted local part, and
+    /// `Mailbox::parse` takes none of the three. Accepting one of those with
+    /// SRS configured used to hand the destination the original sender —
+    /// exactly the SPF failure and the backscatter path SRS exists to remove
+    /// — and logged nothing at all.
+    #[tokio::test]
+    async fn a_sender_that_cannot_be_wrapped_is_refused_at_mail_from() {
+        let srs = test_srs();
+        for sender in ["bob@localhost", "user@[192.0.2.1]", "\"a b\"@x.test"] {
+            let talk = talk_srs(
+                &srs,
+                &format!(
+                    "EHLO mail.elsewhere.test\r\n\
+                     MAIL FROM:<{sender}>\r\n\
+                     RCPT TO:<hi@example.com>\r\n\
+                     QUIT\r\n"
+                ),
+            )
+            .await;
+
+            assert_eq!(
+                talk.codes(),
+                vec!["220", "250", "550", "503", "221"],
+                "{sender} cannot be rewritten, so it has to be refused here \
+                 rather than forwarded unprotected: {}",
+                talk.out
+            );
+        }
+    }
+
+    /// And the refusal is only SRS's to make: without an `[srs]` table there
+    /// is no rewriting to fail, so an operator who never configured SRS does
+    /// not get a stricter MX than they had.
+    #[tokio::test]
+    async fn without_srs_an_unwrappable_sender_is_still_accepted() {
+        let talk = talk(
+            "EHLO mail.elsewhere.test\r\n\
+             MAIL FROM:<bob@localhost>\r\n\
+             RCPT TO:<hi@example.com>\r\n\
+             QUIT\r\n",
+        )
+        .await;
+
+        assert_eq!(
+            talk.codes(),
+            vec!["220", "250", "250", "250", "221"],
+            "{}",
+            talk.out
         );
     }
 
