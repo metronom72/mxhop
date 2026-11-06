@@ -384,8 +384,12 @@ pub fn open(settings: &crate::config::SrsSettings) -> Result<Srs, String> {
             settings.secret_file.display()
         )
     })?;
-    let keys = Srs::keys_from(&contents)
-        .map_err(|e| format!("the srs secret file {} {e}", settings.secret_file.display()))?;
+    let keys = Srs::keys_from(&contents).map_err(|e| {
+        format!(
+            "the srs secret file {}: {e}",
+            settings.secret_file.display()
+        )
+    })?;
     Ok(Srs::new(&settings.domain, keys, settings.max_age_days))
 }
 
