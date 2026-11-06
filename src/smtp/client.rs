@@ -123,7 +123,7 @@ impl Delivery {
 /// because mxhop writes its own code in front of a text that already had one
 /// lifted out of it, and a verbose destination's single line can exceed RFC
 /// 5321's 512-octet limit outright.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Reply {
     pub code: u16,
     /// The enhanced status code (RFC 3463), when the destination sent one.
@@ -135,19 +135,6 @@ pub struct Reply {
     /// too, so there is nothing to keep.
     pub lines: Vec<String>,
 }
-
-/// Two replies are the same reply when they say the same thing with the same
-/// code. `lines` is left out on purpose: it is the same sentence as `text`,
-/// kept separately only so that it can be re-folded on the way out, and a
-/// derived equality would make two replies that read identically compare
-/// unequal over where their line breaks fell.
-impl PartialEq for Reply {
-    fn eq(&self, other: &Self) -> bool {
-        self.code == other.code && self.enhanced == other.enhanced && self.text == other.text
-    }
-}
-
-impl Eq for Reply {}
 
 impl Reply {
     fn is_positive(&self) -> bool {
@@ -1030,6 +1017,35 @@ where
             return Ok(results);
         }
 
+        // The last moment at which a deferral is honest. Everything after
+        // DATA is past the point of no return: the body goes on the wire, and
+        // if what is left of this message's shared deadline then runs out
+        // before the final dot is answered, `Fail::Spent` defers a message
+        // the destination may already have queued — and the sending server's
+        // retry delivers a second copy. A deferral costs a retry; a duplicate
+        // cannot be undone.
+        //
+        // Checked here rather than in `deliver` before dialling, although
+        // that would save the connection: DNS and the handshake spend budget
+        // too, so an answer worked out before them can be stale by the time
+        // it matters. This is the only place where "enough time left to hear
+        // the answer" is still true when DATA is sent.
+        if self.deadline.saturating_duration_since(Instant::now()) < self.budget.end_of_data {
+            let _ = self.say("QUIT").await;
+            return Ok(settle(
+                results,
+                Verdict::Deferred(Reply::ours(
+                    451,
+                    "4.4.2",
+                    format_args!(
+                        "the message's delivery budget has less than {:?} left, which is \
+                         not enough to hear whether {} took it",
+                        self.budget.end_of_data, self.host
+                    ),
+                )),
+            ));
+        }
+
         self.say("DATA").await?;
         let (reply, _) = self.reply("DATA", self.budget.command).await?;
         if reply.code != 354 {
@@ -1402,6 +1418,38 @@ mod tests {
             vec!["550-5.1.1 does not exist.", "550 5.1.1 check for typos."],
             "the last line is the only one with a space after the code, which is \
              what tells the sender the reply has ended"
+        );
+    }
+
+    /// Equality has to notice a reply that lost its lines.
+    ///
+    /// `lines` exists so that a multi-line refusal goes back out as
+    /// continuation lines; a code path that rebuilds a `Reply` and forgets to
+    /// carry them is exactly the regression it was added to catch. While
+    /// equality compared only `code`, `enhanced` and `text`, every
+    /// `assert_eq!` in this file was blind to that path: the stranded
+    /// enhanced code and the over-long line would both come back and no test
+    /// would say so.
+    #[test]
+    fn a_reply_that_lost_its_lines_is_not_the_same_reply() {
+        let kept = flatten(&[
+            "550-5.1.1 does not exist.".to_string(),
+            "550 5.1.1 check for typos.".to_string(),
+        ]);
+        let forgotten = Reply {
+            lines: Vec::new(),
+            ..kept.clone()
+        };
+
+        assert_ne!(
+            kept.wire(),
+            forgotten.wire(),
+            "the premise: these two put different bytes on the wire"
+        );
+        assert_ne!(
+            kept, forgotten,
+            "so they are not the same reply, and equality has to be able to \
+             tell a test that"
         );
     }
 
@@ -2688,6 +2736,72 @@ mod tests {
             matches!(outcome.results[0].verdict, Verdict::Deferred(_)),
             "nothing was settled, so nothing may be refused: {:?}",
             verdicts(&outcome)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_group_that_cannot_outlast_the_final_dot_never_starts_its_data() {
+        // One inbound message's destination groups share one deadline. A
+        // group that reaches the final dot with less than `end_of_data` left
+        // is cut off by `Fail::Spent` *after* the body is on the wire, and
+        // the destination may well have taken it: the deferral then asks the
+        // sending server to send a message that has already been delivered,
+        // and the recipient gets two. A deferral decided before DATA costs a
+        // retry; one decided after it costs a duplicate, and nothing undoes a
+        // duplicate.
+        //
+        // The first group goes through with the whole deadline in front of
+        // it; the wait then spends most of what is left, which is what a
+        // first destination taking its time does to the second group.
+        let pipes = Pipes::new(&[
+            ("203.0.113.1", Script::Serve(Mta::default())),
+            ("203.0.113.1", Script::Serve(Mta::default())),
+        ]);
+        let mut out = outbound();
+        out.budget.end_of_data = Duration::from_secs(1);
+        let deadline = Instant::now() + Duration::from_secs(2);
+
+        let first = deliver(
+            &two_exchangers(),
+            &pipes,
+            &out,
+            &message(b"hi\r\n").due_by(deadline),
+        )
+        .await;
+        assert_eq!(
+            verdicts(&first),
+            vec!["hi@example.com: accepted"],
+            "the first group had the budget it needed"
+        );
+
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+
+        let second = deliver(
+            &two_exchangers(),
+            &pipes,
+            &out,
+            &message(b"the second group's body\r\n").due_by(deadline),
+        )
+        .await;
+
+        assert!(
+            matches!(second.results[0].verdict, Verdict::Deferred(_)),
+            "half a second of budget cannot answer for a final dot that is \
+             allowed a second: {:?}",
+            verdicts(&second)
+        );
+        let connections = pipes.connections();
+        assert_eq!(connections.len(), 2, "one connection per group");
+        let (_, second_log) = &connections[1];
+        assert!(
+            second_log.body.is_none(),
+            "the body must not be on the wire: once it is, the deferral is a \
+             lie the destination can contradict by having queued it"
+        );
+        assert!(
+            !second_log.commands.iter().any(|c| c == "DATA"),
+            "and DATA is the point of no return, so it is never sent: {:?}",
+            second_log.commands
         );
     }
 

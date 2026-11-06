@@ -9,6 +9,8 @@
 
 use std::collections::BTreeSet;
 
+use tracing::warn;
+
 use crate::envelope::Envelope;
 use crate::routing::{Mailbox, Route, Router, is_qualified};
 use crate::smtp::client::{self, Outcome, Reply};
@@ -252,7 +254,25 @@ pub fn decide(envelope: &Envelope, router: &Router, head: &Head, limits: &Limits
         // Every recipient here was accepted at RCPT time, so it parses; one
         // that does not is dropped rather than refusing the whole message for
         // the others.
+        //
+        // Dropped, but not silently. A judgement call on where the word goes:
+        // carrying these out of `decide` would put them in the reply, and the
+        // reply is the wrong place — the sending server cannot act on a
+        // recipient we accepted and then could not read, and telling it about
+        // one would refuse or qualify mail the other recipients are getting.
+        // What this is is a bug in us: RCPT accepted something `decide`
+        // cannot parse, and the two are meant to agree. So it stays a
+        // delivery decision, and the record of it goes to the operator, who
+        // is the only one who can fix the disagreement. `decide` has no
+        // clock, socket or disk and still has none; a log line is not state.
         let Ok(mailbox) = Mailbox::parse(recipient) else {
+            warn!(
+                recipient,
+                id = %envelope.id,
+                "this recipient was accepted at RCPT time and cannot be parsed here, \
+                 so its copy is being dropped: RCPT and the alias table disagree \
+                 about what an address is"
+            );
             continue;
         };
         if expand(router, mailbox, 0, limits, &mut flat).is_err() {
@@ -333,8 +353,26 @@ fn expand(
             Ok(())
         }
         // A refusal is a refusal however it is reached: this branch of the
-        // expansion is dropped, and the others still go.
-        Some((_, Route::Reject(_))) | None => Ok(()),
+        // expansion is dropped, and the others still go. That one was asked
+        // for, so it is not worth a word.
+        Some((_, Route::Reject(_))) => Ok(()),
+        // This one was not. An alias pointed at a local part of one of our
+        // own domains that the table has no route for, so the copy goes
+        // nowhere and nobody is told: `check` forbids it in a static
+        // configuration, but the configuration is reloadable and the table
+        // that passed `check` is not necessarily the table that is running.
+        // Named here rather than carried out of `decide` for the same reason
+        // as an unparseable recipient: it is our table that is wrong, and the
+        // stranger whose mail this is cannot do anything about it.
+        None => {
+            warn!(
+                recipient = %mailbox,
+                "an alias points at a local part of one of our own domains that has \
+                 no route, so this copy is being dropped; the alias table disagrees \
+                 with itself"
+            );
+            Ok(())
+        }
     }
 }
 
