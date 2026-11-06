@@ -4,5 +4,8 @@
 //! entry points the service uses.
 
 pub mod config;
+pub mod envelope;
 pub mod routing;
+pub mod smtp;
+pub mod spool;
 pub mod telemetry;

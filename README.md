@@ -22,9 +22,9 @@ been proved end to end. Do not point an MX record at it.
 
 | | |
 |---|---|
-| Config file, validation, `mxhop check` | in progress |
-| Inbound SMTP session, spool to disk | planned |
-| STARTTLS and certificate reload | planned |
+| Config file, validation, `mxhop check` | done |
+| Inbound SMTP session, spool to disk | done |
+| STARTTLS and certificate reload | in progress |
 | Outbound SMTP client | planned |
 | Synchronous relay, hop limit — **0.1** | planned |
 | SRS and bounce decoding | planned |
@@ -35,6 +35,16 @@ been proved end to end. Do not point an MX record at it.
 | ARC sealing | planned |
 | Image, systemd unit, compose | planned |
 | Docs and release — **1.0** | planned |
+
+What works today: it accepts mail. It does not yet forward it, so a message
+ends up in the spool directory and stays there. The queue is two files per
+message — `queue/<id>.eml` is exactly what arrived, `queue/<id>.json` is its
+envelope — so you can read what it took in with `cat`.
+
+```sh
+mxhop check --config mxhop.example.toml   # before anything else
+mxhop run   --config mxhop.example.toml
+```
 
 ## Why this exists
 
