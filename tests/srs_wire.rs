@@ -239,8 +239,16 @@ async fn send(port: u16, script: &str) -> String {
 ///
 /// Before SRS this line carried the original sender, whose SPF record does
 /// not name this host; Gmail junked two test messages from this project for
-/// exactly that. Replacing the rewritten sender with `plan.sender` here fails
-/// this test and nothing else in the suite, which is why it exists.
+/// exactly that.
+///
+/// It exists because it reads the `MAIL FROM` line off a socket. Reverting
+/// the rewrite in `session::hand_on` also fails the unit test
+/// `smtp::session::tests::the_envelope_sender_handed_to_the_destination_is_rewritten`,
+/// which an earlier version of this comment denied — but that one asks the
+/// fake relay what it was handed, and this one asks what was written to a
+/// real TCP socket and read back by a real SMTP peer. A rewrite that is
+/// correct in the struct and lost on the way to the wire fails only this
+/// one, and that is a failure this project has had before.
 #[tokio::test]
 async fn the_mail_from_line_the_destination_reads_is_at_our_srs_domain() {
     let srs = Srs::new(SRS_DOMAIN, vec![secret()], DEFAULT_MAX_AGE_DAYS);
@@ -340,6 +348,15 @@ async fn a_bounce_to_an_address_we_wrote_is_relayed_and_a_forged_one_is_not() {
     // The same address with one character of the MAC changed. This is the
     // open-relay case: if it were accepted, anyone could post mail through
     // this host to any address in the world.
+    //
+    // The MAC runs from index 5 to the next `=`, and the index flipped below
+    // has to land inside it or nothing about the signature is being tested.
+    // Asserted rather than trusted, because the MAC's length has been
+    // changed once already.
+    assert!(
+        honest[5..].find('=').expect("a MAC terminator") + 5 > 6,
+        "index 6 has to be inside the MAC of {honest}"
+    );
     let mut forged: Vec<char> = honest.chars().collect();
     forged[6] = if forged[6] == 'A' { 'B' } else { 'A' };
     let forged: String = forged.into_iter().collect();

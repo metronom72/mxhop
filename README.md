@@ -196,6 +196,11 @@ envelope sender, and that address has to be deliverable or the report is lost.
 from this domain and there is no reason to ask a receiver to be lenient about
 anything else.
 
+The `ip4:` term alone is right for the default `outbound.ipv6 = false`. If you
+turn `ipv6` on, add an `ip6:` term for the address mxhop sends from — with
+`-all` and no `ip6:`, every message delivered over IPv6 hard-fails SPF, which
+is worse than not rewriting the sender at all.
+
 `example.com`'s own SPF record is untouched: mxhop never sends *as* your
 domain, only as the SRS one.
 
