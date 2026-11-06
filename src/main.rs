@@ -13,6 +13,7 @@ use mxhop::server::accept_loop;
 use mxhop::smtp::client::{self, Delivery, Direct, Outbound, Tcp, Verdict};
 use mxhop::smtp::session::SessionConfig;
 use mxhop::spool::Spool;
+use mxhop::srs::{self, Srs};
 use mxhop::telemetry;
 use mxhop::tls::Holder;
 
@@ -111,15 +112,54 @@ fn check(cli: &Cli) -> ExitCode {
         }
     };
 
+    // The same reason the certificate is read here: `run` refuses to start
+    // without a signing key, and a `check` that only looked at the path would
+    // pass a configuration whose every forwarded message then goes out with
+    // the original sender and fails SPF at the destination.
+    let srs = match open_srs(&config) {
+        Ok(srs) => srs,
+        Err(problem) => {
+            report(cli, &[problem]);
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // A key anyone on the box can read is a key anyone on the box can forge
+    // with, and forging one is the whole of being an open relay. `check` is
+    // the only moment an operator looks at this file, so it is where the mode
+    // gets mentioned — a warning rather than a refusal, because a group-
+    // readable key is a real risk on a shared host and none at all on a
+    // single-purpose VPS, and `check` refusing to pass over it would teach
+    // people to stop running `check`.
+    if let Some(settings) = config.srs.as_ref() {
+        warn_about_secret_mode(&settings.secret_file);
+    }
+
     let domains: Vec<&str> = config.router.domains().collect();
     println!(
-        "{}: ok — {} on {}, {} {} for {}{}",
+        "{}: ok — {} on {}, {} {} for {}{}{}",
         cli.config.display(),
         config.hostname,
         config.listen,
         config.router.alias_count(),
         plural(config.router.alias_count(), "alias", "aliases"),
         domains.join(", "),
+        match &srs {
+            // The key count, because rotation is the operation that goes
+            // wrong quietly: a file whose old key was dropped verifies
+            // nothing that is already in flight, and the only moment an
+            // operator can notice is before the restart.
+            Some(srs) => format!(
+                ", SRS at {} ({} {}, {} day window)",
+                srs.domain(),
+                srs.key_count(),
+                plural(srs.key_count(), "key", "keys"),
+                srs.max_age_days()
+            ),
+            None => ", no SRS — forwarded mail keeps the original envelope sender \
+                      and will fail SPF"
+                .to_string(),
+        },
         match &tls {
             // The user is part of the answer: the files were read with this
             // user's permissions, and `run` will read them with the service
@@ -146,6 +186,52 @@ fn open_tls(config: &Config) -> Result<Option<Arc<Holder>>, Problem> {
     Holder::open(paths).map(Some).map_err(|e| Problem {
         line,
         message: e.to_string(),
+    })
+}
+
+/// Says so on stderr when the signing key is readable by anyone but its
+/// owner.
+///
+/// Printed rather than returned as a `Problem`, because it is not one: the
+/// configuration is valid and `run` will start. It goes to stderr so that the
+/// `ok` line on stdout stays the one machine-readable thing `check` prints.
+fn warn_about_secret_mode(path: &std::path::Path) {
+    let _ = path;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let Ok(mode) = std::fs::metadata(path).map(|m| m.permissions().mode()) else {
+            // Unreadable is already `open_srs`'s problem, and it has said so.
+            return;
+        };
+        let extra = mode & 0o077;
+        if extra != 0 {
+            eprintln!(
+                "{}: warning: mode {:04o} — the srs signing key is readable by {}; \
+                 anyone who can read it can forge an address this host will relay. \
+                 `chmod 600 {}`",
+                path.display(),
+                mode & 0o7777,
+                if mode & 0o007 != 0 {
+                    "everyone on this host"
+                } else {
+                    "its group"
+                },
+                path.display()
+            );
+        }
+    }
+}
+
+/// Reads the SRS secret file, if one is configured, and turns a file problem
+/// into a [`Problem`] at the line of the `[srs]` table.
+fn open_srs(config: &Config) -> Result<Option<Srs>, Problem> {
+    let Some(settings) = config.srs.as_ref() else {
+        return Ok(None);
+    };
+    srs::open(settings).map(Some).map_err(|message| Problem {
+        line: settings.line,
+        message,
     })
 }
 
@@ -211,6 +297,18 @@ async fn run(cli: &Cli) -> ExitCode {
         }
     };
 
+    // Without a signing key the service does not start: the alternative is
+    // forwarding every message with the original envelope sender, which is
+    // the failing SPF check this table exists to fix — silently, for as long
+    // as nobody reads a destination's headers.
+    let srs = match open_srs(&config) {
+        Ok(srs) => srs.map(Arc::new),
+        Err(problem) => {
+            error!("{}", problem.message);
+            return ExitCode::FAILURE;
+        }
+    };
+
     let session_config = Arc::new(SessionConfig::from_config(&config));
     let router = Arc::new(config.router.clone());
     let queued = spool.queued().await.map(|q| q.len()).unwrap_or(0);
@@ -225,6 +323,7 @@ async fn run(cli: &Cli) -> ExitCode {
         hostname = %config.hostname,
         domains = config.router.domains().count(),
         aliases = config.router.alias_count(),
+        srs = srs.as_ref().map_or("none".to_string(), |s| s.domain().to_string()),
         queued,
         tls = tls.is_some(),
         "mxhop is accepting mail"
@@ -236,7 +335,7 @@ async fn run(cli: &Cli) -> ExitCode {
         spawn_reload_on_hangup_without_tls();
     }
 
-    accept_loop(listener, session_config, router, spool, relay, tls).await;
+    accept_loop(listener, session_config, router, srs, spool, relay, tls).await;
     ExitCode::SUCCESS
 }
 

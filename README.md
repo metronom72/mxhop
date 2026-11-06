@@ -26,8 +26,8 @@ been proved end to end. Do not point an MX record at it.
 | Inbound SMTP session, spool to disk | done |
 | STARTTLS and certificate reload | done |
 | Outbound SMTP client | done |
-| Synchronous relay, hop limit — **0.1** | planned |
-| SRS and bounce decoding | planned |
+| Synchronous relay, hop limit — **0.1** | done |
+| SRS and bounce decoding | done |
 | SPF/DKIM/DMARC and `Authentication-Results` | planned |
 | Queue, retries, per-host backoff | planned |
 | DSNs for queued failures | planned |
@@ -178,10 +178,45 @@ documented rejection, but there is no reason to have them differ. Outlook's
 behaviour here is untested by this project. The PTR is set where the address
 comes from — your hosting provider's panel — not in your zone.
 
-**SRS.** Once sender rewriting lands it will need a domain of its own for the
-rewritten envelope senders, with an SPF record authorising this server to
-send for it. That is not implemented yet, so there is nothing to publish for
-it today.
+**SRS.** Sender rewriting needs a subdomain of its own, and it has to be one
+that is *not* listed in `[domains]` — `mxhop check` refuses a configuration
+where it is both, because the alias table is consulted first and would answer
+bounces instead of letting them be decoded. For an SRS domain
+`srs.example.com`:
+
+| record | value |
+|---|---|
+| `srs.example.com.` MX 10 | `mx.example.com.` |
+| `srs.example.com.` TXT | `v=spf1 ip4:<the server's IPv4 address> -all` |
+
+The MX record is what brings the bounces back: a destination that refuses a
+forwarded message after accepting it sends its report to the rewritten
+envelope sender, and that address has to be deliverable or the report is lost.
+`-all` rather than `~all`, because mxhop is the only thing that ever sends
+from this domain and there is no reason to ask a receiver to be lenient about
+anything else.
+
+The `ip4:` term alone is right for the default `outbound.ipv6 = false`. If you
+turn `ipv6` on, add an `ip6:` term for the address mxhop sends from — with
+`-all` and no `ip6:`, every message delivered over IPv6 hard-fails SPF, which
+is worse than not rewriting the sender at all.
+
+`example.com`'s own SPF record is untouched: mxhop never sends *as* your
+domain, only as the SRS one.
+
+The signing key is never in the config file. Generate it on the server and
+point `srs.secret_file` at it:
+
+```
+head -c 32 /dev/urandom | base64 > /etc/mxhop/srs.key
+chmod 600 /etc/mxhop/srs.key
+```
+
+To rotate it, put the new key on the **first** line and keep the old one below
+it for at least `srs.max_age_days`: the first line signs and every line
+verifies, so bounces already in flight — carrying addresses signed with the
+retired key — still come home. Dropping the old key immediately destroys
+every delivery report that has not arrived yet.
 
 ## Why this exists
 

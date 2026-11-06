@@ -223,6 +223,7 @@ async fn a_reload_is_seen_by_the_next_connection_and_not_the_current_one() {
         listener,
         config,
         Arc::new(router()),
+        None,
         Arc::clone(&spool),
         Arc::new(mxhop::smtp::client::Blackhole),
         Some(Arc::clone(&holder)),

@@ -205,8 +205,12 @@ pub struct Group {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Plan {
     pub groups: Vec<Group>,
-    /// The envelope sender to announce, unchanged. Rewriting it so that SPF
-    /// passes at the destination is SRS, which is its own piece of work.
+    /// The envelope sender as it arrived, unchanged.
+    ///
+    /// SRS rewrites this before it reaches the wire, but not here: the
+    /// rewrite needs today's date, and this file deliberately has no clock in
+    /// it. The session applies `srs::Srs::rewrite` to this value on the way
+    /// to the delivery.
     pub sender: Option<String>,
 }
 
@@ -311,8 +315,8 @@ pub fn decide(envelope: &Envelope, router: &Router, head: &Head, limits: &Limits
 
     Decision::Deliver(Plan {
         groups,
-        // Unchanged: rewriting it so the destination's SPF check passes is
-        // SRS, which is a separate piece of work. The null sender stays null
+        // As it arrived. The session rewrites it into the SRS domain on the
+        // way out, where the clock is; the null sender stays null either way
         // — a bounce that acquired a sender could be bounced again.
         sender: envelope.from.clone(),
     })
