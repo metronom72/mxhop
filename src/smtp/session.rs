@@ -1371,6 +1371,17 @@ mod tests {
         assert!(!outcome.tls);
     }
 
+    /// Looks like an SMTP reply: three digits and a space or a hyphen. Used
+    /// to assert the *absence* of any reply, which naming two codes cannot
+    /// do — a stray `say("554 …")` on a path that must stay silent would slip
+    /// past a test that only looks for `500` and `421`.
+    fn is_reply_line(line: &str) -> bool {
+        let bytes = line.as_bytes();
+        bytes.len() >= 4
+            && bytes[..3].iter().all(u8::is_ascii_digit)
+            && (bytes[3] == b' ' || bytes[3] == b'-')
+    }
+
     #[tokio::test]
     async fn a_failed_handshake_ends_the_session_quietly() {
         let (mut client, served, _) = serve_with_tls("mx.test").await;
@@ -1378,16 +1389,28 @@ mod tests {
         client.send("STARTTLS\r\n").await;
         assert!(client.reply().await.starts_with("220"));
 
-        // Not a TLS ClientHello. Scanners do this all day, and it is not a
-        // session failure.
-        client.send("GET / HTTP/1.1\r\n\r\n").await;
+        // Not a TLS ClientHello but a whole plaintext SMTP transaction: the
+        // case of an attacker's commands arriving *after* the go-ahead.
+        // Scanners send nonsense here all day and that is not a session
+        // failure; what must never happen is mxhop answering in the clear, or
+        // spooling a message, on a connection it has already promised to
+        // encrypt.
+        client.send(DELIVER).await;
         let rest = client.rest().await;
         let outcome = served.task.await.unwrap().expect("not a session failure");
 
+        let replied: Vec<&str> = rest.lines().filter(|line| is_reply_line(line)).collect();
         assert!(
-            !rest.contains("500") && !rest.contains("421"),
-            "a broken handshake admits no SMTP reply: {rest:?}"
+            replied.is_empty(),
+            "a broken handshake admits no SMTP reply at all — there is no agreed encoding \
+             left to send one in: {replied:?} in {rest:?}"
         );
+        assert_eq!(
+            served.spool.queued().await.unwrap().len(),
+            0,
+            "and nothing sent after the go-ahead may reach the queue"
+        );
+        assert_eq!(outcome.accepted, 0);
         assert!(!outcome.tls);
         assert!(!outcome.quit);
     }
