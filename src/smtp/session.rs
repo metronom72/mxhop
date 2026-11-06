@@ -260,10 +260,7 @@ where
                     greeting.push_str("250-STARTTLS\r\n");
                 }
                 greeting.push_str("250 ENHANCEDSTATUSCODES");
-                let out = reader.get_mut();
-                out.write_all(greeting.as_bytes()).await?;
-                out.write_all(b"\r\n").await?;
-                out.flush().await?;
+                say(reader.get_mut(), &greeting).await?;
             }
 
             Command::Helo(name) => {
@@ -491,12 +488,19 @@ fn decide_recipient(router: &Router, address: &str, recipients: &mut Vec<String>
     }
 }
 
+/// Writes one reply, terminator included, as a single write.
+///
+/// Splitting the CRLF into a write of its own is what breaks a client that
+/// reads the STARTTLS prologue a `recv` at a time — `openssl s_client` among
+/// them.
 async fn say<W>(out: &mut W, line: &str) -> io::Result<()>
 where
     W: AsyncWrite + Unpin,
 {
-    out.write_all(line.as_bytes()).await?;
-    out.write_all(b"\r\n").await?;
+    let mut reply = String::with_capacity(line.len() + 2);
+    reply.push_str(line);
+    reply.push_str("\r\n");
+    out.write_all(reply.as_bytes()).await?;
     out.flush().await
 }
 
@@ -616,6 +620,53 @@ mod tests {
                            body\r\n\
                            .\r\n\
                            QUIT\r\n";
+
+    /// A reply has to leave as one write. `openssl s_client -starttls smtp`
+    /// reads the prologue with one `recv` per line and takes a segment
+    /// without CRLF for a whole line; split the terminator off and its reader
+    /// runs a line behind, sends its ClientHello early, and reads our
+    /// `220 go ahead` as a TLS record — "wrong version number", with no
+    /// handshake. Found by hand against a real listener.
+    #[tokio::test]
+    async fn a_reply_leaves_in_one_write() {
+        struct Segments(std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>);
+
+        impl AsyncWrite for Segments {
+            fn poll_write(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                buf: &[u8],
+            ) -> std::task::Poll<io::Result<usize>> {
+                self.0.lock().unwrap().push(buf.to_vec());
+                std::task::Poll::Ready(Ok(buf.len()))
+            }
+
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut out = Segments(std::sync::Arc::clone(&seen));
+        say(&mut out, "220 mx.test mxhop ready").await.unwrap();
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            *seen,
+            vec![b"220 mx.test mxhop ready\r\n".to_vec()],
+            "line and terminator together, or a line-at-a-time reader loses its place"
+        );
+    }
 
     #[tokio::test]
     async fn the_greeting_names_the_host_and_quit_is_answered() {
