@@ -40,6 +40,11 @@ pub const SMTP_PORT: u16 = 25;
 /// a question.
 const MAX_REPLY_BYTES: usize = 16 * 1024;
 
+/// How much of the body is written under one go of [`Budget::body`]. Small
+/// enough that a destination which has stopped reading is noticed inside one
+/// budget, large enough that the budget is not re-armed per syscall.
+const BODY_CHUNK_BYTES: usize = 64 * 1024;
+
 // ------------------------------------------------------------------- the message
 
 /// One message on its way to one domain.
@@ -182,7 +187,9 @@ pub struct Budget {
     pub connect: Duration,
     /// Greeting, EHLO, STARTTLS, MAIL and each RCPT.
     pub command: Duration,
-    /// A body write that stops being accepted.
+    /// How long one chunk of the body may sit unaccepted. A stall timeout,
+    /// not a limit on the whole body: a big message to a slow destination is
+    /// normal, and a destination that has stopped reading is not.
     pub body: Duration,
     /// The reply to the final dot, which is where a destination does its
     /// spam scanning and takes its time.
@@ -259,9 +266,18 @@ pub fn webpki_connector() -> TlsConnector {
     let roots = RootCertStore {
         roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
     };
-    let config = ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+    // The provider is named rather than looked up, exactly as `crate::tls`
+    // does for the server side. `ClientConfig::builder()` takes — and
+    // *installs* — the process-wide default, which both makes the choice a
+    // dependency's to change and defeats the check in `crate::tls` that the
+    // choice was made here.
+    let config = ClientConfig::builder_with_provider(Arc::new(
+        tokio_rustls::rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("ring supports the default protocol versions")
+    .with_root_certificates(roots)
+    .with_no_client_auth();
     TlsConnector::from(Arc::new(config))
 }
 
@@ -282,6 +298,29 @@ pub enum Fail {
     Garbled(String),
     /// STARTTLS was offered and did not work.
     Tls(String),
+    /// The destination answered the greeting or EHLO with a refusal. Its own
+    /// words are the whole value of this: a block list's text and its URL are
+    /// what tells the sender what to do, and "the budget is spent" is not.
+    Rejected(Reply),
+    /// The message was written in full and the destination never said what it
+    /// did with it. Retrying this against another host risks a second copy,
+    /// so it ends the delivery instead of continuing it.
+    Unsettled(Box<Fail>),
+}
+
+impl Fail {
+    /// How much this failure is worth saying to the sender, so that the
+    /// reason in the deferral is the most informative one rather than the
+    /// last one. A phase timeout and a spent budget say nothing about the
+    /// destination; a reply from it says everything.
+    fn worth(&self) -> u8 {
+        match self {
+            Fail::Unsettled(_) => 3,
+            Fail::Rejected(_) => 2,
+            Fail::Timeout(_) | Fail::Spent => 0,
+            _ => 1,
+        }
+    }
 }
 
 impl fmt::Display for Fail {
@@ -293,6 +332,8 @@ impl fmt::Display for Fail {
             Fail::Spent => f.write_str("the message's delivery budget is spent"),
             Fail::Garbled(line) => write!(f, "not an SMTP reply: {line:?}"),
             Fail::Tls(e) => write!(f, "TLS failed: {e}"),
+            Fail::Rejected(reply) => write!(f, "{reply}"),
+            Fail::Unsettled(e) => write!(f, "{e}, and the message was already sent"),
         }
     }
 }
@@ -360,9 +401,26 @@ where
         };
     };
 
-    let hosts = match targets(resolver, domain).await {
-        Ok(hosts) => hosts,
-        Err(e) => {
+    // Inside the clock. hickory will spend 5 seconds twice per query against
+    // an unresponsive resolver, and an MX lookup plus one address lookup per
+    // exchanger is enough of that to push a 180 second ceiling well past
+    // three minutes while the inbound sender waits on us.
+    let hosts = match clocked(out.budget.command, deadline, targets(resolver, domain)).await {
+        Err(_) => {
+            return Outcome {
+                host: None,
+                results: Outcome::all(
+                    &delivery.to,
+                    Verdict::Deferred(Reply::ours(
+                        451,
+                        "4.4.3",
+                        format_args!("the MX lookup for {domain} did not finish in time"),
+                    )),
+                ),
+            };
+        }
+        Ok(Ok(hosts)) => hosts,
+        Ok(Err(e)) => {
             // A domain with no route is the one case decided without talking
             // to anybody, and the permanence of it comes from DNS: a null MX
             // is a refusal, a resolver that did not answer is not.
@@ -378,16 +436,20 @@ where
         }
     };
 
-    // The reason the last host failed, so that the deferral says something
-    // other than "it did not work".
-    let mut last: Option<Fail> = None;
-    // Whether every host failed because DNS said its name has no address.
-    // That is an answer rather than a silence, and the commonest cause is a
-    // misspelled domain — which belongs back with the sender now rather than
-    // after five days of retries.
-    let mut only_missing_names = true;
+    // The reason the best-informed host failed, so that the deferral says
+    // something other than "it did not work", and the name of the host that
+    // said it.
+    let mut last: Option<Last> = None;
+    // How many exchangers were actually examined, and how many of those
+    // failed because DNS said the name has no address. All of them being the
+    // second is an answer rather than a silence — the commonest cause is a
+    // misspelled domain, which belongs back with the sender now rather than
+    // after five days of retries — but *none* of them having been examined is
+    // not an answer at all, so the count matters as much as the reason.
+    let mut examined = 0usize;
+    let mut missing_names = 0usize;
 
-    for target in &hosts {
+    'hosts: for target in &hosts {
         if Instant::now() >= deadline {
             warn!(
                 domain,
@@ -397,26 +459,41 @@ where
             break;
         }
 
-        let addrs = match resolver.addrs(&target.host).await {
-            Ok(addrs) if addrs.is_empty() => {
-                debug!(host = %target.host, "the name resolves to nothing");
-                last = Some(Fail::Connect(io::Error::other(format!(
-                    "{} has no address",
-                    target.host
-                ))));
+        let addrs = match clocked(out.budget.command, deadline, resolver.addrs(&target.host)).await
+        {
+            Err(_) => {
+                examined += 1;
+                debug!(host = %target.host, "the address lookup did not finish in time");
+                last = Last::keep(last, &target.host, Fail::Timeout("the address lookup"));
                 continue;
             }
-            Ok(addrs) => addrs,
-            Err(e) => {
+            Ok(Ok(addrs)) if addrs.is_empty() => {
+                examined += 1;
+                missing_names += 1;
+                debug!(host = %target.host, "the name resolves to nothing");
+                last = Last::keep(
+                    last,
+                    &target.host,
+                    Fail::Connect(io::Error::other(format!("{} has no address", target.host))),
+                );
+                continue;
+            }
+            Ok(Ok(addrs)) => addrs,
+            Ok(Err(e)) => {
+                examined += 1;
                 debug!(host = %target.host, "no address: {e}");
-                if !matches!(e, crate::dns::DnsError::NotFound) {
-                    only_missing_names = false;
+                if matches!(e, crate::dns::DnsError::NotFound) {
+                    missing_names += 1;
                 }
-                last = Some(Fail::Connect(io::Error::other(e.to_string())));
+                last = Last::keep(
+                    last,
+                    &target.host,
+                    Fail::Connect(io::Error::other(e.to_string())),
+                );
                 continue;
             }
         };
-        only_missing_names = false;
+        examined += 1;
 
         for addr in usable(&addrs, out.ipv6) {
             if Instant::now() >= deadline {
@@ -441,7 +518,7 @@ where
                     warn!(
                         host = %target.host,
                         %addr,
-                        "STARTTLS failed, delivering in plaintext instead: {e}"
+                        "STARTTLS failed, retrying in plaintext: {e}"
                     );
                     match attempt(
                         connector,
@@ -460,22 +537,39 @@ where
                                 results,
                             };
                         }
-                        Err(e) => last = Some(e),
+                        Err(e) => last = Last::keep(last, &target.host, e),
                     }
                 }
+                Err(Fail::Unsettled(e)) => {
+                    // The message is on the wire in full and this host never
+                    // said what it did with it. It may well have queued it —
+                    // a content scan that outran our patience, or a reply
+                    // lost to a reset — so trying the next host would be
+                    // asking a second mail server to deliver a copy. Stop,
+                    // and defer: a duplicate is worse than a delay.
+                    warn!(
+                        host = %target.host,
+                        %addr,
+                        "the destination never answered the final dot, so the message \
+                         may already have been delivered; deferring rather than \
+                         resending it to another host: {e}"
+                    );
+                    last = Last::keep(last, &target.host, Fail::Unsettled(e));
+                    break 'hosts;
+                }
                 Err(Fail::Spent) => {
-                    last = Some(Fail::Spent);
-                    break;
+                    last = Last::keep(last, &target.host, Fail::Spent);
+                    break 'hosts;
                 }
                 Err(e) => {
-                    debug!(host = %target.host, %addr, "attempt failed: {e}");
-                    last = Some(e);
+                    warn!(host = %target.host, %addr, "attempt failed: {e}");
+                    last = Last::keep(last, &target.host, e);
                 }
             }
         }
     }
 
-    if only_missing_names && !hosts.is_empty() {
+    if examined > 0 && examined == missing_names {
         return Outcome {
             host: None,
             results: Outcome::all(
@@ -493,16 +587,62 @@ where
     // has said nothing, and inventing a refusal on its behalf throws away
     // mail it would have taken.
     let reason = match last {
-        Some(e) => Reply::ours(
+        // The destination's own refusal, relayed with its text intact. In the
+        // next milestone this sentence goes straight back to a stranger's
+        // mail server, so it has to be the destination's words and not ours.
+        Some(Last {
+            host,
+            fail: Fail::Rejected(reply),
+        }) => Reply::ours(
             451,
             "4.4.1",
-            format_args!("no mail exchanger answered: {e}"),
+            format_args!("{host} refused the connection: {reply}"),
+        ),
+        Some(Last { fail, .. }) => Reply::ours(
+            451,
+            "4.4.1",
+            format_args!("no mail exchanger answered: {fail}"),
         ),
         None => Reply::ours(451, "4.4.1", "no mail exchanger could be tried"),
     };
     Outcome {
         host: None,
         results: Outcome::all(&delivery.to, Verdict::Deferred(reason)),
+    }
+}
+
+/// The failure worth telling the sender about, and who said it.
+struct Last {
+    host: String,
+    fail: Fail,
+}
+
+impl Last {
+    /// Keeps whichever of the two failures says more; see [`Fail::worth`]. On
+    /// a tie the newer one wins, so that the ordinary case is still "what
+    /// happened last".
+    fn keep(current: Option<Last>, host: &str, fail: Fail) -> Option<Last> {
+        match current {
+            Some(old) if old.fail.worth() > fail.worth() => Some(old),
+            _ => Some(Last {
+                host: host.to_string(),
+                fail,
+            }),
+        }
+    }
+}
+
+/// Runs something that is not SMTP — a DNS lookup, a TLS handshake — under
+/// this phase's budget clipped to what is left of the message's, so that the
+/// overall ceiling covers everything and not only the parts we speak.
+async fn clocked<F: std::future::Future>(
+    want: Duration,
+    deadline: Instant,
+    task: F,
+) -> Result<F::Output, Fail> {
+    match left(want, deadline) {
+        Ok(budget) => timeout(budget, task).await.map_err(|_| Fail::Spent),
+        Err(e) => Err(e),
     }
 }
 
@@ -564,8 +704,10 @@ pub async fn dialog<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let mut chat = Chat::new(stream, out.budget.clone(), deadline);
-    let caps = chat.open(&out.hostname).await?;
+    let mut chat = Chat::new(stream, host, out.budget.clone(), deadline);
+    // A fresh TCP connection, so the destination speaks first.
+    chat.greet().await?;
+    let caps = chat.ehlo(&out.hostname).await?;
 
     match tls {
         Some(connector) if caps.starttls => {
@@ -575,17 +717,31 @@ where
                     "{host} is not a name a certificate can be for: {e}"
                 ))
             })?;
-            let encrypted = connector
-                .connect(name, plain)
-                .await
-                .map_err(|e| Fail::Tls(e.to_string()))?;
+            // Under the clock, and classified as a TLS failure rather than a
+            // timeout. A middlebox that answers 220 to STARTTLS and then
+            // sends nothing would otherwise hang here until TCP gave up,
+            // which with no data flowing can be never — and the inbound
+            // session waiting on us hangs with it. Calling it `Tls` is what
+            // puts it through the plaintext fallback, which is the right
+            // answer for exactly that middlebox.
+            let encrypted =
+                match clocked(out.budget.command, deadline, connector.connect(name, plain)).await {
+                    Err(_) => return Err(Fail::Tls("the handshake timed out".into())),
+                    Ok(Ok(encrypted)) => encrypted,
+                    Ok(Err(e)) => return Err(Fail::Tls(e.to_string())),
+                };
 
-            // RFC 3207 §4.2: everything either side learned before the
-            // handshake is discarded, so EHLO is asked again. The second
-            // answer is the one that counts — a destination may well offer
-            // 8BITMIME or a larger SIZE only once the session is private.
-            let mut chat = Chat::new(encrypted, out.budget.clone(), deadline);
-            let caps = chat.open(&out.hostname).await?;
+            // RFC 3207 §4.2: the session returns to the state it was in
+            // immediately *after* the greeting, so EHLO is asked again and
+            // there is no second greeting to wait for. Postfix, Exim and
+            // Gmail all send nothing here and wait for EHLO — as does this
+            // project's own inbound server — so a client that reads a 220
+            // first waits out its whole command budget against every real
+            // destination that offers STARTTLS. The second EHLO answer is
+            // the one that counts: a destination may well offer 8BITMIME or
+            // a larger SIZE only once the session is private.
+            let mut chat = Chat::new(encrypted, host, out.budget.clone(), deadline);
+            let caps = chat.ehlo(&out.hostname).await?;
             chat.send(&caps, delivery).await
         }
         _ => chat.send(&caps, delivery).await,
@@ -606,6 +762,10 @@ pub struct Caps {
 
 struct Chat<S> {
     io: BufReader<S>,
+    /// Who we are talking to, so that every line this file logs names the
+    /// host. A delivery tries five of them, and a warning that does not say
+    /// which one is a warning an operator cannot act on.
+    host: String,
     budget: Budget,
     deadline: Instant,
 }
@@ -614,31 +774,44 @@ impl<S> Chat<S>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    fn new(stream: S, budget: Budget, deadline: Instant) -> Self {
+    fn new(stream: S, host: &str, budget: Budget, deadline: Instant) -> Self {
         Self {
             // BufReader passes writes straight through, so one wrapper is
             // both halves of the conversation and the stream stays whole —
             // which it has to be, because STARTTLS hands it to rustls.
             io: BufReader::new(stream),
+            host: host.to_string(),
             budget,
             deadline,
         }
     }
 
-    /// Reads the greeting and announces ourselves.
-    async fn open(&mut self, me: &str) -> Result<Caps, Fail> {
+    /// Reads the greeting the destination sends unprompted.
+    ///
+    /// Separate from [`Chat::ehlo`] because only a new connection has one: a
+    /// session resumed after a STARTTLS handshake has already had its
+    /// greeting and goes straight to EHLO.
+    async fn greet(&mut self) -> Result<(), Fail> {
         let (greeting, _) = self.reply("the greeting", self.budget.command).await?;
         if !greeting.is_positive() {
             // A destination that greets with 4xx or 5xx is telling us to go
             // away before we have said anything; the usual cause is a block
-            // list, and its text is the only useful thing we will get.
-            return Err(Fail::Garbled(greeting.to_string()));
+            // list, and its text is the only useful thing we will get — so it
+            // is kept as a reply and not filed as noise. Deferring on a 5xx
+            // greeting is deliberate, and matches Postfix's
+            // `smtp_skip_5xx_greeting = yes`: a host that will not talk has
+            // not refused the mail.
+            return Err(Fail::Rejected(greeting));
         }
+        Ok(())
+    }
 
+    /// Announces ourselves and reads back what the destination can do.
+    async fn ehlo(&mut self, me: &str) -> Result<Caps, Fail> {
         self.say(&format!("EHLO {me}")).await?;
         let (reply, lines) = self.reply("EHLO", self.budget.command).await?;
         if !reply.is_positive() {
-            return Err(Fail::Garbled(reply.to_string()));
+            return Err(Fail::Rejected(reply));
         }
         Ok(caps_from(&lines))
     }
@@ -700,6 +873,7 @@ where
             // bytes go out as they are, and the warning is here so that an
             // operator reading the log knows what was decided for them.
             warn!(
+                host = %self.host,
                 "the destination does not announce 8BITMIME; sending the message unchanged \
                  anyway, because re-encoding it would invalidate the sender's DKIM signature"
             );
@@ -756,9 +930,20 @@ where
 
         self.write_body(delivery).await?;
 
-        let (reply, _) = self
+        // Past this point the message is on the wire in full, so an error is
+        // no longer a reason to try another host: the destination may have
+        // queued it and lost only the reply. `Unsettled` says so, and
+        // [`deliver`] stops rather than sending a second copy somewhere else.
+        // A spent overall budget is left alone — it already ends the delivery
+        // for the same reason.
+        let (reply, _) = match self
             .reply("the reply to the final dot", self.budget.end_of_data)
-            .await?;
+            .await
+        {
+            Ok(got) => got,
+            Err(Fail::Spent) => return Err(Fail::Spent),
+            Err(e) => return Err(Fail::Unsettled(Box::new(e))),
+        };
         let verdict = if reply.is_positive() {
             Verdict::Accepted
         } else {
@@ -774,8 +959,13 @@ where
     /// The only transformation is dot-stuffing; see [`stuff`].
     async fn write_body(&mut self, delivery: &Delivery) -> Result<(), Fail> {
         let mut out = Vec::with_capacity(delivery.head.len() + delivery.body.len() + 64);
-        stuff(&delivery.head, &mut out);
-        stuff(&delivery.body, &mut out);
+        // The line state carries from the head into the body: they are one
+        // byte stream, and a head that does not end in CRLF leaves the body's
+        // first byte in the middle of a line. Treating the body as a fresh
+        // start there inserts a dot inside a line that did not begin with
+        // one, which is a changed byte under the sender's signature.
+        let at_line_start = stuff(&delivery.head, true, &mut out);
+        stuff(&delivery.body, at_line_start, &mut out);
         // The terminator is a dot on a line of its own, so the message has to
         // have ended a line first. A stored body always has; an empty one has
         // not.
@@ -784,13 +974,23 @@ where
         }
         out.extend_from_slice(b".\r\n");
 
+        // A chunk at a time, with the budget applied to each. As one timeout
+        // over the whole body it was a throughput floor dressed up as a
+        // stall timeout: 60 seconds for a 25 MiB message demands about
+        // 3.5 Mbit/s of a destination, and a slow but perfectly healthy one
+        // would have the message cut off mid-body and sent again from the
+        // start. What wants a timeout is a destination that stops reading,
+        // and that is what no chunk making progress means.
+        for chunk in out.chunks(BODY_CHUNK_BYTES) {
+            let budget = left(self.budget.body, self.deadline)?;
+            match timeout(budget, self.io.write_all(chunk)).await {
+                Err(_) => return Err(Fail::Timeout("the body to be accepted")),
+                Ok(r) => r?,
+            }
+        }
+
         let budget = left(self.budget.body, self.deadline)?;
-        match timeout(budget, async {
-            self.io.write_all(&out).await?;
-            self.io.flush().await
-        })
-        .await
-        {
+        match timeout(budget, self.io.flush()).await {
             Err(_) => Err(Fail::Timeout("the body to be accepted")),
             Ok(r) => r.map_err(Fail::from),
         }
@@ -944,10 +1144,11 @@ fn settle(results: Vec<RecipientResult>, verdict: Verdict) -> Vec<RecipientResul
 /// 0x7f, is written exactly as it was stored, because the sender's DKIM
 /// signature covers all of it.
 ///
-/// `src` is assumed to begin at a line boundary, which is true of a stored
-/// body and of the headers mxhop prepends to it.
-fn stuff(src: &[u8], out: &mut Vec<u8>) {
-    let mut at_line_start = true;
+/// `at_line_start` says whether `src` begins a line, and the return value
+/// says whether the next chunk would: the head and the body are written by
+/// two calls and are one byte stream, so the state has to cross between them.
+fn stuff(src: &[u8], at_line_start: bool, out: &mut Vec<u8>) -> bool {
+    let mut at_line_start = at_line_start;
     for byte in src {
         if at_line_start && *byte == b'.' {
             out.push(b'.');
@@ -955,6 +1156,7 @@ fn stuff(src: &[u8], out: &mut Vec<u8>) {
         out.push(*byte);
         at_line_start = *byte == b'\n';
     }
+    at_line_start
 }
 
 /// This phase's budget, clipped to what is left of the message's.
@@ -1018,6 +1220,17 @@ mod tests {
         tls: Option<Arc<TlsAcceptor>>,
         /// Reply 220 to STARTTLS and then send a line before the handshake.
         inject_after_starttls: bool,
+        /// Reply 220 to STARTTLS and then never handshake, which is what a
+        /// TLS-mangling middlebox does.
+        stall_after_starttls: bool,
+        /// Read the whole body and then never reply to the final dot.
+        stall_at_dot: bool,
+        /// Whether this is the session resumed inside TLS. A resumed session
+        /// has already had its greeting; see [`Mta::serve`].
+        resumed: bool,
+        /// Sleep this long before taking each line of the body, so that a
+        /// slow but progressing destination can be told from a stalled one.
+        read_delay: Option<Duration>,
     }
 
     impl Default for Mta {
@@ -1036,6 +1249,10 @@ mod tests {
                 silent: false,
                 tls: None,
                 inject_after_starttls: false,
+                stall_after_starttls: false,
+                stall_at_dot: false,
+                resumed: false,
+                read_delay: None,
             }
         }
     }
@@ -1066,7 +1283,13 @@ mod tests {
             }
 
             let mut io = BufReader::new(stream);
-            let _ = say(&mut io, &self.greeting).await;
+            // RFC 3207 §4.2 puts the session back where it was *after* the
+            // greeting, so a real server sends nothing here and waits for
+            // EHLO. The fake has to do the same, or it quietly props up a
+            // client that waits for a second greeting no destination sends.
+            if !self.resumed {
+                let _ = say(&mut io, &self.greeting).await;
+            }
             let mut rcpts = 0usize;
 
             loop {
@@ -1104,6 +1327,11 @@ mod tests {
                         if self.inject_after_starttls {
                             let _ = say(&mut io, "250 injected").await;
                         }
+                        if self.stall_after_starttls {
+                            // Holds the connection and never speaks TLS.
+                            tokio::time::sleep(Duration::from_secs(30)).await;
+                            return;
+                        }
                         let Ok(encrypted) = acceptor.accept(io.into_inner()).await else {
                             return;
                         };
@@ -1112,6 +1340,7 @@ mod tests {
                         // script serves it again.
                         let mut again = self.clone();
                         again.tls = None;
+                        again.resumed = true;
                         Box::pin(again.serve(Box::new(encrypted), log)).await;
                         return;
                     }
@@ -1134,11 +1363,18 @@ mod tests {
                             continue;
                         }
                         let mut raw = Vec::new();
-                        let read = read_body_recording(&mut io, &mut raw).await;
+                        let read = read_body_recording(&mut io, &mut raw, self.read_delay).await;
                         {
                             let mut log = log.lock().unwrap();
                             log.raw = Some(raw);
                             log.body = read;
+                        }
+                        if self.stall_at_dot {
+                            // The message is in: a content scan that outruns
+                            // the client's patience looks exactly like this,
+                            // and the destination may still queue it.
+                            tokio::time::sleep(Duration::from_secs(30)).await;
+                            return;
                         }
                         let _ = say(&mut io, &self.dot).await;
                     }
@@ -1170,13 +1406,20 @@ mod tests {
     /// stuffing undone. [`wire::read_body`] cannot be used for this because
     /// it is the code under test's own counterpart: a test of byte fidelity
     /// that trusted it would pass on a symmetric mistake.
-    async fn read_body_recording<R>(io: &mut R, raw: &mut Vec<u8>) -> Option<Vec<u8>>
+    async fn read_body_recording<R>(
+        io: &mut R,
+        raw: &mut Vec<u8>,
+        per_line: Option<Duration>,
+    ) -> Option<Vec<u8>>
     where
         R: tokio::io::AsyncBufRead + Unpin,
     {
         use tokio::io::AsyncReadExt;
         let mut unstuffed = Vec::new();
         loop {
+            if let Some(delay) = per_line {
+                tokio::time::sleep(delay).await;
+            }
             let mut line = Vec::new();
             loop {
                 let mut byte = [0u8; 1];
@@ -1273,6 +1516,28 @@ mod tests {
                     Ok(client)
                 }
             }
+        }
+    }
+
+    // ------------------------------------------------------------- a slow DNS
+
+    /// A resolver that answers correctly, eventually. The question a delivery
+    /// budget has to answer is what happens while DNS is thinking, and a
+    /// table answers instantly.
+    struct Slow {
+        inner: Table,
+        delay: Duration,
+    }
+
+    impl Resolve for Slow {
+        async fn mx(&self, domain: &str) -> Result<Vec<crate::dns::Target>, DnsError> {
+            tokio::time::sleep(self.delay).await;
+            Resolve::mx(&self.inner, domain).await
+        }
+
+        async fn addrs(&self, host: &str) -> Result<Vec<IpAddr>, DnsError> {
+            tokio::time::sleep(self.delay).await;
+            Resolve::addrs(&self.inner, host).await
         }
     }
 
@@ -1781,14 +2046,19 @@ mod tests {
         let cert = CertificateDer::from(signed.cert.der().to_vec());
         let key = PrivateKeyDer::try_from(signed.signing_key.serialize_der()).expect("a key");
 
-        let server = ServerConfig::builder()
+        let provider = Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
+        let server = ServerConfig::builder_with_provider(Arc::clone(&provider))
+            .with_safe_default_protocol_versions()
+            .expect("the default versions")
             .with_no_client_auth()
             .with_single_cert(vec![cert.clone()], key)
             .expect("a server config");
 
         let mut roots = RootCertStore::empty();
         roots.add(cert).expect("a trusted root");
-        let client = ClientConfig::builder()
+        let client = ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .expect("the default versions")
             .with_root_certificates(roots)
             .with_no_client_auth();
 
@@ -1923,13 +2193,375 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn the_client_sends_ehlo_after_the_handshake_without_waiting_for_a_greeting() {
+        // RFC 3207 §4.2 resets the session to the state *after* the greeting:
+        // Postfix, Exim and Gmail send nothing and wait for EHLO, and so does
+        // this project's own inbound server. A client that reads a 220 first
+        // spends its whole command budget in silence against every real
+        // destination that offers STARTTLS — which is every real one — and
+        // never reaches MAIL FROM. The fake above is honest about this now,
+        // so the plain `starttls_is_used_when_offered…` test is the thing
+        // that turns red if it comes back; this one says so by name.
+        let (acceptor, connector) = tls_pair();
+        let offering = Mta {
+            tls: Some(acceptor),
+            ..Mta::default().keywords(&["SIZE 10485760", "8BITMIME", "STARTTLS"])
+        };
+        let pipes = Pipes::new(&[("203.0.113.1", Script::Serve(offering))]);
+        let mut out = outbound();
+        out.tls = Some(connector);
+        // Short enough that waiting for a greeting that never comes is a
+        // failure rather than a slow pass.
+        out.budget.command = Duration::from_millis(300);
+
+        let outcome = deliver(&two_exchangers(), &pipes, &out, &message(b"hi\r\n")).await;
+
+        assert_eq!(
+            verdicts(&outcome),
+            vec!["hi@example.com: accepted"],
+            "the message has to go out inside TLS, not time out waiting to be \
+             greeted twice"
+        );
+        let log = pipes.connections()[0].1.clone();
+        assert!(log.encrypted);
+        assert!(
+            log.commands.iter().any(|c| c.starts_with("MAIL FROM:")),
+            "MAIL FROM is never sent when the client waits for a second \
+             greeting: {:?}",
+            log.commands
+        );
+    }
+
+    #[tokio::test]
+    async fn the_client_delivers_to_this_projects_own_inbound_server() {
+        // The two halves of the state machine keeping each other honest. The
+        // headline bug was that `client::open` read a greeting the server
+        // half does not send after a handshake, and every test passed because
+        // the only server in the tests was a fake written to match the
+        // client. A real destination here is the one thing that could not
+        // have agreed with the mistake.
+        use crate::routing::Route;
+        use crate::spool::Spool;
+
+        let dir = std::env::temp_dir()
+            .join("mxhop-tests")
+            .join(format!("client-to-session-{}", crate::spool::new_id()));
+        std::fs::create_dir_all(&dir).expect("a scratch dir");
+        let spool = Spool::open(&dir).await.expect("a spool");
+
+        let mut router = crate::routing::Router::default();
+        router.insert(
+            "example.com",
+            "hi",
+            Route::Forward(vec![Mailbox::parse("onward@gmail.test").unwrap()]),
+        );
+
+        let config = crate::smtp::session::SessionConfig {
+            hostname: "mx.inbound.test".into(),
+            max_message_bytes: 1024 * 1024,
+            max_recipients: 10,
+            max_errors: 4,
+            command_timeout: Duration::from_secs(5),
+            data_timeout: Duration::from_secs(5),
+            handshake_timeout: Duration::from_secs(5),
+        };
+
+        let (client, server) = duplex(256 * 1024);
+        let served = {
+            let spool = spool.clone();
+            tokio::spawn(async move {
+                crate::smtp::session::serve(
+                    server,
+                    "203.0.113.5:40000".to_string(),
+                    &config,
+                    &router,
+                    &spool,
+                    None,
+                )
+                .await
+            })
+        };
+
+        let body: &[u8] = b"Subject: across the pipe\r\n\r\n.dotted\r\nbody\r\n";
+        let delivery = message(body);
+        let out = outbound();
+        let results = dialog(
+            client,
+            "mx.inbound.test",
+            &out,
+            &delivery,
+            None,
+            Instant::now() + out.budget.overall,
+        )
+        .await
+        .expect("the two halves should agree");
+
+        assert!(
+            results.iter().all(|r| r.verdict == Verdict::Accepted),
+            "{results:?}"
+        );
+        // The client says QUIT and does not wait for the 221 — there is
+        // nothing left to learn from it — so the server's goodbye lands on a
+        // closed pipe. That is what every real session looks like.
+        let _ = served.await.expect("the task");
+
+        let queued = spool.queued().await.expect("the queue");
+        assert_eq!(queued.len(), 1, "exactly one message should have landed");
+        let stored = spool.body(&queued[0].id).await.expect("the stored message");
+        assert!(
+            stored.ends_with(&[HEAD, body].concat()),
+            "the message has to arrive byte for byte, dot-stuffing undone at \
+             the far end"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_handshake_that_never_finishes_falls_back_instead_of_hanging() {
+        // A destination or middlebox that answers 220 to STARTTLS and then
+        // sends nothing. With the handshake awaited bare there is no data
+        // flowing for TCP to give up on, so `deliver` hangs — and the inbound
+        // session waiting on us hangs with it, which makes the overall
+        // ceiling a fiction. Classifying it as a TLS failure rather than a
+        // timeout is what puts it through the plaintext fallback, which is
+        // the right answer for a middlebox that mangles TLS.
+        let (acceptor, connector) = tls_pair();
+        let stalling = Mta {
+            tls: Some(acceptor),
+            stall_after_starttls: true,
+            ..Mta::default().keywords(&["SIZE 10485760", "STARTTLS"])
+        };
+        let pipes = Pipes::new(&[
+            ("203.0.113.1", Script::Serve(stalling)),
+            ("203.0.113.1", Script::Serve(Mta::default())),
+        ]);
+        let mut out = outbound();
+        out.tls = Some(connector);
+        out.budget.command = Duration::from_millis(150);
+        out.budget.overall = Duration::from_secs(20);
+
+        let started = Instant::now();
+        let outcome = deliver(&two_exchangers(), &pipes, &out, &message(b"hi\r\n")).await;
+
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the handshake has to be inside the budget — took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            verdicts(&outcome),
+            vec!["hi@example.com: accepted"],
+            "and a stalled handshake is a TLS failure, so the plaintext \
+             fallback delivers: {:?}",
+            verdicts(&outcome)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_destination_that_never_answers_the_final_dot_is_not_tried_again() {
+        // The message is on the wire in full. The destination may well have
+        // queued it — a slow content scan, or a reply lost to a reset — so
+        // moving to the next host sends a second copy, and the recipient gets
+        // the message twice. Nothing about a duplicate is recoverable, and a
+        // deferral is.
+        let stalling = Mta {
+            stall_at_dot: true,
+            ..Mta::default()
+        };
+        let pipes = Pipes::new(&[
+            ("203.0.113.1", Script::Serve(stalling)),
+            ("203.0.113.2", Script::Serve(Mta::default())),
+        ]);
+        let mut out = outbound();
+        out.budget.end_of_data = Duration::from_millis(120);
+        out.budget.overall = Duration::from_secs(20);
+
+        let outcome = deliver(&two_exchangers(), &pipes, &out, &message(b"hi\r\n")).await;
+
+        assert_eq!(
+            pipes.connections().len(),
+            1,
+            "the second exchanger must not be handed a copy of a message the \
+             first one may already have queued"
+        );
+        assert!(
+            matches!(outcome.results[0].verdict, Verdict::Deferred(_)),
+            "nothing was settled, so nothing may be refused: {:?}",
+            verdicts(&outcome)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refusing_greeting_reaches_the_sender_in_the_destinations_own_words() {
+        // A block list's reply is the only useful thing a refused connection
+        // produces, and its URL is the only thing the sender can act on.
+        // Filing it as "not an SMTP reply" and then letting a connection
+        // refused on the next host overwrite it tells the sender nothing at
+        // all. In the next milestone this sentence goes straight back to a
+        // stranger's mail server.
+        let blocked = Mta {
+            greeting: "554-5.7.1 Service unavailable; Client host [203.0.113.7] blocked\r\n\
+                       554 5.7.1 using Spamhaus; see https://check.spamhaus.org/"
+                .into(),
+            ..Mta::default()
+        };
+        let pipes = Pipes::new(&[
+            ("203.0.113.1", Script::Serve(blocked)),
+            ("203.0.113.2", Script::Refuse),
+        ]);
+
+        let outcome = deliver(&two_exchangers(), &pipes, &outbound(), &message(b"hi\r\n")).await;
+
+        let Verdict::Deferred(reply) = &outcome.results[0].verdict else {
+            panic!(
+                "a 5xx greeting is a host that will not talk, not mail that is \
+                 refused — Postfix's smtp_skip_5xx_greeting = yes: {:?}",
+                verdicts(&outcome)
+            );
+        };
+        let said = reply.to_string();
+        assert!(
+            said.contains("check.spamhaus.org"),
+            "the destination's own words and its URL are the whole value of \
+             this reply: {said}"
+        );
+        assert!(
+            said.contains("mx1.example.com refused the connection"),
+            "and the sender needs to know which host said it: {said}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_deadline_that_passes_before_any_host_is_examined_is_not_a_refusal() {
+        // `550 5.1.2 no mail exchanger has an address` is permanent and goes
+        // back to the sender as a bounce. Reaching it because a slow MX
+        // lookup used up the budget before a single host was looked at
+        // bounces mail that is perfectly deliverable, on the strength of
+        // nothing having been tried.
+        let slow = Slow {
+            inner: two_exchangers(),
+            delay: Duration::from_millis(200),
+        };
+        let mut out = outbound();
+        out.budget.command = Duration::from_millis(60);
+        out.budget.overall = Duration::from_millis(60);
+
+        let outcome = deliver(&slow, &Pipes::new(&[]), &out, &message(b"hi\r\n")).await;
+
+        assert!(
+            matches!(outcome.results[0].verdict, Verdict::Deferred(_)),
+            "nothing was asked of any host, so nothing may be concluded about \
+             them: {:?}",
+            verdicts(&outcome)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dns_lookup_that_does_not_answer_stays_inside_the_budget() {
+        // hickory will spend five seconds twice per query against an
+        // unresponsive resolver. An MX lookup plus one address lookup per
+        // exchanger, all outside the clock, puts a 180 second ceiling tens of
+        // seconds past three minutes while the inbound sender waits on us.
+        let slow = Slow {
+            inner: two_exchangers(),
+            delay: Duration::from_secs(30),
+        };
+        let mut out = outbound();
+        out.budget.command = Duration::from_millis(100);
+        out.budget.overall = Duration::from_secs(20);
+
+        let started = Instant::now();
+        let outcome = deliver(&slow, &Pipes::new(&[]), &out, &message(b"hi\r\n")).await;
+
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the MX lookup has to be under the clock — took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            matches!(outcome.results[0].verdict, Verdict::Deferred(_)),
+            "{:?}",
+            verdicts(&outcome)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_head_that_does_not_end_a_line_does_not_get_a_dot_in_the_middle_of_one() {
+        // `head` is generated in the next PR, and a head without a trailing
+        // CRLF followed by a body beginning with a dot produces a stuffed dot
+        // inside a line — a changed byte underneath the sender's DKIM
+        // signature, which receivers read as forgery.
+        let pipes = Pipes::new(&[("203.0.113.1", Script::Serve(Mta::default()))]);
+        let head: &[u8] = b"X-Forwarded-For: 203.0.113.9";
+        let body: &[u8] = b".hidden\r\nbody\r\n";
+        let delivery = Delivery::new(
+            Some("sender@elsewhere.test".into()),
+            to(&["hi@example.com"]),
+            head.to_vec(),
+            Arc::from(body),
+        );
+
+        let outcome = deliver(&two_exchangers(), &pipes, &outbound(), &delivery).await;
+        assert_eq!(verdicts(&outcome), vec!["hi@example.com: accepted"]);
+
+        let log = pipes.connections()[0].1.clone();
+        assert_eq!(
+            log.body.as_deref(),
+            Some([head, body].concat().as_slice()),
+            "the dot here is data, not a line's first byte"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_slow_but_progressing_destination_is_not_cut_off_mid_body() {
+        // `Budget::body` is a stall timeout. Applied to the whole body it is
+        // a throughput floor instead — 60 seconds for 25 MiB demands about
+        // 3.5 Mbit/s — and a slow but healthy destination has the message cut
+        // off part-written and sent again from the start.
+        let slow_reader = Mta {
+            read_delay: Some(Duration::from_millis(2)),
+            ..Mta::default()
+        };
+        let pipes = Pipes::new(&[("203.0.113.1", Script::Serve(slow_reader))]);
+        // 600 lines of a kilobyte each: bigger than the pipe, so the writes
+        // really do block on the reader, and 1.2 seconds of reading at two
+        // milliseconds a line — twice what one `body` budget allows.
+        let line = [vec![b'x'; 1022].as_slice(), b"\r\n"].concat();
+        let body: Vec<u8> = line.repeat(600);
+        let mut out = outbound();
+        out.budget.body = Duration::from_millis(600);
+        out.budget.overall = Duration::from_secs(30);
+
+        let outcome = deliver(&two_exchangers(), &pipes, &out, &message(&body)).await;
+
+        assert_eq!(
+            verdicts(&outcome),
+            vec!["hi@example.com: accepted"],
+            "every chunk made progress, so nothing stalled"
+        );
+    }
+
     // ------------------------------------------------------- the small pieces
 
     #[test]
     fn dot_stuffing_touches_only_the_dot() {
         let mut out = Vec::new();
-        stuff(b".a\r\nb.\r\n..c\r\n\xffd\r\n", &mut out);
+        let ended_a_line = stuff(b".a\r\nb.\r\n..c\r\n\xffd\r\n", true, &mut out);
         assert_eq!(out, b"..a\r\nb.\r\n...c\r\n\xffd\r\n");
+        assert!(ended_a_line);
+    }
+
+    #[test]
+    fn dot_stuffing_carries_the_line_state_between_chunks() {
+        // The head and the body are written by two calls over one byte
+        // stream. A head that does not end in CRLF leaves the body's first
+        // byte mid-line, and a dot there is data — stuffing it changes a byte
+        // the sender signed.
+        let mut out = Vec::new();
+        let at_line_start = stuff(b"X-Spam-Status: No", true, &mut out);
+        assert!(!at_line_start);
+        stuff(b".hidden\r\n", at_line_start, &mut out);
+        assert_eq!(out, b"X-Spam-Status: No.hidden\r\n");
     }
 
     #[test]

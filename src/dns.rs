@@ -171,6 +171,38 @@ impl Hickory {
             .map_err(|e| DnsError::Failed(e.to_string()))?;
         Ok(Self { inner })
     }
+
+    /// A resolver that asks exactly one nameserver, for the tests. The two
+    /// kinds of A-lookup failure can only be told apart by what a nameserver
+    /// actually answers, so the test needs one it can make answer SERVFAIL.
+    #[cfg(test)]
+    fn against(server: std::net::SocketAddr) -> Self {
+        use hickory_resolver::config::{ConnectionConfig, NameServerConfig, ResolverConfig};
+
+        let mut udp = ConnectionConfig::udp();
+        udp.port = server.port();
+        let config = ResolverConfig::from_parts(
+            None,
+            Vec::new(),
+            vec![{
+                let mut ns = NameServerConfig::udp(server.ip());
+                ns.connections = vec![udp];
+                ns
+            }],
+        );
+        let mut builder = hickory_resolver::Resolver::builder_with_config(
+            config,
+            hickory_resolver::net::runtime::TokioRuntimeProvider::default(),
+        );
+        // One question, one answer: no retries, no fallback to TCP and no
+        // cache, so the test reads back exactly what it scripted.
+        builder.options_mut().attempts = 0;
+        builder.options_mut().try_tcp_on_error = false;
+        builder.options_mut().cache_size = 0;
+        Self {
+            inner: builder.build().expect("a resolver"),
+        }
+    }
 }
 
 impl Resolve for Hickory {
@@ -198,13 +230,70 @@ impl Resolve for Hickory {
         }
     }
 
+    /// The A records first and the AAAA records after them, with the two
+    /// kinds of A failure kept apart.
+    ///
+    /// Not `lookup_ip`: its `Ipv4thenIpv6` strategy falls through to AAAA on
+    /// *any* A error, SERVFAIL and timeout included. The caller then sees a
+    /// host with IPv6 addresses and no IPv4 ones, which is indistinguishable
+    /// from a host that publishes only AAAA — and a host that publishes only
+    /// AAAA is dialled over IPv6 even with `ipv6 = false`, because the
+    /// alternative would be not delivering at all. On a VPS with no matching
+    /// IPv6 PTR that earns Gmail's `550-5.7.25`, which is read as a permanent
+    /// refusal and relayed to the sender. A transient resolver hiccup must
+    /// not be able to bounce somebody's mail, so an A lookup that failed is
+    /// reported as a failure and the AAAA query is not used to paper over it.
     async fn addrs(&self, host: &str) -> Result<Vec<IpAddr>, DnsError> {
-        match self.inner.lookup_ip(host).await {
-            Ok(answer) => Ok(answer.iter().collect()),
-            Err(e) if e.is_no_records_found() => Err(DnsError::NotFound),
-            Err(e) => Err(DnsError::Failed(e.to_string())),
-        }
+        let v4 = match self.inner.ipv4_lookup(host).await {
+            Ok(answer) => Some(v4_of(&answer)),
+            // "this name has no A records" is an answer, and the only one
+            // that justifies asking for AAAA instead.
+            Err(e) if e.is_no_records_found() => None,
+            Err(e) => return Err(DnsError::Failed(e.to_string())),
+        };
+
+        let Some(v4) = v4 else {
+            return match self.inner.ipv6_lookup(host).await {
+                Ok(answer) => Ok(v6_of(&answer)),
+                Err(e) if e.is_no_records_found() => Err(DnsError::NotFound),
+                Err(e) => Err(DnsError::Failed(e.to_string())),
+            };
+        };
+
+        // There is a route either way now, so an AAAA lookup that fails costs
+        // nothing but the addresses it would have added.
+        let v6 = self
+            .inner
+            .ipv6_lookup(host)
+            .await
+            .map(|answer| v6_of(&answer))
+            .unwrap_or_default();
+        Ok(v4.into_iter().chain(v6).collect())
     }
+}
+
+/// The A records of an answer. An A lookup's answer section can carry a
+/// CNAME chain as well, which is not an address.
+fn v4_of(answer: &hickory_resolver::lookup::Lookup) -> Vec<IpAddr> {
+    answer
+        .answers()
+        .iter()
+        .filter_map(|record| match &record.data {
+            hickory_resolver::proto::rr::RData::A(a) => Some(IpAddr::V4(a.0)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn v6_of(answer: &hickory_resolver::lookup::Lookup) -> Vec<IpAddr> {
+    answer
+        .answers()
+        .iter()
+        .filter_map(|record| match &record.data {
+            hickory_resolver::proto::rr::RData::AAAA(aaaa) => Some(IpAddr::V6(aaaa.0)),
+            _ => None,
+        })
+        .collect()
 }
 
 // ------------------------------------------------------------ the one for tests
@@ -273,6 +362,165 @@ impl Resolve for Table {
 
 #[cfg(test)]
 mod tests {
+    // ------------------------------------------ a nameserver that can be rude
+
+    /// What the fake nameserver does with one question.
+    #[derive(Clone, Copy)]
+    enum Answer {
+        /// One address record of the matching type.
+        Address,
+        /// NOERROR with nothing in it: this name has no records of this type.
+        Empty,
+        /// SERVFAIL — the resolver did not answer the question.
+        ServFail,
+    }
+
+    /// A nameserver that answers A and AAAA separately and however it is
+    /// told. The whole point of the `addrs` rewrite is which *kind* of A
+    /// failure is allowed to fall through to AAAA, and only a real
+    /// nameserver's rcode can tell a SERVFAIL from an empty answer — a table
+    /// of addresses cannot express the difference at all.
+    async fn nameserver(a: Answer, aaaa: Answer) -> std::net::SocketAddr {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("a port");
+        let addr = socket.local_addr().expect("the port");
+
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            loop {
+                let Ok((n, from)) = socket.recv_from(&mut buf).await else {
+                    return;
+                };
+                if n < 12 {
+                    continue;
+                }
+                // Walk the single question: labels, then qtype and qclass.
+                let mut at = 12;
+                while at < n && buf[at] != 0 {
+                    at += 1 + buf[at] as usize;
+                }
+                if at + 5 > n {
+                    continue;
+                }
+                let end = at + 5;
+                let qtype = u16::from_be_bytes([buf[at + 1], buf[at + 2]]);
+                let question = &buf[12..end];
+
+                let reply = match qtype {
+                    1 => a,
+                    28 => aaaa,
+                    _ => Answer::Empty,
+                };
+
+                let mut out = Vec::with_capacity(64);
+                out.extend_from_slice(&buf[..2]); // the query's id
+                // QR, recursion desired and available, and the rcode.
+                let rcode: u16 = if matches!(reply, Answer::ServFail) {
+                    2
+                } else {
+                    0
+                };
+                out.extend_from_slice(&(0x8180 | rcode).to_be_bytes());
+                out.extend_from_slice(&1u16.to_be_bytes()); // one question
+                let answers: u16 = if matches!(reply, Answer::Address) {
+                    1
+                } else {
+                    0
+                };
+                out.extend_from_slice(&answers.to_be_bytes());
+                out.extend_from_slice(&0u16.to_be_bytes()); // no authorities
+                out.extend_from_slice(&0u16.to_be_bytes()); // no additionals
+                out.extend_from_slice(question);
+
+                if matches!(reply, Answer::Address) {
+                    out.extend_from_slice(&0xc00cu16.to_be_bytes()); // the question's name
+                    out.extend_from_slice(&qtype.to_be_bytes());
+                    out.extend_from_slice(&1u16.to_be_bytes()); // IN
+                    out.extend_from_slice(&60u32.to_be_bytes()); // ttl
+                    if qtype == 1 {
+                        out.extend_from_slice(&4u16.to_be_bytes());
+                        out.extend_from_slice(&[203, 0, 113, 4]);
+                    } else {
+                        out.extend_from_slice(&16u16.to_be_bytes());
+                        let v6: std::net::Ipv6Addr = "2001:db8::6".parse().unwrap();
+                        out.extend_from_slice(&v6.octets());
+                    }
+                }
+
+                let _ = socket.send_to(&out, from).await;
+            }
+        });
+
+        addr
+    }
+
+    #[tokio::test]
+    async fn a_servfail_on_the_a_record_is_a_failure_and_not_an_ipv6_only_host() {
+        // `lookup_ip`'s default `Ipv4thenIpv6` strategy queries AAAA on *any*
+        // A error, SERVFAIL and timeout included. The caller then sees a host
+        // with AAAA records and no A records, which is indistinguishable from
+        // a host that publishes only AAAA — and such a host is dialled over
+        // IPv6 even with `ipv6 = false`, because the alternative is not
+        // delivering at all. From a VPS with no matching IPv6 PTR Gmail
+        // answers `550-5.7.25`, which is read as permanent and bounced back
+        // to the sender. A transient resolver hiccup must not be able to do
+        // that.
+        let server = nameserver(Answer::ServFail, Answer::Address).await;
+
+        let found = Hickory::against(server).addrs("mx.example.com").await;
+
+        assert!(
+            matches!(found, Err(DnsError::Failed(_))),
+            "a resolver that did not answer the A question has said nothing, \
+             and the AAAA answer must not stand in for it: {found:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_name_with_no_a_record_falls_through_to_its_aaaa_records() {
+        // The one A failure that *is* an answer. A destination that publishes
+        // only AAAA would otherwise be undeliverable.
+        let server = nameserver(Answer::Empty, Answer::Address).await;
+
+        let found = Hickory::against(server)
+            .addrs("mx.example.com")
+            .await
+            .expect("the AAAA records");
+
+        assert_eq!(found, vec!["2001:db8::6".parse::<IpAddr>().unwrap()]);
+    }
+
+    #[tokio::test]
+    async fn the_a_records_come_first_and_a_broken_aaaa_lookup_costs_nothing() {
+        // There is a route either way once the A lookup has answered, so an
+        // AAAA query that fails must not take the delivery down with it — and
+        // IPv4 has to stay in front, which is the preference the whole of
+        // `usable` rests on.
+        let server = nameserver(Answer::Address, Answer::ServFail).await;
+
+        let found = Hickory::against(server)
+            .addrs("mx.example.com")
+            .await
+            .expect("the A records");
+
+        assert_eq!(found, vec!["203.0.113.4".parse::<IpAddr>().unwrap()]);
+    }
+
+    #[tokio::test]
+    async fn a_name_with_neither_kind_of_address_is_not_found() {
+        let server = nameserver(Answer::Empty, Answer::Empty).await;
+
+        let found = Hickory::against(server).addrs("mx.example.com").await;
+
+        assert_eq!(
+            found,
+            Err(DnsError::NotFound),
+            "DNS answered that this name has no address, which is information \
+             and not a silence"
+        );
+    }
+
     use super::*;
 
     fn hosts(found: &[Target]) -> Vec<&str> {
