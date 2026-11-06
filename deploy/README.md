@@ -105,20 +105,28 @@ project — open the message and read its headers.
   the wrong host once SPF lands.
 - **`order: stop-first`, `init: true`, `stop_grace_period: 30s`.** A
   host-mode port 25 cannot be held by two tasks at once, so the new task has
-  to wait for the old one to let go. mxhop has no SIGTERM handler yet
-  (graceful shutdown is the 0.2 row of the root README's status table): it
-  registers SIGHUP only and the accept loop never returns. As pid 1 an
-  unhandled SIGTERM is not even delivered to it, so without `init: true`
-  every deploy, `service update` and `docker stop` waited out the full grace
-  period and then SIGKILLed — a minute of downtime on each one. tini as pid 1
-  makes SIGTERM an ordinary signal to an ordinary process, so the task ends
-  immediately; tini forwards SIGHUP as well, so the certificate reload below
-  is unaffected. A SIGKILL cannot corrupt the spool: the body and the
-  envelope are written into `tmp/`, fsynced, and only then renamed into
+  to wait for the old one to let go.
+
+  mxhop has no SIGTERM handler of its own — it registers SIGHUP only and the
+  accept loop never returns, so there is no graceful shutdown yet (it is the
+  0.2 row of the root README's status table). It still exits promptly:
+  measured on this image, mxhop as pid 1 dies with 143 on the first SIGTERM,
+  because tokio's signal driver installs a handler for it as a side effect of
+  mxhop asking for SIGHUP, and a *caught* signal is delivered to pid 1. That
+  is a runtime implementation detail and not a promise, so `init: true` makes
+  it the stack's own: tini is pid 1, SIGTERM reaches mxhop as an ordinary
+  process, and a deploy cannot start silently waiting out the grace period
+  because something changed inside tokio. tini forwards SIGHUP as well, so
+  the certificate reload below is unaffected.
+
+  The abrupt exit costs nothing in the spool: it writes the body and the
+  envelope into `tmp/`, fsyncs them and only then renames them into
   `queue/`, and delivery ignores an `.eml` whose `.json` rename never
-  happened — so the worst a kill leaves is a stray file, never half a message
-  that gets delivered, and the sender that never saw its `250` retries. The grace period
-  only starts to mean something once graceful shutdown lands.
+  happened — so the worst case is a stray file, never half a message that
+  gets delivered, and the sender that never saw its `250` retries. The grace
+  period is 30s rather than 60s because nothing currently uses it; SMTP's own
+  timeouts are 5 minutes per command and 10 inside `DATA`, which 60s never
+  covered anyway. It starts to mean something once graceful shutdown lands.
 - **The spool as a bind mount.** `docker system prune --volumes` removes
   named volumes. The spool holds mail that was accepted and not yet
   delivered, so that prune would delete mail the sender was already told had

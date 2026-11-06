@@ -85,29 +85,37 @@ services:
           # directory of files.
           memory: 256M
 
-    # tini as pid 1, because mxhop does not handle SIGTERM yet — it
-    # registers SIGHUP only, and the accept loop never returns (graceful
-    # shutdown is in the 0.2 row of the README's status table). The kernel
-    # does not deliver an unhandled signal to pid 1, so with mxhop itself as
-    # pid 1 every `stack deploy`, `service update` and `docker stop` sat out
-    # the whole grace period below and then took a SIGKILL. With tini as pid
-    # 1 the SIGTERM reaches mxhop as an ordinary process, its default action
-    # applies, and the task ends at once.
+    # tini as pid 1. Not because SIGTERM is currently lost — it is not:
+    # measured on this image, mxhop as pid 1 exits at once with 143, because
+    # tokio's signal driver installs a handler for SIGTERM even though mxhop
+    # only ever asks it for SIGHUP, and a caught signal IS delivered to pid
+    # 1. That is an implementation detail of the async runtime, not anything
+    # this program states, and the day it changes every deploy would silently
+    # start waiting out the grace period below and then SIGKILLing. tini
+    # makes the behaviour the stack's own: SIGTERM reaches mxhop as an
+    # ordinary process with an ordinary default action. It also reaps the
+    # zombies a pid 1 otherwise has to.
+    #
+    # What is NOT true today either way: a graceful stop. mxhop registers
+    # SIGHUP only and the accept loop never returns, so the exit cuts open
+    # sessions off mid-command. Graceful shutdown is the 0.2 row of the root
+    # README's status table.
     #
     # tini forwards SIGHUP too, so the certificate reload below still works.
     init: true
 
-    # What a SIGKILL costs today: nothing half-written becomes deliverable.
-    # The spool writes body and envelope into tmp/, fsyncs them and only then
-    # renames them into queue/; delivery skips an .eml whose .json rename did
-    # not happen, so a kill leaves at worst a stray file, and a sender that
-    # never got its 250 retries. So this period
-    # is not protecting an in-flight DATA — it cannot, nothing stops the
-    # accept loop — and SMTP's own timeouts are 5 minutes per command and 10
-    # minutes inside DATA, which 60s never covered anyway. It is kept short
-    # and will become meaningful when graceful shutdown lands: then mxhop
-    # will stop accepting on SIGTERM, let open sessions finish, and exit
-    # inside this window.
+    # What an abrupt exit costs today: nothing half-written becomes
+    # deliverable. The spool writes body and envelope into tmp/, fsyncs them
+    # and only then renames them into queue/; delivery skips an .eml whose
+    # .json rename did not happen, so the worst a kill leaves is a stray
+    # file, and a sender that never got its 250 retries.
+    #
+    # So this period is not protecting an in-flight DATA — it cannot,
+    # nothing stops the accept loop — and SMTP's own timeouts are 5 minutes
+    # per command and 10 minutes inside DATA, which the 60s that used to be
+    # here never covered either. It is kept short, and becomes meaningful
+    # only when graceful shutdown lands: then mxhop will stop accepting on
+    # SIGTERM, let open sessions finish, and exit inside this window.
     stop_grace_period: 30s
 
     cap_drop:

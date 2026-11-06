@@ -12,9 +12,9 @@ if [ "$1" = "run" ]; then
     mxhop check
 fi
 
-# exec, so the SMTP process keeps the pid the init gave it and receives
-# SIGHUP directly — that is how a renewed TLS certificate is reloaded, and a
-# shell in between would swallow it. Note that this process is NOT pid 1 in
-# the stack: the service sets `init: true`, so tini is pid 1 and forwards
-# signals here. See deploy/mxhop.stack.yml for why that matters.
+# exec, so no shell is left between the signal and the SMTP process: SIGHUP
+# is how a renewed TLS certificate is reloaded, and `sh` would swallow it
+# while mxhop ran as its child. Note that mxhop is not necessarily pid 1 —
+# the stack sets `init: true` so tini holds that slot and forwards signals
+# here; see deploy/mxhop.stack.yml for why.
 exec mxhop "$@"
