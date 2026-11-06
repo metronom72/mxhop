@@ -1,0 +1,14 @@
+# Keep the build context to the sources: target/ is gigabytes and is rebuilt
+# for a different libc anyway, and local runtime state is not input.
+/target
+/.git
+/.github
+/spool
+/deploy
+*.pem
+.env
+
+# Not an input: with this file in the context cargo resolves `stable` instead
+# of the toolchain rust:1.91-alpine installs, and rustup downloads the day's
+# stable mid-build. Excluding it is what makes the base image's pin real.
+rust-toolchain.toml
