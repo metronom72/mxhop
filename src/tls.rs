@@ -129,21 +129,32 @@ fn build(paths: &TlsPaths) -> Result<(Arc<ServerConfig>, Fingerprint), TlsError>
     let key = read_key(&paths.key)?;
     let fingerprint = fingerprint_of(&chain[0]);
 
-    let config = ServerConfig::builder()
-        .with_no_client_auth()
-        // A receiving MX cannot ask senders for certificates: nobody has one
-        // it could check against.
-        .with_single_cert(chain, key)
-        .map_err(|e| match e {
-            // rustls compares the public keys for us; the operator-facing
-            // version of that is "your two files are from different
-            // renewals".
-            rustls::Error::InconsistentKeys(_) => TlsError::Mismatch {
-                certificate: paths.certificate.clone(),
-                key: paths.key.clone(),
-            },
-            other => TlsError::Rustls(other),
-        })?;
+    // The provider is named rather than left to rustls to work out. With
+    // `ServerConfig::builder()` the choice is the process-wide default, and
+    // that default is ambiguous — and so a panic, inside `Holder::open`, with
+    // rustls's own wording rather than an operator message — the moment any
+    // dependency enables `rustls/aws-lc-rs`. Outbound delivery is the next
+    // milestone and several mail and HTTP crates pull aws-lc in by default,
+    // so naming ring here is what keeps that from turning into a crash at
+    // startup.
+    let config =
+        ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .map_err(TlsError::Rustls)?
+            .with_no_client_auth()
+            // A receiving MX cannot ask senders for certificates: nobody has one
+            // it could check against.
+            .with_single_cert(chain, key)
+            .map_err(|e| match e {
+                // rustls compares the public keys for us; the operator-facing
+                // version of that is "your two files are from different
+                // renewals".
+                rustls::Error::InconsistentKeys(_) => TlsError::Mismatch {
+                    certificate: paths.certificate.clone(),
+                    key: paths.key.clone(),
+                },
+                other => TlsError::Rustls(other),
+            })?;
 
     Ok((Arc::new(config), fingerprint))
 }
@@ -266,6 +277,24 @@ mod tests {
             said.contains("read access"),
             "a permission is the other half of 'cannot be read': {said}"
         );
+    }
+
+    /// `ServerConfig::builder()` takes the process-wide default provider and
+    /// panics when there is none or more than one. A dependency that enables
+    /// `rustls/aws-lc-rs` would do exactly that, and the crash would land
+    /// inside `Holder::open` — in `check` as well as `run`. Loading with no
+    /// default installed is the only cheap proof that the provider is named
+    /// here and not inherited.
+    #[test]
+    fn a_certificate_loads_without_a_process_wide_crypto_provider() {
+        assert!(
+            rustls::crypto::CryptoProvider::get_default().is_none(),
+            "this test is only meaningful while nothing installs a default provider"
+        );
+
+        let dir = scratch("tls-provider");
+        let (crt, key) = write(&dir, "mx", "mx.test");
+        Holder::open(paths(crt, key)).expect("the provider is named, not looked up");
     }
 
     /// A Caddy renewal that is half-finished leaves a new certificate beside
