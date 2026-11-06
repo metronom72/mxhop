@@ -30,18 +30,33 @@ use crate::routing::Mailbox;
 
 /// How old an address may be before it is refused, in days.
 ///
-/// 21 is what libsrs2 and postsrsd default to, and it is kept for that reason
-/// rather than because the number is right. The doubt is worth recording: a
-/// legitimate delivery report arrives inside the reporting server's queue
-/// lifetime, which is about five days, so days six to twenty-one mostly widen
-/// the window in which an SRS address harvested out of a `Received` header
-/// can be replayed through this host. What keeps the window open anyway is
-/// that out-of-office replies and delayed reports from slow servers do arrive
-/// late, and refusing one of those is a visible failure somebody chases,
-/// while a replayed address costs at worst one message delivered to a mailbox
-/// that was already receiving mail from us. Configurable, so an operator who
-/// weighs those differently can.
-pub const DEFAULT_MAX_AGE_DAYS: u32 = 21;
+/// A judgement call, and not the one libsrs2 and postsrsd make: they default
+/// to 21, and this is 7. A legitimate delivery report arrives inside the
+/// reporting server's queue lifetime, which is about five days — Postfix's
+/// `maximal_queue_lifetime` default is exactly five — so one week covers the
+/// reports that are actually coming, and days eight to twenty-one are almost
+/// entirely replay surface for an address harvested out of a `Received`
+/// header or guessed off the MAC.
+///
+/// What is given up is the late out-of-office reply and the report from a
+/// server that queued for a fortnight. Those exist, and refusing one is a
+/// visible failure somebody can chase and an operator can fix by raising this
+/// number; a replay window nobody can see is not. The default is the safer of
+/// the two because it is what an operator gets by not thinking about it, and
+/// `max_age_days` is there for the one who has.
+pub const DEFAULT_MAX_AGE_DAYS: u32 = 7;
+
+/// The longest window [`crate::config`] will accept, in days.
+///
+/// Expiry is checked modulo [`DAYS`], so a window of 1022 or more accepts
+/// every address mxhop has ever issued and turns expiry off without saying
+/// so. A year is refused long before that, because a replay window measured
+/// in years is wrong whether or not it wraps.
+pub const MAX_AGE_DAYS_CEILING: u32 = 365;
+
+/// The local part length RFC 5321 §4.5.3.1.1 obliges a receiver to accept.
+/// See [`Srs::rewrite`] for what mxhop does when a wrapped sender exceeds it.
+pub const MAX_LOCAL_PART_OCTETS: usize = 64;
 
 /// The shortest secret worth signing with. Below this the key is findable
 /// offline from a single published SRS address, and then the signature stops
@@ -56,10 +71,24 @@ const BASE32: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 
 const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-/// How many base64 characters of the MAC go into the address. Four is the
-/// consensus length; the real constraint is that the whole local part has to
-/// stay inside 64 octets with somebody else's address already inside it.
-const MAC_CHARS: usize = 4;
+/// How many base64 characters of the MAC go into the address.
+///
+/// Eight, not postsrsd's four. Four was chosen for an interoperability this
+/// file does not have — nothing but mxhop ever verifies an mxhop address —
+/// and against the case-insensitive comparison in [`Srs::verifies`] it is
+/// about 21 bits: 38^4 is 2.1 million, and a session that pipelines `RCPT TO`
+/// guesses at this binary is answered at roughly 380 000 a second, so the
+/// whole space falls in under a minute. postsrsd survives that length because
+/// it sits behind Postfix's `smtpd_hard_error_limit`, `smtpd_error_sleep_time`
+/// and anvil. mxhop now counts a refused recipient as an error, which bounds
+/// the rate, but a 21-bit secret that is only safe because of a counter is
+/// one configuration mistake from being no secret at all.
+///
+/// Eight characters is about 42 bits — 38^8 is 4×10^12, which is out of reach
+/// online at any rate this host can answer — and costs four octets of the
+/// local part. That is the real constraint (see [`Srs::rewrite`]), and four
+/// octets is affordable.
+const MAC_CHARS: usize = 8;
 
 /// The prefix every address this file writes begins with.
 const PREFIX: &str = "SRS0";
@@ -215,14 +244,50 @@ impl Srs {
         domain.eq_ignore_ascii_case(&self.domain)
     }
 
+    /// Whether a non-null sender is one [`Self::rewrite`] can wrap, and why
+    /// not when it is not.
+    ///
+    /// `smtp::command` accepts addresses [`Mailbox::parse`] refuses —
+    /// `bob@localhost`, `user@[192.0.2.1]`, `"a b"@x.test` — and before this
+    /// existed each of those was accepted at `MAIL FROM`, found unwrappable
+    /// at the final dot, and forwarded with the original sender intact and no
+    /// log line. The check belongs at `MAIL FROM`, where the sending server
+    /// is still holding the message and a refusal is something it reports to
+    /// the person who wrote it.
+    pub fn wrappable(&self, sender: &str) -> Result<(), crate::routing::MailboxError> {
+        Mailbox::parse(sender).map(|_| ())
+    }
+
     /// The envelope sender to announce in place of `sender`, or `None` when
     /// the sender has to be left exactly as it is.
     ///
-    /// Two senders are never rewritten. The null sender has nothing to
-    /// rewrite and must acquire nothing: a bounce with a sender is a bounce
-    /// that can itself be bounced. And an address already at our own SRS
-    /// domain is left alone, because wrapping it adds one layer per hop until
-    /// the local part is too long to be an address at all.
+    /// `None` means one of exactly three things, and the caller has to know
+    /// which — see `session::hand_on`, where the three are spelled out.
+    ///
+    /// The null sender has nothing to rewrite and must acquire nothing: a
+    /// bounce with a sender is a bounce that can itself be bounced. An
+    /// address already at our own SRS domain is left alone, because wrapping
+    /// it adds one layer per hop until the local part is too long to be an
+    /// address at all. And a sender that is not a [`Mailbox`] cannot be
+    /// wrapped, which is why [`Self::wrappable`] exists: that one is refused
+    /// at `MAIL FROM` instead of reaching here.
+    ///
+    /// **A wrapped sender is allowed to exceed 64 octets.** The local part
+    /// costs 17 fixed octets plus the original domain plus the original local
+    /// part, so a 40-character local part at a 20-character domain is already
+    /// over the length RFC 5321 §4.5.3.1.1 obliges a receiver to accept, and
+    /// some receivers refuse it. The address is written anyway, because the
+    /// alternative — declining to wrap — is to hand that destination the
+    /// original sender, which is the SPF failure and the backscatter path
+    /// this whole file exists to remove, on the senders with the longest
+    /// addresses and for no stated reason the operator ever sees. Nothing is
+    /// truncated either: a truncated local part is a bounce delivered to
+    /// somebody else, or to nobody, and a signature over a string that is not
+    /// the string in the address. So the failure mode is kept the loud one: a
+    /// receiver that refuses the length answers the `MAIL FROM`, the sending
+    /// server is told, and `session::hand_on` logs a warning naming the
+    /// address so the operator can see which sender it was. Length is also
+    /// why [`MAC_CHARS`] stops at eight rather than going further.
     pub fn rewrite(&self, sender: Option<&str>, day: u32) -> Option<String> {
         let mailbox = Mailbox::parse(sender?).ok()?;
         if self.is_ours(mailbox.domain()) {
@@ -298,10 +363,11 @@ impl Srs {
     ///
     /// Compared case-insensitively: base64 is mixed case, and a destination
     /// that lowercases the whole address before putting it in a bounce's
-    /// `RCPT TO` is doing something SMTP allows. That costs about a bit and a
-    /// half out of the four characters — a forger has to guess one of roughly
-    /// 38^4 strings, and every wrong guess is a refused `RCPT` in our log
-    /// rather than a free offline attempt.
+    /// `RCPT TO` is doing something SMTP allows. That costs about a quarter
+    /// of the bits: a forger has to guess one of roughly 38^[`MAC_CHARS`]
+    /// strings rather than 64^[`MAC_CHARS`] — 4×10^12 at eight characters —
+    /// and every wrong guess is a refused `RCPT` that counts against the
+    /// session's error limit, rather than a free offline attempt.
     fn verifies(&self, payload: &str, offered: &str) -> bool {
         self.keys
             .iter()
@@ -333,20 +399,27 @@ fn mac_chars(key: &[u8], payload: &str) -> String {
 ///
 /// SHA-256 rather than postsrsd's SHA-1: nothing but mxhop ever verifies an
 /// mxhop address, so there is no interoperability to keep — and base64 rather
-/// than hex only because four characters of base64 carry more than four of
-/// hex in the same room inside a 64-octet local part.
+/// than hex only because a character of base64 carries six bits where a
+/// character of hex carries four, in the same room inside a 64-octet local
+/// part.
+///
+/// Base64 is written three input bytes to four output characters, so eight
+/// characters need the digest's first six bytes: two 24-bit words, not one
+/// word printed twice.
 fn base64_head(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(MAC_CHARS);
-    let chunk = &bytes[..3.min(bytes.len())];
-    let mut word = 0u32;
-    for (i, byte) in chunk.iter().enumerate() {
-        word |= u32::from(*byte) << (16 - 8 * i);
-    }
-    for shift in [18, 12, 6, 0] {
-        if out.len() == MAC_CHARS {
-            break;
+    let head = &bytes[..6.min(bytes.len())];
+    for chunk in head.chunks(3) {
+        let mut word = 0u32;
+        for (i, byte) in chunk.iter().enumerate() {
+            word |= u32::from(*byte) << (16 - 8 * i);
         }
-        out.push(BASE64[((word >> shift) & 0x3f) as usize] as char);
+        for shift in [18, 12, 6, 0] {
+            if out.len() == MAC_CHARS {
+                return out;
+            }
+            out.push(BASE64[((word >> shift) & 0x3f) as usize] as char);
+        }
     }
     out
 }
@@ -599,6 +672,40 @@ mod tests {
         assert_eq!(
             Srs::keys_from("short"),
             Err(SecretError::TooShort { line: 1, len: 5 })
+        );
+    }
+
+    /// The MAC is the only thing between this host and an open relay, and the
+    /// only way to attack it is online: one guess per `RCPT TO`. postsrsd's
+    /// four base64 characters are about 21 bits once the case-insensitive
+    /// comparison is paid for — 38^4 is 2.1 million, and a pipelined session
+    /// against this binary answered 380 000 refused recipients a second, so
+    /// the whole space falls in seconds. Postfix hides that behind
+    /// `smtpd_hard_error_limit`, `smtpd_error_sleep_time` and anvil; mxhop
+    /// has an error limit and nothing else, so the MAC has to be long enough
+    /// to be hopeless on its own.
+    #[test]
+    fn the_mac_is_too_long_to_guess_at_any_rate_this_host_can_answer() {
+        let srs = srs();
+        let wrapped = local_of(&srs.rewrite(Some("a@elsewhere.test"), 100).unwrap());
+        let mac = wrapped.split('=').nth(1).expect("a MAC");
+
+        assert!(
+            mac.len() >= 8,
+            "{} characters of base64 is about {} bits against a case-insensitive \
+             comparison, and a sweep of that costs an attacker minutes: {wrapped}",
+            mac.len(),
+            (mac.len() as f64 * 38f64.log2()).round() as u32
+        );
+        // Taking the digest's first three bytes yields four base64 characters
+        // and no more, so a MAC of eight has to come from two 24-bit words.
+        // If the second word were the first one again, the last four
+        // characters would repeat the first four and buy nothing.
+        assert_ne!(
+            &mac[..4],
+            &mac[4..8],
+            "the second half of the MAC has to be a second word of the digest, \
+             not the first one printed twice: {wrapped}"
         );
     }
 
