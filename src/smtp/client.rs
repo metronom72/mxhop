@@ -2644,6 +2644,7 @@ mod tests {
             ptr_timeout: Duration::from_secs(5),
             relay_budget: crate::smtp::session::RELAY_BUDGET,
             limits: crate::policy::Limits::default(),
+            auth_enabled: true,
         };
 
         let relay = Capture::default();

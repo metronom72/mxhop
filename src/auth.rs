@@ -209,12 +209,43 @@ impl Auth {
 
     /// The verdict when nothing answered in time.
     ///
-    /// Everything is `temperror`, which is the honest report and the one the
-    /// decision table reads as "defer where a definite answer could have
-    /// refused". The alternative — treating our own expired clock as `none` —
-    /// would turn a resolver outage into an open door for exactly the
-    /// forgeries this file exists to stop.
-    pub fn timed_out(mail_from: Option<&str>, helo: &str, from_domain: &str) -> Self {
+    /// Everything is `temperror`, which is the honest report: nothing was
+    /// found out, and saying so is not the same as saying a domain published
+    /// nothing. `policy` is `None`, which after the narrowing in
+    /// [`crate::policy`] means this forwards with `dmarc=temperror` in the
+    /// header rather than deferring — see the comment on that arm for why an
+    /// expired clock of ours must not cost somebody else their mail.
+    ///
+    /// The `From` domain is read out of the body rather than taken from the
+    /// envelope sender. They are routinely different — forwarded mail and
+    /// mailing lists are nothing but that — and the DMARC identity is the
+    /// `From` header's, so a header reading
+    /// `dmarc=temperror header.from=<the MAIL FROM domain>` was a statement
+    /// about an identity nothing had examined. `AuthenticatedMessage::parse`
+    /// is pure and costs no lookups, so there is no reason to guess; when it
+    /// cannot read a single `From` domain the field is left empty, and
+    /// [`Auth::header`] then omits `header.from` altogether instead of
+    /// naming the wrong thing.
+    pub fn timed_out(mail_from: Option<&str>, helo: &str, body: &[u8]) -> Self {
+        let from_domain = mail_auth::AuthenticatedMessage::parse(body)
+            .map(|message| {
+                let mut domains: Vec<String> = message
+                    .from_addresses()
+                    .iter()
+                    .filter_map(|from| from.rsplit_once('@').map(|(_, d)| d.to_ascii_lowercase()))
+                    .collect();
+                domains.sort();
+                domains.dedup();
+                // Zero or several `From` domains have no single DMARC
+                // identity, exactly as in `Verifier::check` — and picking one
+                // of two would be the same wrong claim in a new place.
+                match domains.len() {
+                    1 => domains.remove(0),
+                    _ => String::new(),
+                }
+            })
+            .unwrap_or_default();
+
         Self {
             spf_mail: Spf::TempError,
             spf_helo: Spf::TempError,
@@ -222,7 +253,7 @@ impl Auth {
             helo: Some(helo.to_string()),
             dkim: Vec::new(),
             dmarc: Dmarc {
-                from_domain: from_domain.to_string(),
+                from_domain,
                 result: DmarcVerdict::TempError,
                 policy: None,
             },
@@ -338,7 +369,7 @@ fn is_base64(s: &str) -> bool {
 // ------------------------------------------------- RFC 8601 §5: ours only
 
 /// The name whose forged copies are spliced out of an arriving message.
-const HEADER_NAME: &[u8] = b"authentication-results:";
+const HEADER_NAME: &[u8] = b"authentication-results";
 
 /// Removes every `Authentication-Results` header in the first header block
 /// whose authserv-id is ours, and returns the message without them.
@@ -367,7 +398,16 @@ pub fn strip_forged_results(message: &[u8], authserv_id: &str) -> Option<Vec<u8>
         if !lowered.as_bytes().starts_with(HEADER_NAME) {
             continue;
         }
-        if claims(&header[HEADER_NAME.len()..], &authserv_id) {
+        // RFC 5322 §4.5.8 (obsolete syntax) allows whitespace between a field
+        // name and its colon, and lenient parsers downstream accept it. So
+        // `Authentication-Results : mx.tooling.ninja;` has to be matched too:
+        // a strip that insisted on the strict spelling would leave behind a
+        // header that those parsers still read as ours.
+        let rest = header[HEADER_NAME.len()..].trim_start_matches([' ', '\t']);
+        let Some(value) = rest.strip_prefix(':') else {
+            continue;
+        };
+        if claims(value, &authserv_id) {
             cuts.push(range);
         }
     }
@@ -390,16 +430,64 @@ pub fn strip_forged_results(message: &[u8], authserv_id: &str) -> Option<Vec<u8>
 ///
 /// The authserv-id is the first token of the value (RFC 8601 §2.2), and the
 /// comparison is case-insensitive because a domain name is. The token ends at
-/// whitespace or at the `;` that begins the first result — a header whose id
-/// is written `mx.tooling.ninja;dkim=pass`, with no space, is the same claim
-/// and has to be caught too.
+/// whitespace, at the `;` that begins the first result, or at a `(` — a header
+/// whose id is written `mx.tooling.ninja;dkim=pass` or `mx.tooling.ninja(x)`
+/// is the same claim and has to be caught too.
+///
+/// RFC 8601 §2.2 writes the value as `[CFWS] authserv-id`, and RFC 5322 CFWS
+/// includes parenthesised comments. So `(x) mx.tooling.ninja; dmarc=pass` is a
+/// *valid* header claiming this host whose first token is not this host's
+/// name, and a token taken before comments are dropped does not match it. The
+/// header then survives the strip, and the planned ARC seal — or any filter
+/// that trusts headers under our name — reads the sender's own claim as our
+/// finding. Dropping comments first is what closes that, and it must not go
+/// the other way: a comment that merely *contains* our name
+/// (`(mx.tooling.ninja) other.example`) belongs to somebody else's header,
+/// which is not ours to delete.
 fn claims(value: &str, authserv_id: &str) -> bool {
-    let token = value
-        .trim_start()
-        .split([' ', '\t', ';'])
-        .next()
-        .unwrap_or("");
+    let mut rest = value;
+    loop {
+        rest = rest.trim_start_matches([' ', '\t']);
+        match rest.strip_prefix('(') {
+            Some(after) => rest = skip_comment(after),
+            None => break,
+        }
+    }
+
+    let token = rest.split([' ', '\t', ';', '(']).next().unwrap_or("");
     token.eq_ignore_ascii_case(authserv_id)
+}
+
+/// What follows the `)` matching a comment whose opening `(` has already been
+/// consumed.
+///
+/// Comments nest and a backslash quotes the character after it (RFC 5322
+/// §3.2.1–3.2.2), and neither can be skipped over naively: scanning to the
+/// first `)` would leave `((x)) mx.tooling.ninja` sitting behind a stray `)`
+/// and the claim unseen. An unterminated comment runs to the end of the
+/// value, which leaves no token at all — nothing is claimed, so nothing is
+/// cut, which is the safe direction for a malformed header.
+fn skip_comment(mut rest: &str) -> &str {
+    let mut depth = 1usize;
+    while let Some(c) = rest.chars().next() {
+        rest = &rest[c.len_utf8()..];
+        match c {
+            '\\' => {
+                if let Some(quoted) = rest.chars().next() {
+                    rest = &rest[quoted.len_utf8()..];
+                }
+            }
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return rest;
+                }
+            }
+            _ => {}
+        }
+    }
+    rest
 }
 
 /// Each header of the first block, as the byte range it occupies and its
@@ -1015,6 +1103,108 @@ mod tests {
         );
     }
 
+    /// **A budget expiry must not name an identity nobody looked at.** The
+    /// DMARC identity is the `From` header's, and for forwarded mail and
+    /// every mailing list it is a different domain from the envelope sender.
+    /// Taking it from `MAIL FROM` put `dmarc=temperror header.from=<envelope
+    /// domain>` in the header — a statement about an identity the check never
+    /// reached. `AuthenticatedMessage::parse` costs no lookups, so there is
+    /// nothing to buy by guessing.
+    #[test]
+    fn a_budget_expiry_reports_the_from_domain_and_not_the_envelope_sender() {
+        let body = b"From: newsletter@author.test\r\n\
+                     To: hi@example.com\r\n\
+                     Subject: hi\r\n\
+                     \r\n\
+                     body\r\n";
+
+        let auth = Auth::timed_out(Some("bounces@list.example"), "mail.list.example", body);
+
+        assert_eq!(
+            auth.dmarc.from_domain, "author.test",
+            "the From header's domain, not the list's bounce address"
+        );
+        assert_eq!(auth.dmarc.result, DmarcVerdict::TempError);
+        assert!(
+            auth.header("mx.tooling.ninja")
+                .contains("header.from=author.test"),
+            "{}",
+            auth.header("mx.tooling.ninja")
+        );
+    }
+
+    /// And when there is no single `From` domain to report, nothing is
+    /// reported: an empty domain makes [`Auth::header`] omit `header.from`
+    /// altogether, which is honest, where naming one of two would not be.
+    #[test]
+    fn a_budget_expiry_on_a_message_with_no_single_from_names_no_domain() {
+        let two = b"From: a@one.test, b@two.test\r\n\r\nbody\r\n";
+
+        let auth = Auth::timed_out(Some("sender@elsewhere.test"), "mail.elsewhere.test", two);
+
+        assert_eq!(auth.dmarc.from_domain, "");
+        assert!(
+            !auth.header("mx.tooling.ninja").contains("header.from="),
+            "{}",
+            auth.header("mx.tooling.ninja")
+        );
+    }
+
+    /// **The comment that walks past the strip.** RFC 8601 §2.2 writes the
+    /// value as `[CFWS] authserv-id ...`, and RFC 5322 CFWS includes
+    /// parenthesised comments — so `(x) mx.tooling.ninja; dmarc=pass` is a
+    /// *valid* header claiming this host's name whose first token is `(x)`.
+    /// A token taken before comments are dropped does not match, the header
+    /// survives, and a reader downstream — the planned ARC seal, or any
+    /// filter that trusts headers under our name — reads the sender's claim
+    /// as our finding.
+    #[test]
+    fn a_comment_before_the_authserv_id_does_not_hide_the_claim() {
+        let message = b"Authentication-Results: (x) mx.tooling.ninja; dmarc=pass\r\n\r\nx\r\n";
+
+        assert_eq!(
+            strip_forged_results(message, "mx.tooling.ninja"),
+            Some(b"\r\nx\r\n".to_vec())
+        );
+    }
+
+    /// The same bypass from the other side: a comment after the id, with no
+    /// space, makes the first token `mx.tooling.ninja(x)`. Still our name,
+    /// still ours to write, still has to go.
+    #[test]
+    fn a_comment_jammed_onto_the_end_of_the_authserv_id_is_still_a_claim() {
+        let message = b"Authentication-Results: mx.tooling.ninja(x); dmarc=pass\r\n\r\nx\r\n";
+
+        assert_eq!(
+            strip_forged_results(message, "mx.tooling.ninja"),
+            Some(b"\r\nx\r\n".to_vec())
+        );
+    }
+
+    /// Obsolete whitespace before the colon (RFC 5322 §4.5.8). Lenient
+    /// parsers downstream accept it, so a strip that insists on the strict
+    /// spelling leaves a header those parsers will read as ours.
+    #[test]
+    fn whitespace_before_the_colon_does_not_hide_the_claim() {
+        let message = b"Authentication-Results : mx.tooling.ninja; dmarc=pass\r\n\r\nx\r\n";
+
+        assert_eq!(
+            strip_forged_results(message, "mx.tooling.ninja"),
+            Some(b"\r\nx\r\n".to_vec())
+        );
+    }
+
+    /// And the awkward sender who writes a comment naming somebody else is
+    /// still somebody else: dropping comments must not turn a lookalike into
+    /// a match, or the strip starts deleting other hosts' findings.
+    #[test]
+    fn a_comment_around_another_hosts_name_is_still_another_host() {
+        let message = b"Authentication-Results: (mx.tooling.ninja) other.example; dmarc=pass\r\n\
+            \r\nx\r\n";
+
+        assert_eq!(strip_forged_results(message, "mx.tooling.ninja"), None);
+    }
+
     /// The body is not the header block. A bounce or a forwarded message
     /// quoting a trace is an ordinary thing to receive, and splicing bytes out
     /// of somebody's quoted text corrupts a message that was never a forgery.
@@ -1346,6 +1536,97 @@ mod tests {
             "and with nothing else aligned, DMARC fails — which under p=reject \
              is the refusal this whole file exists for: {auth:?}"
         );
+    }
+
+    /// The same path with the algorithm the internet actually uses. Ed25519
+    /// DKIM is rare; RSA is what Gmail, Outlook and every mailing list sign
+    /// with — and it is on the path of the one refusal mxhop can issue.
+    /// Forwarded or list-relayed mail from a `p=reject` domain has already
+    /// failed SPF by the time it reaches us, so its RSA DKIM signature
+    /// *alone* is what keeps DMARC passing. A wiring or feature-flag mistake
+    /// in the RSA half of `rust-crypto` would therefore turn into `550` on
+    /// legitimate mail, and only the Ed25519 half was proven in this tree.
+    ///
+    /// The key is generated in-process at a real 2048 bits: no committed key
+    /// material, nothing undersized, and no `#[ignore]` — see the
+    /// `num-bigint-dig` and `rsa` profile overrides in `Cargo.toml` for why
+    /// that is affordable.
+    #[tokio::test]
+    async fn an_rsa_signature_verifies_and_one_changed_byte_breaks_it() {
+        use mail_auth::crypto::{RsaKey, Sha256};
+        use mail_auth::dkim::DkimSigner;
+        use rustls_pki_types::{PrivateKeyDer, PrivatePkcs1KeyDer};
+
+        let pair = mail_auth::dkim::generate::DkimKeyPair::generate_rsa(2048).expect("a key pair");
+        // `generate_rsa` hands back PKCS#1 DER, and `from_key_der` is told
+        // which of the two shapes it is rather than sniffing — so the wrapper
+        // is not noise, it is the half of the call that says PKCS#1.
+        let key = RsaKey::<Sha256>::from_key_der(PrivateKeyDer::Pkcs1(PrivatePkcs1KeyDer::from(
+            pair.private_key(),
+        )))
+        .expect("the signing key");
+
+        let body = message("rsa.test");
+        let signature = DkimSigner::from_key(key)
+            .domain("rsa.test")
+            .selector("mxhop1")
+            .headers(["From", "To", "Subject"])
+            .sign(&body)
+            .expect("a signature");
+
+        let mut signed = Vec::new();
+        signature.write(&mut signed, true);
+        signed.extend_from_slice(&body);
+
+        let script = vec![
+            (
+                "mxhop1._domainkey.rsa.test",
+                16,
+                Rr::Txt(format!("v=DKIM1; k=rsa; p={}", pair.encoded_public_key())),
+            ),
+            (
+                "_dmarc.rsa.test",
+                16,
+                Rr::Txt("v=DMARC1; p=reject; rua=mailto:d@rsa.test".into()),
+            ),
+        ];
+
+        let server = nameserver(script.clone()).await;
+        let auth = Verifier::against(server, "mx.tooling.ninja")
+            .check(probe(&signed, "sender@rsa.test"))
+            .await;
+
+        assert_eq!(
+            auth.dkim.iter().map(|d| d.result).collect::<Vec<_>>(),
+            vec![DkimVerdict::Pass],
+            "{auth:?}"
+        );
+        assert_eq!(auth.dkim[0].domain, "rsa.test");
+        assert_eq!(
+            auth.dmarc.result,
+            DmarcVerdict::Pass,
+            "an aligned RSA DKIM pass is a DMARC pass with no SPF record at \
+             all — which is exactly the shape of forwarded mail from a \
+             p=reject domain, and the shape that must not be refused: {auth:?}"
+        );
+
+        // One byte of the body, changed in transit. A verifier that still
+        // said `pass` here would make every DMARC pass meaningless.
+        let mut tampered = signed.clone();
+        let at = tampered.len() - 3;
+        tampered[at] = b'X';
+
+        let server = nameserver(script).await;
+        let auth = Verifier::against(server, "mx.tooling.ninja")
+            .check(probe(&tampered, "sender@rsa.test"))
+            .await;
+
+        assert_ne!(
+            auth.dkim.first().map(|d| d.result),
+            Some(DkimVerdict::Pass),
+            "a body that does not match the signature must not pass: {auth:?}"
+        );
+        assert_eq!(auth.dmarc.result, DmarcVerdict::Fail, "{auth:?}");
     }
 
     /// Two `From` domains have no single DMARC identity. `mail-auth` answers

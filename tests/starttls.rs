@@ -213,6 +213,7 @@ async fn a_reload_is_seen_by_the_next_connection_and_not_the_current_one() {
         ptr_timeout: std::time::Duration::from_secs(10),
         relay_budget: mxhop::smtp::session::RELAY_BUDGET,
         limits: mxhop::policy::Limits::default(),
+        auth_enabled: true,
     });
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")

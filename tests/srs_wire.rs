@@ -149,6 +149,7 @@ async fn serve_mxhop(srs: Srs, sink_port: u16) -> (u16, Spool) {
         ptr_timeout: Duration::from_secs(1),
         relay_budget: RELAY_BUDGET,
         limits: Default::default(),
+        auth_enabled: true,
     };
 
     let spool_for_task = spool.clone();
