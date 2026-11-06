@@ -49,6 +49,16 @@ impl fmt::Display for DnsError {
 pub trait Resolve {
     fn mx(&self, domain: &str) -> impl Future<Output = Result<Vec<Target>, DnsError>> + Send;
     fn addrs(&self, host: &str) -> impl Future<Output = Result<Vec<IpAddr>, DnsError>> + Send;
+    /// The name an address claims, for the `Received` header of an inbound
+    /// session. One name: a trace records what the peer looked like, and a
+    /// list of every PTR record is not a fact about this connection.
+    ///
+    /// Unverified on purpose — the forward lookup that would confirm it is
+    /// another two queries while a sending server waits on us, and nothing is
+    /// decided on the strength of this name. It is written down, and the
+    /// address beside it in the same header is the part that cannot be
+    /// claimed.
+    fn ptr(&self, ip: IpAddr) -> impl Future<Output = Result<String, DnsError>> + Send;
 }
 
 /// Why a domain cannot be delivered to at all.
@@ -270,6 +280,28 @@ impl Resolve for Hickory {
             .unwrap_or_default();
         Ok(v4.into_iter().chain(v6).collect())
     }
+
+    async fn ptr(&self, ip: IpAddr) -> Result<String, DnsError> {
+        match self.inner.reverse_lookup(ip).await {
+            Ok(answer) => answer
+                .answers()
+                .iter()
+                .filter_map(|record| match &record.data {
+                    hickory_resolver::proto::rr::RData::PTR(ptr) => Some(ptr),
+                    _ => None,
+                })
+                // `to_ascii`, not `to_utf8`: the punycode form is the one
+                // that belongs in a `Received` header, and the one
+                // `routing::is_qualified` accepts. `to_utf8` decodes an
+                // `xn--` label back to Unicode, and the header writer then
+                // reports the peer's real reverse DNS as `unknown`.
+                .map(|ptr| normalise(&ptr.0.to_ascii()))
+                .next()
+                .ok_or(DnsError::NotFound),
+            Err(e) if e.is_no_records_found() => Err(DnsError::NotFound),
+            Err(e) => Err(DnsError::Failed(e.to_string())),
+        }
+    }
 }
 
 /// The A records of an answer. An A lookup's answer section can carry a
@@ -305,6 +337,7 @@ fn v6_of(answer: &hickory_resolver::lookup::Lookup) -> Vec<IpAddr> {
 pub struct Table {
     mx: std::collections::BTreeMap<String, Result<Vec<Target>, DnsError>>,
     addrs: std::collections::BTreeMap<String, Result<Vec<IpAddr>, DnsError>>,
+    ptrs: std::collections::BTreeMap<IpAddr, Result<String, DnsError>>,
 }
 
 impl Table {
@@ -338,6 +371,12 @@ impl Table {
         self
     }
 
+    /// The name an address reverse-resolves to.
+    pub fn ptr(mut self, ip: IpAddr, name: &str) -> Self {
+        self.ptrs.insert(ip, Ok(normalise(name)));
+        self
+    }
+
     pub fn addr_error(mut self, host: &str, e: DnsError) -> Self {
         self.addrs.insert(normalise(host), Err(e));
         self
@@ -355,6 +394,13 @@ impl Resolve for Table {
     async fn addrs(&self, host: &str) -> Result<Vec<IpAddr>, DnsError> {
         self.addrs
             .get(&normalise(host))
+            .cloned()
+            .unwrap_or(Err(DnsError::NotFound))
+    }
+
+    async fn ptr(&self, ip: IpAddr) -> Result<String, DnsError> {
+        self.ptrs
+            .get(&ip)
             .cloned()
             .unwrap_or(Err(DnsError::NotFound))
     }
@@ -453,6 +499,93 @@ mod tests {
         });
 
         addr
+    }
+
+    /// A nameserver that answers one PTR question with one name, so that the
+    /// *form* the name comes back in can be asserted on. A table of names
+    /// cannot express this: the difference is made by the decoding hickory
+    /// does on the wire format, not by what was asked for.
+    async fn ptr_nameserver(name: &'static str) -> std::net::SocketAddr {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("a port");
+        let addr = socket.local_addr().expect("the port");
+
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            loop {
+                let Ok((n, from)) = socket.recv_from(&mut buf).await else {
+                    return;
+                };
+                if n < 12 {
+                    continue;
+                }
+                let mut at = 12;
+                while at < n && buf[at] != 0 {
+                    at += 1 + buf[at] as usize;
+                }
+                if at + 5 > n {
+                    continue;
+                }
+                let end = at + 5;
+                let qtype = u16::from_be_bytes([buf[at + 1], buf[at + 2]]);
+                let question = &buf[12..end];
+
+                // The answer's name, in DNS wire form: each label with its
+                // length in front, and a zero byte for the root.
+                let mut encoded = Vec::new();
+                for label in name.split('.') {
+                    encoded.push(label.len() as u8);
+                    encoded.extend_from_slice(label.as_bytes());
+                }
+                encoded.push(0);
+
+                let answers: u16 = u16::from(qtype == 12);
+                let mut out = Vec::with_capacity(128);
+                out.extend_from_slice(&buf[..2]);
+                out.extend_from_slice(&0x8180u16.to_be_bytes());
+                out.extend_from_slice(&1u16.to_be_bytes());
+                out.extend_from_slice(&answers.to_be_bytes());
+                out.extend_from_slice(&0u16.to_be_bytes());
+                out.extend_from_slice(&0u16.to_be_bytes());
+                out.extend_from_slice(question);
+
+                if answers == 1 {
+                    out.extend_from_slice(&0xc00cu16.to_be_bytes());
+                    out.extend_from_slice(&12u16.to_be_bytes()); // PTR
+                    out.extend_from_slice(&1u16.to_be_bytes()); // IN
+                    out.extend_from_slice(&60u32.to_be_bytes());
+                    out.extend_from_slice(&(encoded.len() as u16).to_be_bytes());
+                    out.extend_from_slice(&encoded);
+                }
+
+                let _ = socket.send_to(&out, from).await;
+            }
+        });
+
+        addr
+    }
+
+    /// A reverse lookup that lands on an internationalised name has to come
+    /// back in its punycode form. `to_utf8` decodes `xn--` back to Unicode,
+    /// and `policy::name_or_unknown` then throws the whole name away —
+    /// `is_qualified` allows only ASCII — so the peer's real reverse DNS was
+    /// reported as `unknown` in the `Received` header. The ASCII form is also
+    /// the only one that belongs in a header: RFC 5321 names are ASCII.
+    #[tokio::test]
+    async fn a_reverse_lookup_keeps_an_idna_name_in_its_ascii_form() {
+        let server = ptr_nameserver("xn--mller-kva.example.com").await;
+
+        let found = Hickory::against(server)
+            .ptr("203.0.113.4".parse().unwrap())
+            .await
+            .expect("the PTR record");
+
+        assert_eq!(
+            found, "xn--mller-kva.example.com",
+            "decoded to Unicode this reads m\u{fc}ller.example.com, which is not \
+             writable into a trace header and is dropped as unknown"
+        );
     }
 
     #[tokio::test]

@@ -11,19 +11,23 @@ use tokio::net::TcpListener;
 use tracing::{info, warn};
 
 use crate::routing::Router;
+use crate::smtp::client::Relay;
 use crate::smtp::session::{self, SessionConfig};
 use crate::spool::Spool;
 use crate::tls::Holder;
 
 /// Accepts connections until the listener fails irrecoverably. One failed
 /// accept is not a reason to stop serving.
-pub async fn accept_loop(
+pub async fn accept_loop<L>(
     listener: TcpListener,
     config: Arc<SessionConfig>,
     router: Arc<Router>,
     spool: Arc<Spool>,
+    relay: Arc<L>,
     tls: Option<Arc<Holder>>,
-) {
+) where
+    L: Relay + Send + Sync + 'static,
+{
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(accepted) => accepted,
@@ -42,9 +46,20 @@ pub async fn accept_loop(
         let config = Arc::clone(&config);
         let router = Arc::clone(&router);
         let spool = Arc::clone(&spool);
+        let relay = Arc::clone(&relay);
         tokio::spawn(async move {
             let peer = peer.to_string();
-            match session::serve(stream, peer.clone(), &config, &router, &spool, acceptor).await {
+            match session::serve(
+                stream,
+                peer.clone(),
+                &config,
+                &router,
+                &spool,
+                relay.as_ref(),
+                acceptor,
+            )
+            .await
+            {
                 Ok(outcome) => info!(
                     %peer,
                     accepted = outcome.accepted,

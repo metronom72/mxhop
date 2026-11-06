@@ -10,7 +10,7 @@ use mxhop::config::{self, Config, Problem};
 use mxhop::dns::Hickory;
 use mxhop::routing::Mailbox;
 use mxhop::server::accept_loop;
-use mxhop::smtp::client::{self, Delivery, Outbound, Tcp, Verdict};
+use mxhop::smtp::client::{self, Delivery, Direct, Outbound, Tcp, Verdict};
 use mxhop::smtp::session::SessionConfig;
 use mxhop::spool::Spool;
 use mxhop::telemetry;
@@ -195,6 +195,22 @@ async fn run(cli: &Cli) -> ExitCode {
         }
     };
 
+    // The resolver and the outbound settings every session delivers with.
+    // Built once: a resolver per connection would mean a cache per
+    // connection, which is no cache at all.
+    let relay = match Hickory::from_system() {
+        Ok(resolver) => Arc::new(Direct::new(
+            resolver,
+            Outbound::new(&config.hostname, config.outbound.ipv6),
+        )),
+        Err(e) => {
+            // Without DNS nothing can be delivered, and accepting mail we
+            // cannot hand on would mean answering 250 and dropping it.
+            error!("cannot build a DNS resolver: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let session_config = Arc::new(SessionConfig::from_config(&config));
     let router = Arc::new(config.router.clone());
     let queued = spool.queued().await.map(|q| q.len()).unwrap_or(0);
@@ -220,7 +236,7 @@ async fn run(cli: &Cli) -> ExitCode {
         spawn_reload_on_hangup_without_tls();
     }
 
-    accept_loop(listener, session_config, router, spool, tls).await;
+    accept_loop(listener, session_config, router, spool, relay, tls).await;
     ExitCode::SUCCESS
 }
 
