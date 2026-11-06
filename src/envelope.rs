@@ -33,6 +33,16 @@ pub struct Envelope {
     /// through two logs.
     #[serde(default)]
     pub received: String,
+    /// The `Authentication-Results` header mxhop built for this hop, which
+    /// goes on the wire directly under `received` and is likewise never
+    /// stored in the message file. Empty when the check is switched off.
+    ///
+    /// Kept for the same reason `received` is: a held copy has to be retried
+    /// with the identical bytes, and re-deriving this one would mean repeating
+    /// every lookup — possibly getting different answers, and certainly
+    /// losing the record of what was true when the message arrived.
+    #[serde(default)]
+    pub authentication_results: String,
     /// What the destination last said about this message, for the operator
     /// reading `queue/`. Not acted on: there is no retry queue yet.
     #[serde(default)]
@@ -66,6 +76,7 @@ mod tests {
             received_at_unix_ms: 1_762_400_000_000,
             size: 42,
             received: "Received: from mail.elsewhere.test\r\n".into(),
+            authentication_results: "Authentication-Results: mx.example.com; dkim=none\r\n".into(),
             last_reply: None,
         }
     }

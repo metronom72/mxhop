@@ -9,11 +9,24 @@
 
 use std::collections::BTreeSet;
 
-use tracing::warn;
+use tracing::{info, warn};
 
+use crate::auth::{Auth, DmarcVerdict, Policy as AuthPolicy};
 use crate::envelope::Envelope;
 use crate::routing::{Mailbox, Route, Router, is_qualified};
 use crate::smtp::client::{self, Outcome, Reply};
+
+/// What mxhop does about a message whose own domain says it is a forgery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Enforce {
+    /// Refuse a DMARC failure whose domain publishes `p=reject`, and defer
+    /// where a definite answer could have refused. Everything else is
+    /// forwarded with the header saying what was found.
+    #[default]
+    Dmarc,
+    /// Evaluate and stamp the header, never refuse and never defer.
+    Off,
+}
 
 /// The bounds mxhop puts on a message's trace, and on its own alias table.
 #[derive(Debug, Clone)]
@@ -24,6 +37,10 @@ pub struct Limits {
     pub max_by_us: usize,
     /// How deep an alias may point at another of our own domains.
     pub max_internal_depth: usize,
+    /// What a DMARC failure is worth. Here rather than in its own argument
+    /// because `Limits` is already "what counts as refusable", and this is one
+    /// more entry on that list.
+    pub enforce: Enforce,
 }
 
 impl Default for Limits {
@@ -55,6 +72,14 @@ impl Default for Limits {
             // may be reloadable at runtime later, and a bound is cheaper than
             // trusting that whatever installed the table had validated it.
             max_internal_depth: 8,
+            // On by default, and the argument for that is the whole of
+            // `check_authentication` below: it refuses only mail whose own
+            // domain asked every receiver to refuse it, defers only where a
+            // missing answer could have been that refusal, and forwards
+            // everything else. Nothing it does is silent — every refusal
+            // names the domain and the policy it came from, in a sentence the
+            // sending server reads while it still holds the message.
+            enforce: Enforce::Dmarc,
         }
     }
 }
@@ -222,31 +247,25 @@ pub enum Decision {
 }
 
 /// Turns one accepted envelope into the deliveries it means.
-pub fn decide(envelope: &Envelope, router: &Router, head: &Head, limits: &Limits) -> Decision {
+pub fn decide(
+    envelope: &Envelope,
+    router: &Router,
+    head: &Head,
+    limits: &Limits,
+    auth: &Auth,
+) -> Decision {
     // The trace is checked before the table, because a message in a loop is
-    // not one whose recipients are interesting.
-    if head.received_count >= limits.max_received {
-        return Decision::Refuse(Reply {
-            code: 554,
-            enhanced: Some("5.4.6".into()),
-            text: format!(
-                "too many hops: the message already carries {} Received headers",
-                head.received_count
-            ),
-            lines: Vec::new(),
-        });
+    // not one whose recipients are interesting. The session calls this first
+    // too, before it spends any DNS budget — see `check_trace`.
+    if let Some(reply) = check_trace(head, limits) {
+        return Decision::Refuse(reply);
     }
-    if head.by_us_count >= limits.max_by_us {
-        return Decision::Refuse(Reply {
-            code: 554,
-            enhanced: Some("5.4.6".into()),
-            // The host is not named here because `decide` is given no
-            // hostname: the `Received` header this hop would have added names
-            // it, and the sender's own trace shows it. Keeping the signature
-            // free of configuration is worth more than the name in the text.
-            text: "this message has already passed through this host".into(),
-            lines: Vec::new(),
-        });
+
+    // What the `From` domain itself says about this message, before the alias
+    // table is consulted: a forgery's recipients are no more interesting than
+    // a loop's.
+    if let Some(reply) = check_authentication(auth, limits.enforce) {
+        return Decision::Refuse(reply);
     }
 
     let mut flat = Vec::new();
@@ -320,6 +339,171 @@ pub fn decide(envelope: &Envelope, router: &Router, head: &Head, limits: &Limits
         // — a bounce that acquired a sender could be bounced again.
         sender: envelope.from.clone(),
     })
+}
+
+/// The loop rules, on the trace alone, or `None` if this message is not in
+/// one.
+///
+/// Split out of [`decide`] so that the session can ask them *before* it
+/// spends anything. [`Head::scan`] is pure and costs no lookups, while the
+/// authentication check that used to run ahead of it can spend the whole DNS
+/// budget — so a looping message paid twenty seconds of resolver time on
+/// every hop before being refused for the loop. That is the one refusal which
+/// is certain in advance and needs nothing from the network, and the sending
+/// server waiting for it is this host in another incarnation.
+///
+/// `decide` still calls this, so the rule holds for any caller that does not.
+pub fn check_trace(head: &Head, limits: &Limits) -> Option<Reply> {
+    if head.received_count >= limits.max_received {
+        return Some(Reply {
+            code: 554,
+            enhanced: Some("5.4.6".into()),
+            text: format!(
+                "too many hops: the message already carries {} Received headers",
+                head.received_count
+            ),
+            lines: Vec::new(),
+        });
+    }
+    if head.by_us_count >= limits.max_by_us {
+        return Some(Reply {
+            code: 554,
+            enhanced: Some("5.4.6".into()),
+            // The host is not named here because this function is given no
+            // hostname: the `Received` header this hop would have added names
+            // it, and the sender's own trace shows it. Keeping the signature
+            // free of configuration is worth more than the name in the text.
+            text: "this message has already passed through this host".into(),
+            lines: Vec::new(),
+        });
+    }
+    None
+}
+
+/// The reply a message's own authentication earns it, or `None` to forward.
+///
+/// **Defer only where a definite answer could have refused.** That one
+/// sentence is the whole of this function, and every arm below is it applied
+/// to a case.
+///
+/// Nothing is decided at `MAIL FROM` or `RCPT TO`, and nothing is decided on
+/// SPF alone. An SPF hard failure with an aligned DKIM pass is a DMARC *pass*,
+/// and that is exactly what mail forwarded by somebody else looks like:
+/// refusing on the SPF result would refuse every message another forwarder
+/// relays to us. DMARC is the only identity a domain owner has actually made a
+/// request about, so DMARC is the only thing acted on.
+fn check_authentication(auth: &Auth, enforce: Enforce) -> Option<Reply> {
+    if !auth.checked {
+        return None;
+    }
+
+    // `enforce = "off"` is sold as the setting for watching what enforcement
+    // *would* do for a week before turning it on, and the rollout plan is to
+    // use it exactly that way. Returning here without a word made that week
+    // blind: the only trace of a would-be refusal was the header, at the
+    // destination, in somebody else's mailbox. So the verdict is computed
+    // either way and the reply is logged instead of sent.
+    if enforce == Enforce::Off {
+        if let Some(reply) = authentication_reply(auth) {
+            info!(
+                domain = %auth.dmarc.from_domain,
+                policy = ?auth.dmarc.policy,
+                dmarc = ?auth.dmarc.result,
+                code = reply.code,
+                "enforce is off: this message would have been answered \
+                 {} and was forwarded instead — {reply}",
+                reply.code
+            );
+        }
+        return None;
+    }
+
+    authentication_reply(auth)
+}
+
+/// The reply the DMARC verdict earns, with no regard to whether `enforce`
+/// will let it be sent. Split out from [`check_authentication`] so that
+/// `enforce = "off"` can log the very same sentence it is declining to send:
+/// a second copy of this table, written for the log, is a second table to get
+/// wrong.
+fn authentication_reply(auth: &Auth) -> Option<Reply> {
+    let domain = &auth.dmarc.from_domain;
+    match (auth.dmarc.result, auth.dmarc.policy) {
+        // The central rule. The domain published `p=reject`, the message
+        // failed, and the refusal happens while the sending server still holds
+        // the message — the one moment it costs nobody anything. See
+        // `crate::auth` for why forwarding it instead is worse than it looks.
+        (DmarcVerdict::Fail, Some(AuthPolicy::Reject)) => Some(Reply {
+            code: 550,
+            enhanced: Some("5.7.1".into()),
+            text: format!(
+                "message from {domain} fails DMARC and that domain asks for \
+                 failures to be rejected"
+            ),
+            lines: Vec::new(),
+        }),
+
+        // A definite answer could have been the refusal above, so neither 250
+        // nor 550 can be given honestly: the record is in hand, it says
+        // `reject`, and only the alignment lookup failed. A retry can get a
+        // different answer, and this is the one case where it is worth
+        // asking for one.
+        //
+        // **Why a `temperror` with no policy in hand is *not* here.** It
+        // reads like the same unknown — a policy nobody could fetch could
+        // have been `reject` — but `mail-auth` makes that reading far wider
+        // than it looks. Its DMARC tree walk aborts the *whole* walk on the
+        // first non-NXDOMAIN failure at any level, including after it has
+        // already read the record at the `From` domain, and discards the
+        // record as it does (`dmarc/verify.rs`: the output comes back with
+        // no policy and a `TempError`). So "no policy" is produced not only
+        // by a lame `_dmarc` delegation at the sender, but by a REFUSED
+        // answer, a flaky authoritative server or a DNSSEC-bogus zone
+        // anywhere in that domain's `_dmarc` ancestry — none of which
+        // affected delivery here before, because inbound mail never needed
+        // the sender's DNS. `Auth::timed_out` reports the same shape, so our
+        // own expired DNS budget landed here too, and one dead `include:` in
+        // an ordinary sender's SPF record can spend it.
+        //
+        // A retry gets the same answer, so deferring meant bouncing after
+        // the sender's retry window — with nothing but a `451` in the
+        // journal and the correspondent left to report the loss. What the
+        // narrow rule gives up is small and not the attacker's to arrange: a
+        // forgery of a `p=reject` domain gets through only while *that
+        // domain's own* `_dmarc` is unanswerable, and the destination then
+        // evaluates DMARC with its own resolver anyway. Accept and stamp on
+        // temperror is what OpenDMARC, rspamd and Gmail all do.
+        (DmarcVerdict::TempError, Some(AuthPolicy::Reject)) => Some(Reply {
+            code: 451,
+            enhanced: Some("4.7.1".into()),
+            // The policy is named as well as the domain: this arm now always
+            // has `p=reject` in hand, and the house rule is that an operator
+            // reading a refusal can tell what was being enforced without
+            // going back to DNS.
+            text: format!(
+                "could not finish checking DMARC for {domain}, which asks for \
+                 failures to be rejected (p=reject); try again"
+            ),
+            lines: Vec::new(),
+        }),
+
+        // Everything else is forwarded, and the header says what was found.
+        //
+        // `p=quarantine` with a failure, because mxhop has no spam folder and
+        // the destination does — the policy goes into the header instead.
+        // `p=none` with a failure, because that domain asked to be told, not
+        // to be protected. No record or a `permerror`, because there is
+        // nothing to enforce (RFC 7489 §6.6.3 reads a permanent error as no
+        // record). A `temperror` under a policy that is known not to be
+        // `reject`, because nothing would have been refused anyway — and a
+        // `temperror` with *no* policy in hand, for the reasons argued on
+        // the arm above. And zero
+        // or several `From` domains, which arrive here as a `permerror`: RFC
+        // 7489 §6.6.1 would prefer a refusal, and refusing a shape of message
+        // that is merely unusual is how a forwarder loses mail, so the
+        // destination — which recomputes all of this — gets to decide.
+        _ => None,
+    }
 }
 
 /// Hit when an alias chain is deeper than [`Limits::max_internal_depth`].
@@ -623,7 +807,7 @@ impl Trace {
 /// `localhost`, a name with a control character in it — becomes `unknown`
 /// rather than being quoted: a reader of this header cannot tell a sanitised
 /// name from a real one, so the only safe report is that there was none.
-fn name_or_unknown(name: Option<&str>) -> String {
+pub(crate) fn name_or_unknown(name: Option<&str>) -> String {
     match name {
         Some(name) if is_qualified(name) => name.to_string(),
         _ => "unknown".to_string(),
@@ -631,7 +815,7 @@ fn name_or_unknown(name: Option<&str>) -> String {
 }
 
 /// Whether an envelope recipient can be written into a header as it stands.
-fn is_safe_address(address: &str) -> bool {
+pub(crate) fn is_safe_address(address: &str) -> bool {
     !address.is_empty()
         && address.len() <= 320
         && !address
@@ -720,6 +904,7 @@ mod tests {
             received_at_unix_ms: 1_762_423_302_000,
             size: 10,
             received: String::new(),
+            authentication_results: String::new(),
             last_reply: None,
         }
     }
@@ -750,6 +935,7 @@ mod tests {
             &router(),
             &Head::default(),
             &Limits::default(),
+            &Auth::not_checked(),
         ));
 
         assert_eq!(
@@ -769,6 +955,7 @@ mod tests {
             &router(),
             &Head::default(),
             &Limits::default(),
+            &Auth::not_checked(),
         ));
 
         assert_eq!(mailboxes(&plan), vec!["a@gmail.test", "b@fast.test"]);
@@ -788,6 +975,7 @@ mod tests {
             &router(),
             &Head::default(),
             &Limits::default(),
+            &Auth::not_checked(),
         ));
 
         assert_eq!(plan.groups.len(), 2, "two domains, two groups: {plan:?}");
@@ -821,7 +1009,8 @@ mod tests {
                 &bounce,
                 &router(),
                 &Head::default(),
-                &Limits::default()
+                &Limits::default(),
+                &Auth::not_checked()
             ))
             .sender,
             None
@@ -842,6 +1031,7 @@ mod tests {
             &router(),
             &head,
             &Limits::default(),
+            &Auth::not_checked(),
         );
 
         match decision {
@@ -867,6 +1057,7 @@ mod tests {
             &router(),
             &head,
             &Limits::default(),
+            &Auth::not_checked(),
         );
 
         match decision {
@@ -1468,6 +1659,7 @@ mod tests {
             &r,
             &Head::default(),
             &Limits::default(),
+            &Auth::not_checked(),
         ) {
             Decision::Refuse(reply) => assert_eq!(reply.code, 550),
             Decision::Deliver(plan) => panic!("nowhere to deliver, yet a plan: {plan:?}"),
@@ -1487,6 +1679,7 @@ mod tests {
             &r,
             &Head::default(),
             &Limits::default(),
+            &Auth::not_checked(),
         ) {
             Decision::Refuse(reply) => assert_eq!(reply.code, 550),
             Decision::Deliver(plan) => panic!("a cycle expanded into a plan: {plan:?}"),
@@ -1515,7 +1708,321 @@ mod tests {
             &r,
             &Head::default(),
             &Limits::default(),
+            &Auth::not_checked(),
         ));
         assert_eq!(mailboxes(&plan), vec!["a@gmail.test"]);
+    }
+
+    // ------------------------------------------------ the decision table of §2
+
+    use crate::auth::{Dkim, DkimVerdict, Dmarc, DmarcVerdict, Policy, Spf};
+
+    /// A verdict for a message whose `From` domain published `policy` and
+    /// whose DMARC evaluation came out as `result`.
+    fn verdict(from: &str, result: DmarcVerdict, policy: Option<Policy>) -> Auth {
+        Auth {
+            spf_mail: Spf::Fail,
+            spf_helo: Spf::Fail,
+            mail_from: Some("sender@elsewhere.test".into()),
+            helo: Some("mail.elsewhere.test".into()),
+            dkim: Vec::new(),
+            dmarc: Dmarc {
+                from_domain: from.to_string(),
+                result,
+                policy,
+            },
+            checked: true,
+        }
+    }
+
+    fn decided(auth: &Auth) -> Decision {
+        decide(
+            &envelope(&["hi@example.com"]),
+            &router(),
+            &Head::default(),
+            &Limits::default(),
+            auth,
+        )
+    }
+
+    fn refusal(decision: Decision) -> Reply {
+        match decision {
+            Decision::Refuse(reply) => reply,
+            Decision::Deliver(plan) => panic!("expected a refusal, got a plan: {plan:?}"),
+        }
+    }
+
+    /// The central rule, and the laundering it stops. After SRS every message
+    /// mxhop forwards passes SPF at the destination, so a forged
+    /// `From: paypal.test` is handed to Gmail with a clean envelope and our
+    /// address on it. Gmail refuses it and counts the refusal against us; with
+    /// two destinations the lax one accepts, we answer 250, and Gmail's
+    /// refusal becomes a copy lost with no delivery report. The domain owner
+    /// asked every receiver to reject this message, and the only moment the
+    /// refusal is free is while the sending server still holds it.
+    #[test]
+    fn a_forged_from_of_a_reject_policy_domain_is_refused_550() {
+        let reply = refusal(decided(&verdict(
+            "paypal.test",
+            DmarcVerdict::Fail,
+            Some(Policy::Reject),
+        )));
+
+        assert_eq!(reply.code, 550);
+        assert_eq!(reply.enhanced.as_deref(), Some("5.7.1"));
+        assert!(
+            reply.text.contains("paypal.test"),
+            "the sender has to be told which domain, or the refusal is unactionable: {reply}"
+        );
+        assert!(
+            reply.text.contains("DMARC"),
+            "and why, so it is not read as a block on the connecting host: {reply}"
+        );
+    }
+
+    /// The outage that bounces. A `_dmarc` lookup that did not come back is
+    /// not a failure and must not be answered 550 — a permanent refusal for a
+    /// resolver hiccup destroys mail nobody forged. It is not a pass either:
+    /// the answer that did not arrive could have said `p=reject`, which is
+    /// exactly the case this file exists for. 451 is the only honest code, and
+    /// a real sending server retries it.
+    #[test]
+    fn a_dmarc_answer_that_never_came_defers_rather_than_refusing_or_accepting() {
+        let reply = refusal(decided(&verdict(
+            "paypal.test",
+            DmarcVerdict::TempError,
+            Some(Policy::Reject),
+        )));
+
+        assert_eq!(reply.code, 451, "{reply}");
+        assert_eq!(reply.enhanced.as_deref(), Some("4.7.1"));
+        assert!(reply.text.contains("paypal.test"), "{reply}");
+        assert!(
+            reply.text.contains("reject"),
+            "the house rule is that a refusal names the domain *and* the \
+             policy it is enforcing; this arm always has `p=reject` in hand, \
+             so there is no excuse for leaving it out: {reply}"
+        );
+    }
+
+    /// **The resolver stall that must not become a bounce.** This is the
+    /// mistake the old version of this test enforced: it required a 451 for a
+    /// `temperror` with no policy in hand, on the theory that an unknown `p`
+    /// could have been `reject`.
+    ///
+    /// `mail-auth` makes that theory expensive. Its DMARC tree walk aborts
+    /// the *whole* walk with a `TempError` on the first non-NXDOMAIN failure
+    /// at any level — including after it has already read the record at the
+    /// `From` domain — and throws the record away as it does
+    /// (`dmarc/verify.rs`). So "no policy in hand" is not only a lame
+    /// `_dmarc` delegation at the sender: it is also a REFUSED answer, a
+    /// flaky authoritative server or a DNSSEC-bogus zone anywhere in the
+    /// `_dmarc` ancestry of an ordinary `p=none` domain. And
+    /// `Auth::timed_out` reports exactly this shape, so our own expired DNS
+    /// budget landed here too — reachable through one dead `include:` in a
+    /// sender's SPF record.
+    ///
+    /// A retry gets the same answer, so a 451 here is a bounce after the
+    /// sender's retry window, with nothing in the journal but `451` and the
+    /// correspondent left to report it. What the narrow rule gives up is a
+    /// forgery of a `p=reject` domain getting through only while *that
+    /// domain's own* `_dmarc` is unanswerable — which the forger does not
+    /// control — and the destination then evaluates DMARC with its own
+    /// resolver anyway. Accept and stamp is what OpenDMARC, rspamd and Gmail
+    /// all do.
+    #[test]
+    fn a_temperror_with_no_policy_in_hand_is_forwarded_with_temperror_in_the_header() {
+        let auth = verdict("lame.test", DmarcVerdict::TempError, None);
+        let decision = decided(&auth);
+
+        assert!(
+            matches!(decision, Decision::Deliver(_)),
+            "a resolver that did not answer must not cost this message its \
+             delivery: {decision:?}"
+        );
+        assert_eq!(
+            auth.dmarc.result,
+            DmarcVerdict::TempError,
+            "and the finding is still reported honestly, so the header the \
+             destination reads says `dmarc=temperror` rather than claiming a \
+             pass we did not see"
+        );
+    }
+
+    /// NXDOMAIN on `_dmarc` is an answer: this domain publishes no policy, so
+    /// there is nothing to enforce and the message is ordinary mail. Confusing
+    /// it with a temporary error defers most of the mail on the internet.
+    #[test]
+    fn a_domain_with_no_dmarc_record_is_forwarded() {
+        let decision = decided(&verdict("elsewhere.test", DmarcVerdict::None, None));
+
+        assert!(
+            matches!(decision, Decision::Deliver(_)),
+            "a domain with no DMARC record has asked for nothing: {decision:?}"
+        );
+    }
+
+    /// RFC 7489 §6.6.3: a record that cannot be parsed is treated as if there
+    /// were none. Refusing on a permanent error would punish a domain for a
+    /// typo in its own DNS, and the destination recomputes all of this anyway.
+    #[test]
+    fn a_dmarc_record_that_cannot_be_read_is_forwarded() {
+        let decision = decided(&verdict(
+            "broken.test",
+            DmarcVerdict::PermError,
+            Some(Policy::Reject),
+        ));
+
+        assert!(matches!(decision, Decision::Deliver(_)), "{decision:?}");
+    }
+
+    /// `p=quarantine` is a request to treat the message as suspicious, not to
+    /// refuse it. mxhop has no spam folder and the destination does, so the
+    /// copy goes on with the policy written into the header. Refusing here
+    /// would destroy mail the domain owner did not ask anyone to destroy.
+    #[test]
+    fn a_quarantine_failure_is_forwarded_rather_than_refused() {
+        let auth = verdict("shop.test", DmarcVerdict::Fail, Some(Policy::Quarantine));
+        let decision = decided(&auth);
+
+        assert!(matches!(decision, Decision::Deliver(_)), "{decision:?}");
+        assert!(
+            auth.header("mx.tooling.ninja")
+                .contains("policy.dmarc=quarantine"),
+            "and the destination is told, or the request is lost on the way: {}",
+            auth.header("mx.tooling.ninja")
+        );
+    }
+
+    /// Monitoring only. A `p=none` domain has asked to be told about failures,
+    /// not to have them stopped — and this is the commonest DMARC record there
+    /// is, so refusing on it would refuse an enormous amount of real mail.
+    #[test]
+    fn a_failure_under_p_none_is_forwarded() {
+        let decision = decided(&verdict(
+            "gmail.test",
+            DmarcVerdict::Fail,
+            Some(Policy::None),
+        ));
+
+        assert!(matches!(decision, Decision::Deliver(_)), "{decision:?}");
+    }
+
+    /// What mail forwarded by somebody else looks like: SPF hard-fails,
+    /// because the message is being relayed by a host its domain never
+    /// authorised, and an aligned DKIM signature still passes — which is a
+    /// DMARC pass. Refusing on the SPF failure alone would refuse every
+    /// message another forwarder sends us, which is why nothing is decided at
+    /// MAIL FROM and SPF alone decides nothing here either.
+    #[test]
+    fn an_spf_hardfail_with_an_aligned_dkim_pass_is_forwarded() {
+        let auth = Auth {
+            spf_mail: Spf::Fail,
+            dkim: vec![Dkim {
+                domain: "list.test".into(),
+                selector: "s1".into(),
+                b8: "AAAAAAAA".into(),
+                result: DkimVerdict::Pass,
+            }],
+            ..verdict("list.test", DmarcVerdict::Pass, Some(Policy::Reject))
+        };
+
+        assert!(
+            matches!(decided(&auth), Decision::Deliver(_)),
+            "a DMARC pass is a pass however it was reached"
+        );
+    }
+
+    /// `~all` means "do not reject" in the words of the domain that published
+    /// it. With no DMARC record on top of it there is nothing to enforce.
+    #[test]
+    fn an_spf_softfail_on_its_own_is_forwarded() {
+        let auth = Auth {
+            spf_mail: Spf::SoftFail,
+            ..verdict("elsewhere.test", DmarcVerdict::None, None)
+        };
+
+        assert!(matches!(decided(&auth), Decision::Deliver(_)));
+    }
+
+    /// `-all` is wrong often enough — every mailing list and every forwarder
+    /// trips it — that refusing on it alone would lose the owner's mail, which
+    /// is the worse of the two errors. The header records it and the message
+    /// goes on.
+    #[test]
+    fn an_spf_hardfail_with_no_dmarc_record_is_forwarded_and_recorded() {
+        let auth = Auth {
+            spf_mail: Spf::Fail,
+            ..verdict("elsewhere.test", DmarcVerdict::None, None)
+        };
+
+        assert!(matches!(decided(&auth), Decision::Deliver(_)));
+        assert!(
+            auth.header("mx.tooling.ninja").contains("spf=fail"),
+            "{}",
+            auth.header("mx.tooling.ninja")
+        );
+    }
+
+    /// A temporary error where the policy is known not to be `reject` could
+    /// not have led to a refusal whatever it turned into, so deferring would
+    /// hold up mail for no possible gain.
+    #[test]
+    fn a_temperror_under_p_none_is_forwarded() {
+        let decision = decided(&verdict(
+            "gmail.test",
+            DmarcVerdict::TempError,
+            Some(Policy::None),
+        ));
+
+        assert!(matches!(decision, Decision::Deliver(_)), "{decision:?}");
+    }
+
+    /// The switch has to do both halves of its job: forward what enforcement
+    /// would have refused, and still tell the truth about it. A switch that
+    /// also silenced the header would leave an operator evaluating
+    /// enforcement with nothing to evaluate.
+    #[test]
+    fn enforce_off_forwards_a_reject_failure_and_the_header_still_says_fail() {
+        let auth = verdict("paypal.test", DmarcVerdict::Fail, Some(Policy::Reject));
+        let decision = decide(
+            &envelope(&["hi@example.com"]),
+            &router(),
+            &Head::default(),
+            &Limits {
+                enforce: Enforce::Off,
+                ..Limits::default()
+            },
+            &auth,
+        );
+
+        assert!(matches!(decision, Decision::Deliver(_)), "{decision:?}");
+        assert!(
+            auth.header("mx.tooling.ninja").contains("dmarc=fail"),
+            "the operator's choice does not make the header lie: {}",
+            auth.header("mx.tooling.ninja")
+        );
+    }
+
+    /// A check that was never run cannot have found a failure. `not_checked`
+    /// is all defaults, and a table that read a default as a verdict would
+    /// refuse on the strength of a lookup nobody made.
+    #[test]
+    fn a_verdict_that_was_never_checked_refuses_nothing() {
+        let decision = decided(&Auth::not_checked());
+
+        assert!(matches!(decision, Decision::Deliver(_)), "{decision:?}");
+    }
+
+    /// Two different `From` domains have no single DMARC identity, so there is
+    /// nothing to align against and nothing to enforce. The destination
+    /// recomputes all of it, and RFC 7489 §6.6.1 would prefer a refusal —
+    /// which is noted, and not taken: refusing a shape of message that is
+    /// merely unusual is how a forwarder loses mail it should have passed on.
+    #[test]
+    fn a_message_with_two_from_domains_is_forwarded_as_a_permerror() {
+        let decision = decided(&verdict("", DmarcVerdict::PermError, None));
+
+        assert!(matches!(decision, Decision::Deliver(_)), "{decision:?}");
     }
 }

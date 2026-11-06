@@ -14,6 +14,7 @@ anyhow = "1.0.104"
 arc-swap = "1.9.3"
 clap = { version = "4.6.7", features = ["derive", "env"] }
 hickory-resolver = { version = "0.26.3", default-features = false, features = ["tokio", "system-config"] }
+mail-auth = { version = "0.15.1", default-features = false, features = ["rust-crypto", "dns-hickory"] }
 ring = "0.17.14"
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-pki-types = "1.15.1"
@@ -28,4 +29,21 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 webpki-roots = "1.0.11"
 
 [dev-dependencies]
+mail-auth = { version = "0.15.1", default-features = false, features = ["rust-crypto", "dns-hickory", "generate"] }
 rcgen = "0.14.10"
+
+# RSA key generation is the only slow thing in this test suite, and it is slow
+# only because bignum arithmetic compiled without optimisation is slow. These
+# two overrides optimise only those two crates, so an ordinary `cargo test`
+# build does not get slower anywhere else.
+# `an_rsa_signature_verifies_and_one_changed_byte_breaks_it` generates a real
+# 2048-bit key in-process; it measured 1.99 s in the plain dev profile and
+# 0.27 s with these overrides. The test profile inherits `dev`, so this is
+# what lets that test be an ordinary one rather than an `#[ignore]`d one — and
+# an ignored test of the RSA path is no test at all, because RSA is the
+# signature that the one refusal mxhop can issue is decided on.
+[profile.dev.package.num-bigint-dig]
+opt-level = 3
+
+[profile.dev.package.rsa]
+opt-level = 3

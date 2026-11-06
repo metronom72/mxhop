@@ -81,6 +81,12 @@ pub struct SessionConfig {
     pub relay_budget: Duration,
     /// What counts as a loop. See [`crate::policy::Limits`].
     pub limits: Limits,
+    /// `[auth] enabled`. Carried here only so that the forged-header strip
+    /// can be switched off with it: the lookups are already switched off by
+    /// the relay handing back [`crate::auth::Auth::not_checked`], but the
+    /// strip runs in this file and would otherwise keep running. See where it
+    /// is read for why that matters.
+    pub auth_enabled: bool,
 }
 
 impl SessionConfig {
@@ -95,7 +101,11 @@ impl SessionConfig {
             handshake_timeout: HANDSHAKE_TIMEOUT,
             ptr_timeout: PTR_TIMEOUT,
             relay_budget: RELAY_BUDGET,
-            limits: Limits::default(),
+            limits: Limits {
+                enforce: config.auth.enforce,
+                ..Limits::default()
+            },
+            auth_enabled: config.auth.enabled,
         }
     }
 }
@@ -579,6 +589,49 @@ where
     let id = new_id();
     let helo = state.helo.clone().unwrap_or_default();
 
+    // One deadline for everything after the final dot, started here rather
+    // than just before the deliveries: the authentication check below spends
+    // real time on DNS while the sending server waits, so it is charged
+    // against this budget instead of being added on top of it. Postfix gives
+    // up on an unanswered final dot after ten minutes and resends, and a
+    // duplicate produced by nothing but arithmetic is the worst kind.
+    let deadline = std::time::Instant::now() + config.relay_budget;
+
+    // RFC 8601 §5: any `Authentication-Results` header already in this
+    // message that claims to be ours is spliced out before ours is written,
+    // and before anything is verified. This is the one place mxhop changes
+    // the bytes of a message, and it changes them for one reason — otherwise
+    // a sender writes the header itself, under our name, and nothing
+    // downstream can tell its claim from our finding.
+    //
+    // Gated on `enabled`, because the documented reason to switch the check
+    // off is that something in front of mxhop already does it and writes the
+    // header — and the natural thing for that box to use as its authserv-id
+    // is this host's name, which the same operator configured. Stripping then
+    // deletes the upstream finding and writes nothing in its place, while the
+    // configuration promises "no lookups, no header, no refusals". With the
+    // check off mxhop has no opinion about this header, so it leaves it
+    // alone; it is also then the only state in which the message's bytes
+    // leave exactly as they arrived.
+    let body = match config
+        .auth_enabled
+        .then(|| crate::auth::strip_forged_results(&body, &config.hostname))
+        .flatten()
+    {
+        Some(stripped) => {
+            warn!(
+                %peer,
+                id = %id,
+                removed = body.len() - stripped.len(),
+                "this message arrived carrying an Authentication-Results header under \
+                 this host's own name, which only this host may write; it has been \
+                 removed before the message was checked"
+            );
+            stripped
+        }
+        None => body,
+    };
+
     // The peer's own name, under a short clock: nothing is decided on it, so
     // a resolver that is thinking must not cost the sending server its
     // session. `unknown` in the trace is the honest answer.
@@ -613,19 +666,108 @@ where
         id,
         from: state.from.clone().flatten(),
         to: state.recipients.clone(),
-        helo,
+        helo: helo.clone(),
         peer: peer.to_string(),
         received_at_unix_ms: now_unix_ms(),
         size: body.len() as u64,
         received: received.clone(),
+        // Filled in below, once the check has run.
+        authentication_results: String::new(),
         last_reply: None,
     };
 
     // The message's own trace, read before anything leaves: the loop that
     // bites a forwarder is not in the alias table but in somebody else's
     // filter rule.
+    //
+    // Read, and acted on, *before* the authentication check below, because
+    // this is pure and that spends up to the whole DNS budget. A message
+    // going round a loop would otherwise burn twenty seconds of resolver
+    // time on every hop before earning the one refusal that needed nothing
+    // from the network — and the server waiting through it is this host.
     let head = policy::Head::scan(&body, &config.hostname);
-    let plan = match policy::decide(&envelope, router, &head, &config.limits) {
+    if let Some(reply) = policy::check_trace(&head, &config.limits) {
+        info!(
+            %peer,
+            id = %envelope.id,
+            received = head.received_count,
+            by_us = head.by_us_count,
+            "refusing to relay: {reply}"
+        );
+        return (reply, false);
+    }
+
+    // SPF, DKIM and DMARC, once, here — not at MAIL FROM and not at RCPT TO.
+    //
+    // SPF *could* run at MAIL FROM, and refusing there would pre-empt DMARC:
+    // an SPF hard failure with an aligned DKIM pass is a DMARC pass, and that
+    // is exactly what mail forwarded by somebody else looks like. DKIM needs
+    // the whole body and DMARC needs the `From:` header plus both results, so
+    // end-of-DATA is the first moment any of it can be decided — and it is
+    // still early enough that the sending server holds the message.
+    //
+    // `mail-auth` has no clock of its own, so this `timeout` is the only one.
+    // An expired budget becomes a verdict of `temperror` throughout rather
+    // than a verdict of `none`: see `Auth::timed_out`.
+    let auth = {
+        let budget = crate::auth::AUTH_BUDGET
+            .min(deadline.saturating_duration_since(std::time::Instant::now()));
+        let probe = crate::auth::Probe {
+            // A peer that is not an address at all happens only in a test;
+            // the unspecified address matches no SPF mechanism, which makes
+            // every result honest rather than invented.
+            ip: address.as_ref().map_or(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                |address| address.ip(),
+            ),
+            helo: &helo,
+            // The sender as it arrived, before SRS: here mxhop is the
+            // receiver, and the question is whether the *original* sender's
+            // domain allows this peer to send for it.
+            mail_from: envelope.from.as_deref(),
+            body: &body,
+        };
+        match timeout(budget, relay.verify(probe)).await {
+            Ok(auth) => auth,
+            Err(_) => {
+                warn!(
+                    %peer,
+                    id = %envelope.id,
+                    seconds = budget.as_secs(),
+                    "SPF, DKIM and DMARC could not be checked inside their budget; \
+                     every result is reported as temporary and the message is \
+                     forwarded with that in its header, because an expired clock \
+                     of ours is not evidence against the sender"
+                );
+                // The body, not the envelope sender: the DMARC identity is
+                // the `From` header's, and `timed_out` reads it from here so
+                // the header does not name a domain nothing examined.
+                crate::auth::Auth::timed_out(envelope.from.as_deref(), &helo, &body)
+            }
+        }
+    };
+
+    // Empty when the check is switched off: a header that reported nothing
+    // having looked nothing up would be a claim of its own.
+    let results = if auth.checked {
+        auth.header(&config.hostname)
+    } else {
+        String::new()
+    };
+    // Kept on the envelope beside `received`, and for the same reason that
+    // field exists: a held copy has to be retried with the identical bytes,
+    // and a second attempt that re-derived this header would have to repeat
+    // every lookup and might get different answers — so the record of what
+    // was found when the message arrived would be lost.
+    let envelope = Envelope {
+        authentication_results: results.clone(),
+        ..envelope
+    };
+
+    // `head` was scanned above, before the DNS budget was spent, and the loop
+    // rules were already applied to it there; `decide` re-checks them, which
+    // costs a comparison and keeps the rule true for any other caller.
+    let plan = match policy::decide(&envelope, router, &head, &config.limits, &auth) {
         Decision::Refuse(reply) => {
             info!(
                 %peer,
@@ -718,7 +860,14 @@ where
     // difference between one copy and four.
     let body: std::sync::Arc<[u8]> = body.into();
 
-    // One deadline for the whole message, not one per destination domain.
+    // The `Received` header, then ours directly under it: a reader of the
+    // destination's "Show original" sees the hop and what we found out about
+    // it together, and the spooled bytes stay exactly what arrived.
+    let mut prepended = received.clone();
+    prepended.push_str(&results);
+
+    // The deadline for all of this was started at the top of this function,
+    // where the authentication check began spending it.
     //
     // The groups are delivered in turn, so a per-group budget multiplies:
     // four destination domains at `Budget::overall` each is up to twelve
@@ -735,7 +884,6 @@ where
     // that actually has to be bounded, and costs the last group its chance
     // when the earlier ones were slow, which is the right trade: a deferral
     // is retried, a duplicate is not undone.
-    let deadline = std::time::Instant::now() + config.relay_budget;
 
     let mut outcomes = Vec::with_capacity(plan.groups.len());
     for group in &plan.groups {
@@ -748,7 +896,7 @@ where
                     Delivery::new(
                         sender.clone(),
                         group.recipients.clone(),
-                        received.clone().into_bytes(),
+                        prepended.clone().into_bytes(),
                         std::sync::Arc::clone(&body),
                     )
                     .due_by(deadline),
@@ -1036,7 +1184,20 @@ mod tests {
         /// What each destination domain says. Anything not listed accepts.
         answers: std::collections::BTreeMap<String, client::Verdict>,
         ptr: Option<String>,
+        /// The verdict the authentication check comes back with, and the
+        /// probe it was asked about. A literal, because the session's job
+        /// here is to put the verdict's header in the right place and hand
+        /// the refusal to `decide` — not to work out what the verdict is,
+        /// which `auth.rs` and `policy.rs` are tested on separately.
+        auth: crate::auth::Auth,
+        probed: std::sync::Arc<std::sync::Mutex<Vec<Probed>>>,
     }
+
+    /// One call of `Relay::verify`, as the test wants to read it back: the
+    /// HELO name, the envelope sender and how many bytes of message the check
+    /// was given. The identities matter because the check has to be made
+    /// against the sender that *arrived*, not the SRS-rewritten one.
+    type Probed = (String, Option<String>, usize);
 
     impl Fake {
         fn accepting() -> Self {
@@ -1088,6 +1249,15 @@ mod tests {
 
         async fn ptr(&self, _ip: std::net::IpAddr) -> Option<String> {
             self.ptr.clone()
+        }
+
+        async fn verify(&self, probe: crate::auth::Probe<'_>) -> crate::auth::Auth {
+            self.probed.lock().unwrap().push((
+                probe.helo.to_string(),
+                probe.mail_from.map(ToString::to_string),
+                probe.body.len(),
+            ));
+            self.auth.clone()
         }
     }
 
@@ -1147,6 +1317,22 @@ mod tests {
     }
 
     async fn talk_all(relay: Fake, limit: u64, srs: Option<&Srs>, script: &str) -> Talk {
+        talk_everything(relay, limit, srs, true, script).await
+    }
+
+    /// `talk_all` with `[auth] enabled` turned down, for the one test that is
+    /// about what a disabled check leaves alone.
+    async fn talk_unchecked(relay: Fake, script: &str) -> Talk {
+        talk_everything(relay, 26_214_400, None, false, script).await
+    }
+
+    async fn talk_everything(
+        relay: Fake,
+        limit: u64,
+        srs: Option<&Srs>,
+        auth_enabled: bool,
+        script: &str,
+    ) -> Talk {
         let root = scratch("session");
         let spool = Spool::open(&root).await.unwrap();
         let config = SessionConfig {
@@ -1159,6 +1345,7 @@ mod tests {
             handshake_timeout: Duration::from_secs(10),
             ptr_timeout: Duration::from_secs(10),
             relay_budget: RELAY_BUDGET,
+            auth_enabled,
             limits: Limits::default(),
         };
 
@@ -1313,6 +1500,11 @@ mod tests {
         )
         .await;
 
+        // The *last* code, not merely *a* 250 somewhere in the transcript:
+        // `codes().contains("250")` is satisfied by the EHLO reply alone, so
+        // that weaker form passes even when DATA is refused and nothing is
+        // relayed. 221 is the QUIT only a session that accepted the message
+        // ever reaches.
         assert_eq!(talk.last_code(), "221", "{}", talk.out);
         let seen = talk.relay.seen.lock().unwrap();
         assert_eq!(seen.len(), 1, "{}", talk.out);
@@ -2194,6 +2386,7 @@ mod tests {
             handshake_timeout: Duration::from_millis(50),
             ptr_timeout: Duration::from_secs(10),
             relay_budget: RELAY_BUDGET,
+            auth_enabled: true,
             limits: Limits::default(),
         };
 
@@ -2430,6 +2623,7 @@ mod tests {
             handshake_timeout: Duration::from_millis(200),
             ptr_timeout: Duration::from_secs(10),
             relay_budget: RELAY_BUDGET,
+            auth_enabled: true,
             limits: Limits::default(),
         };
 
@@ -2723,5 +2917,279 @@ mod tests {
             .unwrap();
 
         assert!(!outcome.tls);
+    }
+
+    // ------------------------------ what the session does with the verdict
+
+    use crate::auth::{Auth, Dmarc, DmarcVerdict, Policy as DmarcPolicy, Spf};
+
+    /// A relay whose authentication check comes back with `auth`.
+    fn fake_with(auth: Auth) -> Fake {
+        Fake {
+            auth,
+            ..Fake::accepting()
+        }
+    }
+
+    fn verdict(from: &str, result: DmarcVerdict, policy: Option<DmarcPolicy>) -> Auth {
+        Auth {
+            spf_mail: Spf::Fail,
+            spf_helo: Spf::Pass,
+            mail_from: Some("sender@elsewhere.test".into()),
+            helo: Some("mail.elsewhere.test".into()),
+            dkim: Vec::new(),
+            dmarc: Dmarc {
+                from_domain: from.to_string(),
+                result,
+                policy,
+            },
+            checked: true,
+        }
+    }
+
+    /// The header has to sit *under* our `Received`, and in the delivery's
+    /// prepended bytes rather than in the stored message: the spooled file
+    /// stays exactly what arrived, which is what makes a held copy retryable
+    /// with identical bytes. A reader of the destination's "Show original"
+    /// then sees the hop and what we found out about it together.
+    #[tokio::test]
+    async fn the_results_header_goes_on_the_wire_directly_under_our_received() {
+        let auth = verdict(
+            "elsewhere.test",
+            DmarcVerdict::Pass,
+            Some(DmarcPolicy::None),
+        );
+        let talk = talk_with(fake_with(auth), 26_214_400, DELIVER).await;
+
+        let head = String::from_utf8(talk.relay.only().head).unwrap();
+        let received = head
+            .find("Received: from mail.elsewhere.test")
+            .unwrap_or_else(|| panic!("a Received header: {head:?}"));
+        let results = head
+            .find("Authentication-Results: mx.test;")
+            .unwrap_or_else(|| panic!("our results header: {head:?}"));
+
+        assert!(
+            received < results,
+            "the trace comes first and ours is written under it: {head:?}"
+        );
+        assert!(head.contains("dmarc=pass"), "{head:?}");
+        assert!(
+            head.ends_with("\r\n"),
+            "the prepended block has to end on a header boundary, or the first \
+             line of the stored message is folded onto ours: {head:?}"
+        );
+    }
+
+    /// The check is told the sender as it arrived, not the SRS-rewritten one.
+    /// Rewritten, the question becomes whether this host may send for its own
+    /// SRS domain, which it always may — so every message would pass SPF and
+    /// the whole check would be a no-op that looks like it works.
+    #[tokio::test]
+    async fn the_check_is_made_against_the_sender_that_arrived() {
+        let srs = test_srs();
+        let auth = verdict("elsewhere.test", DmarcVerdict::None, None);
+        let relay = fake_with(auth);
+        let talk = talk_all(relay, 26_214_400, Some(&srs), DELIVER).await;
+
+        let probed = talk.relay.probed.lock().unwrap().clone();
+        assert_eq!(
+            probed
+                .iter()
+                .map(|(helo, from, _)| (helo.clone(), from.clone()))
+                .collect::<Vec<_>>(),
+            vec![(
+                "mail.elsewhere.test".to_string(),
+                Some("sender@elsewhere.test".to_string())
+            )],
+            "checked once, against the original envelope sender"
+        );
+        assert!(
+            talk.relay
+                .only()
+                .from
+                .as_deref()
+                .is_some_and(|from| from.contains("srs.mx.test")),
+            "and the rewrite still happened on the way out"
+        );
+    }
+
+    /// The whole point: a forgery is refused while the sending server still
+    /// holds the message, and nothing leaves. A 550 that still handed the
+    /// message to Gmail would be the worst of both — the sender told it
+    /// failed and the forgery delivered anyway.
+    #[tokio::test]
+    async fn a_reject_policy_failure_is_refused_and_nothing_leaves() {
+        let auth = verdict("paypal.test", DmarcVerdict::Fail, Some(DmarcPolicy::Reject));
+        let talk = talk_with(fake_with(auth), 26_214_400, DELIVER).await;
+
+        assert!(talk.codes().contains(&"550"), "{}", talk.out);
+        assert!(
+            talk.out.contains("paypal.test"),
+            "the sender is told which domain and why: {}",
+            talk.out
+        );
+        assert!(
+            talk.relay.deliveries().is_empty(),
+            "nothing may be handed on: {:?}",
+            talk.relay.deliveries()
+        );
+        assert_eq!(talk.outcome.accepted, 0);
+    }
+
+    /// And a deferral is a deferral all the way out to the wire: 451, nothing
+    /// delivered and nothing stored, so the message waits where it already is
+    /// — on a sending server that has a retry queue, which mxhop does not.
+    #[tokio::test]
+    async fn a_dmarc_temperror_under_p_reject_is_deferred_on_the_wire() {
+        let auth = verdict(
+            "paypal.test",
+            DmarcVerdict::TempError,
+            Some(DmarcPolicy::Reject),
+        );
+        let talk = talk_with(fake_with(auth), 26_214_400, DELIVER).await;
+
+        assert!(talk.codes().contains(&"451"), "{}", talk.out);
+        assert!(talk.relay.deliveries().is_empty());
+        assert!(
+            talk.spool.queued().await.unwrap().is_empty(),
+            "nothing is kept: the sending server still has it"
+        );
+    }
+
+    /// `p=quarantine` forwards, and the destination is told what the domain
+    /// asked for — because the destination is the one with a spam folder.
+    #[tokio::test]
+    async fn a_quarantine_failure_is_delivered_with_the_policy_in_the_header() {
+        let auth = verdict(
+            "shop.test",
+            DmarcVerdict::Fail,
+            Some(DmarcPolicy::Quarantine),
+        );
+        let talk = talk_with(fake_with(auth), 26_214_400, DELIVER).await;
+
+        assert!(talk.codes().contains(&"250"), "{}", talk.out);
+        let head = String::from_utf8(talk.relay.only().head).unwrap();
+        assert!(head.contains("policy.dmarc=quarantine"), "{head:?}");
+    }
+
+    /// With the check switched off no header is written at all. A header that
+    /// reported `none` throughout, having looked nothing up, would be a claim
+    /// of its own — and the next hop would read it as a finding.
+    #[tokio::test]
+    async fn a_check_that_was_never_run_writes_no_header() {
+        let talk = talk_with(fake_with(Auth::not_checked()), 26_214_400, DELIVER).await;
+
+        let head = String::from_utf8(talk.relay.only().head).unwrap();
+        assert!(
+            !head.to_ascii_lowercase().contains("authentication-results"),
+            "{head:?}"
+        );
+    }
+
+    /// RFC 8601 §5, end to end. The forged header is gone from the bytes that
+    /// leave, and the one that leaves in its place is ours — otherwise the
+    /// destination sees two headers under our name and no way to tell them
+    /// apart.
+    #[tokio::test]
+    async fn a_forged_results_header_does_not_reach_the_destination() {
+        let auth = verdict("paypal.test", DmarcVerdict::Fail, Some(DmarcPolicy::None));
+        let script = "EHLO mail.elsewhere.test\r\n\
+                      MAIL FROM:<sender@elsewhere.test>\r\n\
+                      RCPT TO:<hi@example.com>\r\n\
+                      DATA\r\n\
+                      Authentication-Results: mx.test; dmarc=pass header.from=paypal.test\r\n\
+                      Subject: your account\r\n\
+                      \r\n\
+                      body\r\n\
+                      .\r\n\
+                      QUIT\r\n";
+
+        let talk = talk_with(fake_with(auth), 26_214_400, script).await;
+
+        let delivery = talk.relay.only();
+        let wire =
+            String::from_utf8([delivery.head.clone(), delivery.body.to_vec()].concat()).unwrap();
+
+        assert_eq!(
+            wire.matches("Authentication-Results:").count(),
+            1,
+            "exactly one, and it is ours: {wire:?}"
+        );
+        assert!(wire.contains("dmarc=fail"), "{wire:?}");
+        assert!(
+            !wire.contains("dmarc=pass"),
+            "the sender's own claim must not survive: {wire:?}"
+        );
+    }
+
+    /// **`enabled = false` changes no bytes.** The documented reason to switch
+    /// the check off is that something in front of mxhop already does it and
+    /// writes the header — and the natural authserv-id for that box is this
+    /// host's name, because the same operator configured both. The strip then
+    /// deleted the upstream finding and wrote nothing in its place, while the
+    /// example config promised "no lookups, no header, no refusals".
+    #[tokio::test]
+    async fn a_disabled_check_leaves_an_upstream_results_header_where_it_is() {
+        let script = "EHLO mail.elsewhere.test\r\n\
+                      MAIL FROM:<sender@elsewhere.test>\r\n\
+                      RCPT TO:<hi@example.com>\r\n\
+                      DATA\r\n\
+                      Authentication-Results: mx.test; dmarc=pass header.from=elsewhere.test\r\n\
+                      Subject: hello\r\n\
+                      \r\n\
+                      body\r\n\
+                      .\r\n\
+                      QUIT\r\n";
+
+        let talk = talk_unchecked(fake_with(Auth::not_checked()), script).await;
+
+        let delivery = talk.relay.only();
+        let wire =
+            String::from_utf8([delivery.head.clone(), delivery.body.to_vec()].concat()).unwrap();
+
+        assert!(
+            wire.contains("Authentication-Results: mx.test; dmarc=pass"),
+            "with the check off mxhop has no opinion about this header, so it \
+             is not ours to delete: {wire:?}"
+        );
+        assert_eq!(
+            wire.matches("Authentication-Results:").count(),
+            1,
+            "and none of our own is written in its place: {wire:?}"
+        );
+    }
+
+    /// **A loop must not cost the DNS budget first.** `Head::scan` is pure,
+    /// the authentication check can spend the whole twenty seconds, and the
+    /// loop refusal needs nothing from the network — so a message going round
+    /// a loop used to buy twenty seconds of resolver time per hop before
+    /// being refused for a reason that was certain before any lookup. An
+    /// empty `probed` is the proof: the check was never reached.
+    #[tokio::test]
+    async fn a_looping_message_is_refused_before_any_authentication_lookup() {
+        let script = "EHLO mail.elsewhere.test\r\n\
+                      MAIL FROM:<sender@elsewhere.test>\r\n\
+                      RCPT TO:<hi@example.com>\r\n\
+                      DATA\r\n\
+                      Received: from a.test by mx.test with ESMTP id 1\r\n\
+                      Received: from b.test by mx.test with ESMTP id 2\r\n\
+                      Received: from c.test by mx.test with ESMTP id 3\r\n\
+                      Subject: round and round\r\n\
+                      \r\n\
+                      body\r\n\
+                      .\r\n\
+                      QUIT\r\n";
+
+        let talk = talk_with(Fake::accepting(), 26_214_400, script).await;
+
+        assert!(talk.codes().contains(&"554"), "{}", talk.out);
+        assert!(
+            talk.relay.probed.lock().unwrap().is_empty(),
+            "the loop was certain without DNS, so no lookup may have been \
+             started: {:?}",
+            talk.relay.probed.lock().unwrap()
+        );
+        assert!(talk.relay.deliveries().is_empty());
     }
 }

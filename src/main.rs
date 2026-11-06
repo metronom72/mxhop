@@ -137,7 +137,7 @@ fn check(cli: &Cli) -> ExitCode {
 
     let domains: Vec<&str> = config.router.domains().collect();
     println!(
-        "{}: ok — {} on {}, {} {} for {}{}{}",
+        "{}: ok — {} on {}, {} {} for {}{}{}{}",
         cli.config.display(),
         config.hostname,
         config.listen,
@@ -171,6 +171,17 @@ fn check(cli: &Cli) -> ExitCode {
                 mxhop::tls::current_user()
             ),
             None => ", no TLS".to_string(),
+        },
+        // Whether arriving mail is authenticated, and whether a failure can
+        // cost a message. Printed because it is the one setting in this file
+        // that can refuse somebody else's mail, and an operator who has
+        // turned it off should not have to open the file to find that out.
+        match (config.auth.enabled, config.auth.enforce) {
+            (false, _) => ", no SPF/DKIM/DMARC check at all".to_string(),
+            (true, mxhop::policy::Enforce::Dmarc) =>
+                ", SPF/DKIM/DMARC checked, and a p=reject failure refused".to_string(),
+            (true, mxhop::policy::Enforce::Off) =>
+                ", SPF/DKIM/DMARC checked and stamped, never refused".to_string(),
         },
     );
     ExitCode::SUCCESS
@@ -284,10 +295,28 @@ async fn run(cli: &Cli) -> ExitCode {
     // The resolver and the outbound settings every session delivers with.
     // Built once: a resolver per connection would mean a cache per
     // connection, which is no cache at all.
+    // The authentication side's own resolver, when `[auth]` is enabled. It
+    // fails the start for the same reason a missing SRS key does: running on
+    // with the check silently absent is the outage that looks like silence,
+    // and an MX that is down for a minute loses nothing because senders
+    // retry.
+    let verifier = if config.auth.enabled {
+        match mxhop::auth::Verifier::from_system(&config.hostname) {
+            Ok(verifier) => Some(verifier),
+            Err(e) => {
+                error!("cannot build a resolver for SPF, DKIM and DMARC: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
+
     let relay = match Hickory::from_system() {
         Ok(resolver) => Arc::new(Direct::new(
             resolver,
             Outbound::new(&config.hostname, config.outbound.ipv6),
+            verifier,
         )),
         Err(e) => {
             // Without DNS nothing can be delivered, and accepting mail we
@@ -325,6 +354,13 @@ async fn run(cli: &Cli) -> ExitCode {
         aliases = config.router.alias_count(),
         srs = srs.as_ref().map_or("none".to_string(), |s| s.domain().to_string()),
         queued,
+        auth = if !config.auth.enabled {
+            "off"
+        } else if config.auth.enforce == mxhop::policy::Enforce::Off {
+            "stamp only"
+        } else {
+            "dmarc"
+        },
         tls = tls.is_some(),
         "mxhop is accepting mail"
     );
