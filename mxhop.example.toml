@@ -25,6 +25,16 @@ spool_dir = "/var/lib/mxhop/spool"
 # responsibility for mail you then cannot hand over.
 max_message_bytes = 26214400
 
+# How mxhop hands mail on. The whole table is optional.
+[outbound]
+
+# Deliver over IPv6 to a destination that also publishes an A record. Off by
+# default, and worth leaving off unless your IPv6 reverse DNS (PTR) resolves
+# to this host's name: Gmail answers an IPv6 sender whose PTR does not match
+# with "550-5.7.25", and does it for every message. A destination that
+# publishes only AAAA records is tried over IPv6 either way.
+ipv6 = false
+
 # One table per domain you accept mail for. Mail for a domain that is not
 # listed here is refused outright — a TXT record somewhere else cannot make
 # mxhop accept mail on your behalf.

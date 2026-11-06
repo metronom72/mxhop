@@ -381,6 +381,11 @@ where
     // The reason the last host failed, so that the deferral says something
     // other than "it did not work".
     let mut last: Option<Fail> = None;
+    // Whether every host failed because DNS said its name has no address.
+    // That is an answer rather than a silence, and the commonest cause is a
+    // misspelled domain — which belongs back with the sender now rather than
+    // after five days of retries.
+    let mut only_missing_names = true;
 
     for target in &hosts {
         if Instant::now() >= deadline {
@@ -393,13 +398,25 @@ where
         }
 
         let addrs = match resolver.addrs(&target.host).await {
+            Ok(addrs) if addrs.is_empty() => {
+                debug!(host = %target.host, "the name resolves to nothing");
+                last = Some(Fail::Connect(io::Error::other(format!(
+                    "{} has no address",
+                    target.host
+                ))));
+                continue;
+            }
             Ok(addrs) => addrs,
             Err(e) => {
                 debug!(host = %target.host, "no address: {e}");
+                if !matches!(e, crate::dns::DnsError::NotFound) {
+                    only_missing_names = false;
+                }
                 last = Some(Fail::Connect(io::Error::other(e.to_string())));
                 continue;
             }
         };
+        only_missing_names = false;
 
         for addr in usable(&addrs, out.ipv6) {
             if Instant::now() >= deadline {
@@ -458,9 +475,23 @@ where
         }
     }
 
-    // Nobody answered. Deferred rather than refused, always: a host that
-    // cannot be reached has said nothing, and inventing a refusal on its
-    // behalf throws away mail it would have taken.
+    if only_missing_names && !hosts.is_empty() {
+        return Outcome {
+            host: None,
+            results: Outcome::all(
+                &delivery.to,
+                Verdict::Refused(Reply::ours(
+                    550,
+                    "5.1.2",
+                    format_args!("no mail exchanger of {domain} has an address"),
+                )),
+            ),
+        };
+    }
+
+    // Otherwise: deferred, never refused. A host that could not be reached
+    // has said nothing, and inventing a refusal on its behalf throws away
+    // mail it would have taken.
     let reason = match last {
         Some(e) => Reply::ours(
             451,
@@ -1354,6 +1385,59 @@ mod tests {
             verdicts(&outcome)
         );
         assert!(pipes.connections().is_empty(), "and nothing was dialled");
+    }
+
+    #[tokio::test]
+    async fn a_domain_with_neither_an_exchanger_nor_an_address_is_refused() {
+        // A misspelled domain is the commonest bad recipient there is. DNS
+        // has answered — it said this name has nothing — so deferring it
+        // keeps the message in the queue for five days before telling the
+        // sender what DNS already knew.
+        let table = Table::default();
+
+        let outcome = deliver(&table, &Pipes::new(&[]), &outbound(), &message(b"hi\r\n")).await;
+
+        assert!(
+            matches!(outcome.results[0].verdict, Verdict::Refused(_)),
+            "{:?}",
+            verdicts(&outcome)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_exchanger_whose_address_will_not_resolve_is_only_deferred() {
+        // The same shape of failure, with the resolver unable to answer
+        // rather than answering that there is nothing: nothing is known, so
+        // nothing may be decided.
+        let table = Table::default()
+            .mx("example.com", &[(10, "mx1.example.com")])
+            .addr_error("mx1.example.com", DnsError::Failed("timeout".into()));
+
+        let outcome = deliver(&table, &Pipes::new(&[]), &outbound(), &message(b"hi\r\n")).await;
+
+        assert!(
+            matches!(outcome.results[0].verdict, Verdict::Deferred(_)),
+            "{:?}",
+            verdicts(&outcome)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dead_exchanger_is_deferred_rather_than_refused() {
+        // It resolved and refused the connection, which says nothing about
+        // whether the mail is deliverable.
+        let table = Table::default()
+            .mx("example.com", &[(10, "mx1.example.com")])
+            .addr("mx1.example.com", "203.0.113.1".parse().unwrap());
+        let pipes = Pipes::new(&[("203.0.113.1", Script::Refuse)]);
+
+        let outcome = deliver(&table, &pipes, &outbound(), &message(b"hi\r\n")).await;
+
+        assert!(
+            matches!(outcome.results[0].verdict, Verdict::Deferred(_)),
+            "{:?}",
+            verdicts(&outcome)
+        );
     }
 
     #[tokio::test]
