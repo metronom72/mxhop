@@ -228,6 +228,33 @@ pub fn load_str(src: &str) -> Result<Config, Vec<Problem>> {
                 ));
                 crate::srs::DEFAULT_MAX_AGE_DAYS
             }
+            // The other end of the range, and the one that fails silently.
+            // The day an address carries is two base32 characters, so ages
+            // are compared modulo 1024: a window of 1022 or more is older
+            // than every address that exists, every forged address verifies
+            // as in date, and the configuration looks like it tightened
+            // expiry rather than switching it off. The ceiling is a year
+            // rather than 1021, because a replay window measured in years is
+            // wrong whether or not it wraps — and the reason is stated, so
+            // that an operator who typed 1095 learns which of the two
+            // problems they have.
+            Some(v) if *v.get_ref() > crate::srs::MAX_AGE_DAYS_CEILING => {
+                problems.push(at(
+                    src,
+                    v.span(),
+                    format!(
+                        "srs.max_age_days must be at most {}: the day an address carries \
+                         wraps every 1024 days, so anything from 1022 upwards accepts \
+                         every address ever issued and turns expiry off without saying \
+                         so — and {} days is a window in which a harvested address \
+                         stays replayable for the better part of {:.1} years",
+                        crate::srs::MAX_AGE_DAYS_CEILING,
+                        v.get_ref(),
+                        f64::from(*v.get_ref()) / 365.0
+                    ),
+                ));
+                crate::srs::DEFAULT_MAX_AGE_DAYS
+            }
             Some(v) => *v.get_ref(),
         };
         // Our own alias lookup would shadow the bounce path: `RCPT TO` at a
@@ -1186,6 +1213,31 @@ hi = \"me@gmail.com\"
         let p = only_problem(&src);
 
         assert!(p.contains("max_age_days"), "{p}");
+    }
+
+    #[test]
+    fn an_srs_expiry_window_longer_than_a_year_is_refused() {
+        // The day counter in an address is two base32 characters, so ages are
+        // taken modulo 1024. A window of 1022 or more therefore accepts every
+        // address mxhop has ever issued: expiry is off, and nothing says so.
+        // Refused well below the wrap, because a window measured in years is
+        // a replay window measured in years whether it wraps or not.
+        let src = format!("{MINIMAL}{SRS}max_age_days = 1022\n");
+        let p = only_problem(&src);
+
+        assert!(p.contains("max_age_days"), "{p}");
+        assert!(
+            p.contains("365"),
+            "the refusal has to say what the ceiling is: {p}"
+        );
+
+        let src = format!("{MINIMAL}{SRS}max_age_days = 366\n");
+        let p = only_problem(&src);
+        assert!(p.contains("max_age_days"), "{p}");
+
+        let src = format!("{MINIMAL}{SRS}max_age_days = 365\n");
+        let c = load_str(&src).expect("a year is allowed, if unwise");
+        assert_eq!(c.srs.expect("srs").max_age_days, 365);
     }
 
     #[test]
