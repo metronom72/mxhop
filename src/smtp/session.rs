@@ -23,7 +23,7 @@ use crate::config::Config;
 use crate::envelope::{Envelope, now_unix_ms};
 use crate::policy::{self, Decision, Limits, Trace};
 use crate::routing::{Route, Router};
-use crate::smtp::client::{Delivery, Relay};
+use crate::smtp::client::{self, Delivery, Relay};
 use crate::smtp::command::{self, Command};
 use crate::smtp::wire::{self, WireError};
 use crate::spool::{Spool, new_id};
@@ -437,7 +437,7 @@ where
 
                 let (reply, delivered) =
                     hand_on(config, router, spool, relay, peer, state, body).await;
-                say(reader.get_mut(), &reply).await?;
+                say_reply(reader.get_mut(), &reply).await?;
                 if delivered {
                     state.outcome.accepted += 1;
                 }
@@ -506,7 +506,7 @@ async fn hand_on<L>(
     peer: &str,
     state: &State,
     body: Vec<u8>,
-) -> (String, bool)
+) -> (client::Reply, bool)
 where
     L: Relay,
 {
@@ -568,7 +568,7 @@ where
                 by_us = head.by_us_count,
                 "refusing to relay: {reply}"
             );
-            return (reply.to_string(), false);
+            return (reply, false);
         }
         Decision::Deliver(plan) => plan,
     };
@@ -646,7 +646,7 @@ where
             "relayed: {}",
             verdict.reply
         );
-        return (verdict.reply.to_string(), delivered);
+        return (verdict.reply, delivered);
     }
 
     // Some of it arrived, so the sender is told 250 and must not send it
@@ -698,7 +698,7 @@ where
         ),
     }
 
-    (verdict.reply.to_string(), delivered)
+    (verdict.reply, delivered)
 }
 
 /// Counts one refusal and says goodbye if the client has made too many.
@@ -757,11 +757,31 @@ where
     out.flush().await
 }
 
+/// Writes a destination's reply back to the sending server, as however many
+/// lines it arrived on.
+///
+/// Flattened into one line it reaches the sender with the enhanced code
+/// stranded mid-sentence — `... Please try 5.1.1 double-checking ...` — and
+/// a verbose destination's reply can pass RFC 5321's 512-octet limit for a
+/// single line. The whole reply is one write, for the same reason `say` is:
+/// a client that reads a reply a `recv` at a time must not see half of it.
+async fn say_reply<W>(out: &mut W, reply: &client::Reply) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut out_buf = String::new();
+    for line in reply.wire() {
+        out_buf.push_str(&line);
+        out_buf.push_str("\r\n");
+    }
+    out.write_all(out_buf.as_bytes()).await?;
+    out.flush().await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::routing::Mailbox;
-    use crate::smtp::client;
     use std::path::PathBuf;
     use tokio::io::{AsyncReadExt, duplex};
 
@@ -872,6 +892,7 @@ mod tests {
             code,
             enhanced: Some(enhanced.to_string()),
             text: text.to_string(),
+            lines: Vec::new(),
         }
     }
 
@@ -1428,6 +1449,46 @@ mod tests {
             String::from_utf8(t.spool.body(&queued[0].id).await.unwrap()).unwrap(),
             "body\r\n",
             "the stored file is the message as it arrived, with no header of ours in it"
+        );
+    }
+
+    /// A destination's multi-line refusal reaches the sending server as a
+    /// multi-line reply.
+    ///
+    /// Gmail's "does not exist" refusal arrives on three lines. Flattened
+    /// into one, the sender reads `550 5.1.1 mx.gmail.test said: ... Please
+    /// try 5.1.1 double-checking ...` — our enhanced code at the front and
+    /// the destination's stranded in the middle of the sentence — and a
+    /// longer reply of the same shape goes past the 512 octets RFC 5321
+    /// allows one line.
+    #[tokio::test]
+    async fn a_destinations_multi_line_refusal_is_refolded_for_the_sender() {
+        let refusal = client::Reply {
+            code: 550,
+            enhanced: Some("5.1.1".into()),
+            text: "does not exist. Please try double-checking the address".into(),
+            lines: vec![
+                "does not exist.".into(),
+                "Please try double-checking the address".into(),
+            ],
+        };
+        let script = "EHLO x.test\r\nMAIL FROM:<a@b.test>\r\nRCPT TO:<hi@example.com>\r\n\
+                      DATA\r\nbody\r\n.\r\nQUIT\r\n";
+        let t = talk_with(
+            Fake::answering("gmail.test", client::Verdict::Refused(refusal)),
+            26_214_400,
+            script,
+        )
+        .await;
+
+        assert!(
+            t.out.contains(
+                "550-5.1.1 mx.gmail.test said: does not exist.\r\n\
+                 550 5.1.1 Please try double-checking the address\r\n"
+            ),
+            "the attribution goes on the first line, the enhanced code on every \
+             line, and only the last line ends the reply: {}",
+            t.out.escape_debug()
         );
     }
 

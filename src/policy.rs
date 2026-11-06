@@ -227,6 +227,7 @@ pub fn decide(envelope: &Envelope, router: &Router, head: &Head, limits: &Limits
                 "too many hops: the message already carries {} Received headers",
                 head.received_count
             ),
+            lines: Vec::new(),
         });
     }
     if head.by_us_count >= limits.max_by_us {
@@ -238,6 +239,7 @@ pub fn decide(envelope: &Envelope, router: &Router, head: &Head, limits: &Limits
             // it, and the sender's own trace shows it. Keeping the signature
             // free of configuration is worth more than the name in the text.
             text: "this message has already passed through this host".into(),
+            lines: Vec::new(),
         });
     }
 
@@ -254,6 +256,7 @@ pub fn decide(envelope: &Envelope, router: &Router, head: &Head, limits: &Limits
                 code: 550,
                 enhanced: Some("5.4.6".into()),
                 text: format!("the alias for {recipient} points in a circle"),
+                lines: Vec::new(),
             });
         }
     }
@@ -268,6 +271,7 @@ pub fn decide(envelope: &Envelope, router: &Router, head: &Head, limits: &Limits
             code: 550,
             enhanced: Some("5.1.1".into()),
             text: "the alias expands to no deliverable mailbox".into(),
+            lines: Vec::new(),
         });
     }
 
@@ -404,6 +408,7 @@ pub fn reply_for(outcomes: &[Outcome], id: &str) -> Verdict {
                 code: 250,
                 enhanced: Some("2.0.0".into()),
                 text: format!("delivered as {id}"),
+                lines: Vec::new(),
             },
             hold: deferred
                 .iter()
@@ -451,22 +456,21 @@ pub fn reply_for(outcomes: &[Outcome], id: &str) -> Verdict {
             code: 451,
             enhanced: Some("4.4.1".into()),
             text: "mxhop: nothing was delivered and nothing said why".into(),
+            lines: Vec::new(),
         },
         Some((host, reply, _)) => {
-            let text = match host {
-                // The destination's own words, attributed. Without the host
-                // name the sender cannot tell our sentence from theirs.
+            // The destination's own words, attributed, and still as the lines
+            // they arrived on: re-folded on the way out they keep the
+            // enhanced code at the front of each line where the sender
+            // expects it, instead of stranded in the middle of one long one.
+            let relayed = match host {
                 Some(host) if !reply.text.starts_with("mxhop: ") => {
-                    format!("{host} said: {}", reply.text)
+                    (*reply).clone().attributed_to(host)
                 }
-                _ => reply.text.clone(),
+                _ => (*reply).clone(),
             };
             if deferred.is_empty() {
-                Reply {
-                    code: reply.code,
-                    enhanced: reply.enhanced.clone(),
-                    text,
-                }
+                relayed
             } else {
                 // One recipient still undecided makes the whole message
                 // retryable, even when the informative sentence came from a
@@ -479,7 +483,7 @@ pub fn reply_for(outcomes: &[Outcome], id: &str) -> Verdict {
                 Reply {
                     code: 451,
                     enhanced: Some(enhanced),
-                    text,
+                    ..relayed
                 }
             }
         }
@@ -1127,6 +1131,7 @@ mod tests {
             code,
             enhanced: Some(enhanced.to_string()),
             text: text.to_string(),
+            lines: Vec::new(),
         }
     }
 

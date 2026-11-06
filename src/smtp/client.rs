@@ -116,17 +116,38 @@ impl Delivery {
 
 /// One SMTP reply, however many lines it arrived on.
 ///
-/// The lines are flattened because the reply has one destination: the single
-/// line mxhop says back to the sending server. A reply that arrives as four
-/// lines and is relayed as the first one only loses the half that says what
-/// to do about it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `text` is every line joined, which is what a log line and an envelope's
+/// `last_reply` want. `lines` keeps them apart, which is what the wire wants:
+/// a reply relayed as one flattened line strands the enhanced code in the
+/// middle of the sentence — `... Please try 5.1.1 double-checking ...` —
+/// because mxhop writes its own code in front of a text that already had one
+/// lifted out of it, and a verbose destination's single line can exceed RFC
+/// 5321's 512-octet limit outright.
+#[derive(Debug, Clone, Default)]
 pub struct Reply {
     pub code: u16,
     /// The enhanced status code (RFC 3463), when the destination sent one.
     pub enhanced: Option<String>,
     pub text: String,
+    /// The destination's own lines, enhanced code and reply code stripped
+    /// from each. Empty for a reply mxhop wrote itself, and for one that
+    /// arrived on a single line: both of those are one line on the way out
+    /// too, so there is nothing to keep.
+    pub lines: Vec<String>,
 }
+
+/// Two replies are the same reply when they say the same thing with the same
+/// code. `lines` is left out on purpose: it is the same sentence as `text`,
+/// kept separately only so that it can be re-folded on the way out, and a
+/// derived equality would make two replies that read identically compare
+/// unequal over where their line breaks fell.
+impl PartialEq for Reply {
+    fn eq(&self, other: &Self) -> bool {
+        self.code == other.code && self.enhanced == other.enhanced && self.text == other.text
+    }
+}
+
+impl Eq for Reply {}
 
 impl Reply {
     fn is_positive(&self) -> bool {
@@ -146,8 +167,69 @@ impl Reply {
             code,
             enhanced: Some(enhanced.to_string()),
             text: format!("mxhop: {text}"),
+            lines: Vec::new(),
         }
     }
+
+    /// The same reply, said by someone and attributed to them.
+    ///
+    /// Without the host name the sending server cannot tell our sentence from
+    /// the destination's. The attribution goes on the first line as well as
+    /// on `text`, because the first line is what the sender reads first.
+    #[must_use]
+    pub fn attributed_to(mut self, host: &str) -> Self {
+        self.text = format!("{host} said: {}", self.text);
+        if let Some(first) = self.lines.first_mut() {
+            *first = format!("{host} said: {first}");
+        }
+        self
+    }
+
+    /// The reply as it goes on the wire to the sending server: one line, or
+    /// RFC 5321 continuation lines for a reply that arrived as several.
+    ///
+    /// The enhanced code is repeated on every line, which is what RFC 3463
+    /// §2 asks for, and the last line is the only one with a space rather
+    /// than a hyphen after the code — that is what tells the sender the reply
+    /// has ended.
+    #[must_use]
+    pub fn wire(&self) -> Vec<String> {
+        let enhanced = match &self.enhanced {
+            Some(enhanced) => format!("{enhanced} "),
+            None => String::new(),
+        };
+        if self.lines.len() < 2 {
+            return vec![clamp(format!("{} {enhanced}{}", self.code, self.text))];
+        }
+        let last = self.lines.len() - 1;
+        self.lines
+            .iter()
+            .enumerate()
+            .map(|(at, line)| {
+                let sep = if at == last { ' ' } else { '-' };
+                clamp(format!("{}{sep}{enhanced}{line}", self.code))
+            })
+            .collect()
+    }
+}
+
+/// A reply line cut to what RFC 5321 §4.5.3.1.5 allows: 512 octets, CRLF
+/// included. A destination that writes one enormous line — Microsoft's 5.7.1
+/// texts get close — is not a reason to write an illegal one back, and a
+/// sender that reads 512 octets and then looks for CRLF finds the next line's
+/// digits instead and calls the whole reply garbled.
+fn clamp(mut line: String) -> String {
+    const LIMIT: usize = 512 - 2;
+    if line.len() <= LIMIT {
+        return line;
+    }
+    // On a character boundary, so the truncation cannot leave half a UTF-8
+    // sequence on the wire.
+    while !line.is_char_boundary(LIMIT) {
+        line.truncate(line.len() - 1);
+    }
+    line.truncate(LIMIT);
+    line
 }
 
 impl fmt::Display for Reply {
@@ -1084,31 +1166,41 @@ where
 /// Turns however many lines arrived into the one reply mxhop will quote.
 fn flatten(lines: &[String]) -> Reply {
     let code = lines[0][..3].parse::<u16>().unwrap_or(0);
-    let mut text = String::new();
+    let mut kept: Vec<String> = Vec::with_capacity(lines.len());
     for line in lines {
         let rest = line.get(4..).unwrap_or("").trim();
         if rest.is_empty() {
             continue;
         }
-        if !text.is_empty() {
-            text.push(' ');
-        }
-        text.push_str(rest);
+        kept.push(rest.to_string());
     }
 
     // RFC 3463: the enhanced code is the first token of the text, and it is
     // lifted out so that mxhop's own reply can carry the destination's class
-    // rather than a made-up one.
-    let (enhanced, text) = match text.split_once(' ') {
-        Some((head, rest)) if is_enhanced(head) => (Some(head.to_string()), rest.to_string()),
-        _ if is_enhanced(&text) => (Some(text.clone()), String::new()),
-        _ => (None, text),
-    };
+    // rather than a made-up one. A destination that repeats it on every line
+    // — which is what the RFC asks of it — has it taken off every line, or
+    // re-emitting them would say it twice.
+    let enhanced = kept.first().and_then(|first| match first.split_once(' ') {
+        Some((head, _)) if is_enhanced(head) => Some(head.to_string()),
+        _ if is_enhanced(first) => Some(first.clone()),
+        _ => None,
+    });
+    if let Some(enhanced) = &enhanced {
+        for line in &mut kept {
+            if let Some(rest) = line.strip_prefix(enhanced.as_str()) {
+                *line = rest.trim_start().to_string();
+            }
+        }
+    }
+    kept.retain(|line| !line.is_empty());
 
     Reply {
         code,
         enhanced,
-        text,
+        text: kept.join(" "),
+        // One line on the way in is one line on the way out, so there is
+        // nothing worth keeping apart.
+        lines: if kept.len() > 1 { kept } else { Vec::new() },
     }
 }
 
@@ -1265,6 +1357,81 @@ impl Relay for Blackhole {
 mod tests {
     use super::*;
     use crate::dns::{DnsError, Table};
+
+    /// A multi-line reply has to survive as lines, not only as a sentence.
+    ///
+    /// Flattened to one line and relayed, the enhanced code is stranded
+    /// mid-sentence — `... Please try 5.1.1 double-checking ...` — because
+    /// mxhop writes its own code in front of a text that already had one
+    /// taken out of the middle of it. A verbose destination (Microsoft's
+    /// 5.7.1 texts run to several hundred characters) can also push the
+    /// single line past RFC 5321's 512-octet reply limit.
+    #[test]
+    fn a_multi_line_reply_keeps_its_lines() {
+        let reply = flatten(&[
+            "550-5.1.1 The email account that you tried to reach does not exist.".to_string(),
+            "550-5.1.1 Please try double-checking the recipient's email address".to_string(),
+            "550 5.1.1 for typos or unnecessary spaces.".to_string(),
+        ]);
+
+        assert_eq!(reply.code, 550);
+        assert_eq!(reply.enhanced.as_deref(), Some("5.1.1"));
+        assert_eq!(
+            reply.lines,
+            vec![
+                "The email account that you tried to reach does not exist.",
+                "Please try double-checking the recipient's email address",
+                "for typos or unnecessary spaces.",
+            ],
+            "the enhanced code is lifted off every line it repeats on, and what is \
+             left is the destination's three sentences"
+        );
+    }
+
+    /// What goes on the wire for a multi-line reply: RFC 5321's continuation
+    /// syntax, and RFC 3463's enhanced code on each line of it.
+    #[test]
+    fn a_multi_line_reply_goes_back_out_as_continuation_lines() {
+        let reply = flatten(&[
+            "550-5.1.1 does not exist.".to_string(),
+            "550 5.1.1 check for typos.".to_string(),
+        ]);
+
+        assert_eq!(
+            reply.wire(),
+            vec!["550-5.1.1 does not exist.", "550 5.1.1 check for typos."],
+            "the last line is the only one with a space after the code, which is \
+             what tells the sender the reply has ended"
+        );
+    }
+
+    /// Single-line replies, and mxhop's own, are one line as before: the
+    /// continuation syntax is for replies that arrived as several.
+    #[test]
+    fn a_single_line_reply_is_still_one_line() {
+        assert_eq!(
+            Reply::ours(451, "4.4.1", "nobody answered").wire(),
+            vec!["451 4.4.1 mxhop: nobody answered"]
+        );
+    }
+
+    /// RFC 5321 §4.5.3.1.5 caps a reply line at 512 octets, CRLF included.
+    /// A destination that writes one enormous line is not a reason to write
+    /// an illegal one back.
+    #[test]
+    fn a_reply_line_longer_than_the_rfc_allows_is_cut() {
+        let long = format!("550 5.7.1 {}", "x".repeat(900));
+        let reply = flatten(&[long]);
+
+        for line in reply.wire() {
+            assert!(
+                line.len() + 2 <= 512,
+                "{} octets, and the CRLF still has to fit",
+                line.len()
+            );
+        }
+    }
+
     use std::collections::{BTreeMap, VecDeque};
     use std::sync::Mutex;
     use tokio::io::duplex;
