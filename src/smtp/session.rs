@@ -1414,13 +1414,25 @@ mod tests {
     /// The loop the alias table cannot see, arriving as a real message: our
     /// own name already in the trace three times means the message has been
     /// here before and is going round.
+    ///
+    /// Folded, like every `Received` header a real mail server writes, and
+    /// with our name in the `by` clause on the continuation line where real
+    /// ones put it. Written unfolded this test passed while the scanner was
+    /// counting nothing at all in production.
     #[tokio::test]
     async fn a_message_that_has_been_here_three_times_is_refused_554() {
         let script = "EHLO x.test\r\nMAIL FROM:<a@b.test>\r\nRCPT TO:<hi@example.com>\r\nDATA\r\n\
-                      Received: from a.test by mx.test with ESMTP id 1\r\n\
-                      Received: from b.test by mx.test with ESMTP id 2\r\n\
-                      Received: from c.test by mx.test with ESMTP id 3\r\n\
-                      Subject: round and round\r\n\
+                      Received: from a.test (a.test [10.0.0.1])\r\n\
+                      \tby mx.test (mxhop) with ESMTPS id 1;\r\n\
+                      \tThu, 06 Nov 2026 10:00:00 +0000\r\n\
+                      Received: from b.test (b.test [10.0.0.2])\r\n\
+                      \tby mx.test (mxhop) with ESMTPS id 2;\r\n\
+                      \tThu, 06 Nov 2026 10:00:01 +0000\r\n\
+                      Received: from c.test (c.test [10.0.0.3])\r\n\
+                      \tby mx.test (mxhop) with ESMTPS id 3;\r\n\
+                      \tThu, 06 Nov 2026 10:00:02 +0000\r\n\
+                      Content-Type: text/plain;\r\n\
+                      \tcharset=utf-8\r\n\
                       \r\n\
                       body\r\n.\r\nQUIT\r\n";
         let t = talk(script).await;

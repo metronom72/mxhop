@@ -37,7 +37,16 @@ impl Default for Limits {
             max_received: 25,
             // Three, not one: a message legitimately passing through this
             // host twice is conceivable (a list that expands to a second of
-            // our aliases), and three sightings of our own name cannot be.
+            // our aliases), and a third pass cannot be.
+            //
+            // Three sightings is not three passes. The match is deliberately
+            // loose about where our name sits in the header, so a round trip
+            // through Gmail leaves two: the `by` clause of the header we
+            // wrote, and the `from` clause of the header Gmail wrote about
+            // us. A bound of three therefore stops the loop on its second
+            // return, not its third — which is the behaviour wanted, and
+            // worth stating because the number on its own reads as a count of
+            // passes.
             max_by_us: 3,
             // `config::check` already refuses a table with a loop in it, so
             // this bound should never be reached. It exists because the table
@@ -75,15 +84,42 @@ impl Head {
                 continue;
             }
             head.received_count += 1;
-            // Deliberately loose: anywhere in the header, not only after
-            // `by`. A sender can forge a mention of us, but forging one can
-            // only get its own message refused.
-            if line.contains(&hostname) {
+            // Deliberately loose about *where*: anywhere in the header, not
+            // only after `by`. A sender can forge a mention of us, but
+            // forging one can only get its own message refused.
+            //
+            // Not loose about *what*, though. A bare `contains` also matches
+            // `backup-mx.tooling.ninja` and `mx.tooling.ninja.example`,
+            // neither of which is this host, so the name has to be bounded by
+            // something that cannot be part of a hostname at either end.
+            if names_host(&line, &hostname) {
                 head.by_us_count += 1;
             }
         }
         head
     }
+}
+
+/// Whether `line` names exactly `hostname`, rather than merely containing it.
+///
+/// A hostname is made of letters, digits, hyphens and dots, so a sighting is
+/// only ours when the characters on both sides of it are none of those: a
+/// hyphen before it makes `backup-mx.tooling.ninja`, and a dot after it makes
+/// `mx.tooling.ninja.example`. Both are other people's hosts, and counting
+/// either one is how a message that has never been here gets refused as a
+/// loop. Both arguments are already lowercase.
+fn names_host(line: &str, hostname: &str) -> bool {
+    if hostname.is_empty() {
+        return false;
+    }
+    let boundary = |c: Option<char>| match c {
+        None => true,
+        Some(c) => !(c.is_ascii_alphanumeric() || c == '-' || c == '.'),
+    };
+    line.match_indices(hostname).any(|(at, _)| {
+        boundary(line[..at].chars().next_back())
+            && boundary(line[at + hostname.len()..].chars().next())
+    })
 }
 
 /// The header block, one unfolded header per item.
@@ -124,10 +160,6 @@ impl Iterator for HeaderLines<'_> {
         }
         let mut header = String::new();
         loop {
-            // Folded continuations belong to the header above them, so they
-            // are joined rather than counted: a `Received` header spread over
-            // four lines is one hop, not four.
-            let next_is_continuation = matches!(self.rest.first(), Some(b' ' | b'\t'));
             let Some(line) = self.next_line() else {
                 self.done = true;
                 break;
@@ -138,7 +170,16 @@ impl Iterator for HeaderLines<'_> {
                 return None;
             }
             header.push_str(&String::from_utf8_lossy(line));
-            if !next_is_continuation {
+            // Folded continuations belong to the header above them, so they
+            // are joined rather than counted: a `Received` header spread over
+            // four lines is one hop, not four. The peek has to come *after*
+            // the line has been consumed, because what makes a line a
+            // continuation of this header is that the line below it begins
+            // with whitespace — peeking before `next_line` tested the line
+            // about to be read instead, which glued every fold onto the
+            // following header and let a folded last header swallow the blank
+            // line that ends the block.
+            if !matches!(self.rest.first(), Some(b' ' | b'\t')) {
                 break;
             }
             header.push(' ');
@@ -746,6 +787,12 @@ mod tests {
 
     /// A trace that does not mention us is counted but not blamed on us: a
     /// `by_us` test that matched any hostname would refuse ordinary mail.
+    ///
+    /// The `by` clause is on the *folded* line on purpose. Before the fold
+    /// was attributed to the header above it this test passed for the wrong
+    /// reason — the continuation was glued onto `Subject:`, so the hostname
+    /// was never looked at in a `Received` header at all, and a version that
+    /// did name us would have passed just as happily.
     #[test]
     fn a_trace_naming_somebody_else_is_not_us() {
         let message = b"Received: from a.test (a.test [10.0.0.1])\r\n\
@@ -760,6 +807,110 @@ mod tests {
             "one hop folded over two lines is one hop, and the body is not the header block"
         );
         assert_eq!(head.by_us_count, 0);
+    }
+
+    /// Every real `Received` header is folded, Gmail's included: the `by`
+    /// clause is almost never on the first line. A scanner that attributed a
+    /// continuation to the header *below* it never saw our own name in a
+    /// `by` clause, which left both loop rules dead in production — the loop
+    /// that actually bites a forwarder (our alias → Gmail → a Gmail filter
+    /// forwards back to us) would have gone round for ever.
+    #[test]
+    fn our_own_name_in_a_folded_by_clause_is_still_us() {
+        let message = b"Received: from mail-ed1-f54.google.test (mail-ed1-f54.google.test\r\n\
+                        \t[209.85.208.54])\r\n\
+                        \tby mx.tooling.ninja (mxhop) with ESMTPS id 7\r\n\
+                        \tfor <hi@example.com>; Thu, 06 Nov 2026 10:00:00 +0000\r\n\
+                        Subject: hi\r\n\
+                        \r\n\
+                        body\r\n";
+        let head = Head::scan(message, "mx.tooling.ninja");
+
+        assert_eq!(head.received_count, 1, "four lines are one hop");
+        assert_eq!(
+            head.by_us_count, 1,
+            "our own hostname sits on the third line of the fold, which is where \
+             every real forwarder writes it"
+        );
+    }
+
+    /// A realistic block: four folded hops, two of them ours. Counting the
+    /// first line of each fold only — or gluing a fold onto the next header —
+    /// turns 4/2 into 1/0, and 1/0 is relayed.
+    #[test]
+    fn four_folded_hops_count_as_four() {
+        let message = b"Received: from a.test (a.test [10.0.0.1])\r\n\
+                        \tby mx.tooling.ninja (mxhop) with ESMTPS id 1;\r\n\
+                        \tThu, 06 Nov 2026 10:00:00 +0000\r\n\
+                        Received: from b.test (b.test [10.0.0.2])\r\n\
+                        \tby mx.elsewhere.test with ESMTP id 2;\r\n\
+                        \tThu, 06 Nov 2026 10:00:01 +0000\r\n\
+                        Received: from c.test (c.test [10.0.0.3])\r\n\
+                        \tby mx.tooling.ninja (mxhop) with ESMTPS id 3;\r\n\
+                        \tThu, 06 Nov 2026 10:00:02 +0000\r\n\
+                        Received: from d.test (d.test [10.0.0.4])\r\n\
+                        \tby mx.other.test with ESMTP id 4;\r\n\
+                        \tThu, 06 Nov 2026 10:00:03 +0000\r\n\
+                        \r\n\
+                        body\r\n";
+        let head = Head::scan(message, "mx.tooling.ninja");
+
+        assert_eq!(
+            head,
+            Head {
+                received_count: 4,
+                by_us_count: 2,
+            }
+        );
+    }
+
+    /// The same bug in the other direction, and this one destroys legitimate
+    /// mail. `Content-Type: multipart/...;` with the boundary on a folded
+    /// line is the commonest last header there is; a scanner that let the
+    /// fold swallow the blank line read the whole body as headers, so a
+    /// forwarded bounce quoting a trace scanned 4/3 and was refused
+    /// `554 5.4.6` as a loop.
+    #[test]
+    fn a_folded_last_header_does_not_let_the_body_count_as_a_trace() {
+        let message = b"Received: from a.test by mx.elsewhere.test with ESMTP id 1\r\n\
+                        Content-Type: multipart/mixed;\r\n\
+                        \tboundary=\"----=_Part_1\"\r\n\
+                        \r\n\
+                        Here is the bounce you asked about:\r\n\
+                        Received: from x.test by mx.tooling.ninja with ESMTP id 9\r\n\
+                        Received: from y.test by mx.tooling.ninja with ESMTP id 8\r\n\
+                        Received: from z.test by mx.tooling.ninja with ESMTP id 7\r\n";
+        let head = Head::scan(message, "mx.tooling.ninja");
+
+        assert_eq!(
+            head,
+            Head {
+                received_count: 1,
+                by_us_count: 0,
+            },
+            "the blank line ends the header block even when the header before it \
+             was folded, or quoting a trace is enough to get a message refused"
+        );
+    }
+
+    /// `contains` is not a hostname match. A backup MX and a lookalike
+    /// subdomain both contain our name, and neither is us; counting them is
+    /// how a sighting of somebody else's host becomes a loop refusal.
+    #[test]
+    fn a_hostname_that_merely_contains_ours_is_not_ours() {
+        let message = b"Received: from a.test\r\n\
+                        \tby backup-mx.tooling.ninja with ESMTP id 1\r\n\
+                        Received: from b.test\r\n\
+                        \tby mx.tooling.ninja.example with ESMTP id 2\r\n\
+                        \r\n\
+                        body\r\n";
+        let head = Head::scan(message, "mx.tooling.ninja");
+
+        assert_eq!(head.received_count, 2);
+        assert_eq!(
+            head.by_us_count, 0,
+            "neither host is this one, however much of our name is spelled inside it"
+        );
     }
 
     #[test]
