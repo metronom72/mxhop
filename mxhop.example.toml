@@ -25,6 +25,28 @@ spool_dir = "/var/lib/mxhop/spool"
 # responsibility for mail you then cannot hand over.
 max_message_bytes = 26214400
 
+# Opportunistic inbound STARTTLS. Leave the whole table out and mxhop speaks
+# plaintext only, which is a supported way to run an MX.
+#
+# TLS here is never required: this is a receiving MX, not a submission server,
+# and a sender that offers no encryption still has to be able to deliver.
+# Refusing plaintext would lose mail.
+#
+# mxhop does not get certificates — it reads the files Caddy or certbot
+# renews. Both paths must be absolute: they are read again on SIGHUP, from
+# whatever directory the service is in by then.
+#
+#     systemctl reload mxhop      # or: kill -HUP $(pidof mxhop)
+#
+# A reload that cannot read the files logs a warning and keeps serving the
+# certificate it already has. Startup is the opposite: a [tls] block whose
+# files are unreadable stops the service, because starting plaintext-only
+# would downgrade every sender silently.
+#
+# [tls]
+# certificate = "/var/lib/caddy/certificates/acme-v02.api.letsencrypt.org-directory/mx.example.com/mx.example.com.crt"
+# key = "/var/lib/caddy/certificates/acme-v02.api.letsencrypt.org-directory/mx.example.com/mx.example.com.key"
+
 # One table per domain you accept mail for. Mail for a domain that is not
 # listed here is refused outright — a TXT record somewhere else cannot make
 # mxhop accept mail on your behalf.

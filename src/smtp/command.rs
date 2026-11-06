@@ -23,6 +23,9 @@ pub enum Command {
     Data,
     Rset,
     Noop,
+    /// RFC 3207: the client asks to start a TLS handshake. Whether mxhop can
+    /// is the session's business, not the parser's.
+    StartTls,
     Quit,
     /// `VRFY` and `EXPN` — answered, never obeyed: an alias table is not a
     /// directory for strangers to read.
@@ -87,6 +90,7 @@ pub fn parse(line: &str) -> Result<Command, CommandError> {
         "DATA" => no_arguments(rest, "DATA", Command::Data),
         "RSET" => no_arguments(rest, "RSET", Command::Rset),
         "QUIT" => no_arguments(rest, "QUIT", Command::Quit),
+        "STARTTLS" => no_arguments(rest, "STARTTLS", Command::StartTls),
         // RFC 5321 gives NOOP an optional argument, and some clients use it
         // as a keepalive.
         "NOOP" => Ok(Command::Noop),
@@ -375,11 +379,24 @@ mod tests {
         );
     }
 
+    /// RFC 3207 §4: STARTTLS takes no parameters. A client that sends one is
+    /// talking a protocol mxhop does not know, and the answer has to come
+    /// before the handshake rather than inside it.
+    #[test]
+    fn starttls_takes_no_arguments() {
+        assert_eq!(parse("STARTTLS").unwrap(), Command::StartTls);
+        assert_eq!(parse("starttls").unwrap(), Command::StartTls);
+        assert_eq!(
+            parse("STARTTLS now"),
+            Err(CommandError::UnexpectedArguments { verb: "STARTTLS" })
+        );
+    }
+
     #[test]
     fn an_unknown_verb_comes_back_as_unknown() {
         assert_eq!(
-            parse("STARTTLS").unwrap(),
-            Command::Unknown("STARTTLS".into())
+            parse("BREWCOFFEE").unwrap(),
+            Command::Unknown("BREWCOFFEE".into())
         );
         assert_eq!(parse("").unwrap(), Command::Unknown(String::new()));
     }
