@@ -180,6 +180,51 @@ fn check_reads_the_srs_secret_and_fails_at_the_srs_line() {
     );
 }
 
+/// A key anyone on the host can read is a key anyone on the host can forge
+/// an address with, and forging one is the whole of being an open relay.
+/// `check` is the only moment an operator looks at this file, so it is the
+/// only moment the mode can be mentioned — and a warning rather than a
+/// refusal, because group-readable is a real risk on a shared host and none
+/// at all on a single-purpose VPS.
+#[test]
+fn check_warns_when_the_srs_secret_is_readable_by_anyone_but_its_owner() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("check_cli");
+    fs::create_dir_all(&dir).expect("temp dir");
+    let key = dir.join("loose-srs.key");
+    // Generated here, not written down: a key-shaped literal in a source
+    // file is a key in a source file.
+    fs::write(&key, format!("mxhop-check-test-{}\n", "k".repeat(24))).expect("write key");
+    fs::set_permissions(&key, fs::Permissions::from_mode(0o644)).expect("chmod");
+
+    let body = format!(
+        "{GOOD}\n[srs]\ndomain = \"srs.example.com\"\nsecret_file = {:?}\n",
+        key.display().to_string()
+    );
+    let out = run_check(&write_config("loose-srs-key.toml", &body));
+
+    assert!(
+        out.status.success(),
+        "a loose mode is a warning, not a configuration that cannot start: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("0644") && stderr.contains("forge"),
+        "the warning has to name the mode and say why it matters: {stderr}"
+    );
+
+    fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).expect("chmod");
+    let out = run_check(&write_config("loose-srs-key.toml", &body));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).is_empty(),
+        "and 600 has to be silent, or the warning is noise an operator learns \
+         to skip: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// A short key is guessable offline from one SRS address found in a
 /// `Received` header, and a guessed key makes this host an open relay. The
 /// refusal has to say what to type instead, because "too short" on its own

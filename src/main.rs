@@ -124,6 +124,17 @@ fn check(cli: &Cli) -> ExitCode {
         }
     };
 
+    // A key anyone on the box can read is a key anyone on the box can forge
+    // with, and forging one is the whole of being an open relay. `check` is
+    // the only moment an operator looks at this file, so it is where the mode
+    // gets mentioned — a warning rather than a refusal, because a group-
+    // readable key is a real risk on a shared host and none at all on a
+    // single-purpose VPS, and `check` refusing to pass over it would teach
+    // people to stop running `check`.
+    if let Some(settings) = config.srs.as_ref() {
+        warn_about_secret_mode(&settings.secret_file);
+    }
+
     let domains: Vec<&str> = config.router.domains().collect();
     println!(
         "{}: ok — {} on {}, {} {} for {}{}{}",
@@ -176,6 +187,40 @@ fn open_tls(config: &Config) -> Result<Option<Arc<Holder>>, Problem> {
         line,
         message: e.to_string(),
     })
+}
+
+/// Says so on stderr when the signing key is readable by anyone but its
+/// owner.
+///
+/// Printed rather than returned as a `Problem`, because it is not one: the
+/// configuration is valid and `run` will start. It goes to stderr so that the
+/// `ok` line on stdout stays the one machine-readable thing `check` prints.
+fn warn_about_secret_mode(path: &std::path::Path) {
+    let _ = path;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let Ok(mode) = std::fs::metadata(path).map(|m| m.permissions().mode()) else {
+            // Unreadable is already `open_srs`'s problem, and it has said so.
+            return;
+        };
+        let extra = mode & 0o077;
+        if extra != 0 {
+            eprintln!(
+                "{}: warning: mode {:04o} — the srs signing key is readable by {}; \
+                 anyone who can read it can forge an address this host will relay. \
+                 `chmod 600 {}`",
+                path.display(),
+                mode & 0o7777,
+                if mode & 0o007 != 0 {
+                    "everyone on this host"
+                } else {
+                    "its group"
+                },
+                path.display()
+            );
+        }
+    }
 }
 
 /// Reads the SRS secret file, if one is configured, and turns a file problem
