@@ -27,6 +27,7 @@ use crate::smtp::client::{self, Delivery, Relay};
 use crate::smtp::command::{self, Command};
 use crate::smtp::wire::{self, WireError};
 use crate::spool::{Spool, new_id};
+use crate::srs::Srs;
 
 /// How many recipients one message may have before mxhop asks the client to
 /// come back for the rest.
@@ -155,11 +156,16 @@ enum Step {
 /// `tls` is the certificate snapshot this connection was accepted with, or
 /// `None` when no certificate is configured. TLS here is opportunistic and
 /// never required: this is an MX, and refusing plaintext loses mail.
+///
+/// `srs` is the sender rewriter, or `None` when no `[srs]` table is
+/// configured — in which case the envelope sender goes out as it arrived.
+#[allow(clippy::too_many_arguments)]
 pub async fn serve<S, L>(
     stream: S,
     peer: String,
     config: &SessionConfig,
     router: &Router,
+    srs: Option<&Srs>,
     spool: &Spool,
     relay: &L,
     tls: Option<TlsAcceptor>,
@@ -185,6 +191,7 @@ where
         &mut state,
         config,
         router,
+        srs,
         spool,
         relay,
         &peer,
@@ -249,6 +256,7 @@ where
         &mut state,
         config,
         router,
+        srs,
         spool,
         relay,
         &peer,
@@ -272,6 +280,7 @@ async fn talk<S, L>(
     state: &mut State,
     config: &SessionConfig,
     router: &Router,
+    srs: Option<&Srs>,
     spool: &Spool,
     relay: &L,
     peer: &str,
@@ -395,7 +404,7 @@ where
                     )
                     .await?;
                 } else {
-                    let reply = decide_recipient(router, &address, &mut state.recipients);
+                    let reply = decide_recipient(router, srs, &address, &mut state.recipients);
                     say(reader.get_mut(), &reply).await?;
                 }
             }
@@ -436,7 +445,7 @@ where
                 };
 
                 let (reply, delivered) =
-                    hand_on(config, router, spool, relay, peer, state, body).await;
+                    hand_on(config, router, srs, spool, relay, peer, state, body).await;
                 say_reply(reader.get_mut(), &reply).await?;
                 if delivered {
                     state.outcome.accepted += 1;
@@ -498,9 +507,11 @@ where
 /// Nothing is stored before delivery is attempted. While the message is only
 /// on the wire the sending server still owns it, and that is the one place a
 /// message can wait that has a retry queue today.
+#[allow(clippy::too_many_arguments)]
 async fn hand_on<L>(
     config: &SessionConfig,
     router: &Router,
+    srs: Option<&Srs>,
     spool: &Spool,
     relay: &L,
     peer: &str,
@@ -573,6 +584,31 @@ where
         Decision::Deliver(plan) => plan,
     };
 
+    // The envelope sender the destination will check SPF against. Rewritten
+    // here rather than in `policy::decide` because the rewrite needs today's
+    // date, and `policy` is deliberately a file with no clock in it: every
+    // rule about who a message is copied to stays a pure function of its
+    // arguments, and this is the one decision that does not fit that.
+    //
+    // `rewrite` returning `None` means "leave it exactly as it is", which is
+    // the null sender and an address already at our own SRS domain.
+    let sender = match srs {
+        Some(srs) => match srs.rewrite(plan.sender.as_deref(), crate::srs::today()) {
+            Some(rewritten) => {
+                info!(
+                    id = %envelope.id,
+                    from = %plan.sender.as_deref().unwrap_or("<>"),
+                    srs = %rewritten,
+                    "rewrote the envelope sender so the destination's SPF check \
+                     is made against a domain that names this host"
+                );
+                Some(rewritten)
+            }
+            None => plan.sender.clone(),
+        },
+        None => plan.sender.clone(),
+    };
+
     // One `Arc` for every group: the body is handed to each delivery without
     // being copied, which for a 25 MiB message to three domains is the
     // difference between one copy and four.
@@ -606,7 +642,7 @@ where
             relay
                 .deliver(
                     Delivery::new(
-                        plan.sender.clone(),
+                        sender.clone(),
                         group.recipients.clone(),
                         received.clone().into_bytes(),
                         std::sync::Arc::clone(&body),
@@ -721,10 +757,48 @@ where
 
 /// The reply for one `RCPT TO`, and the recipient added to the envelope if it
 /// is one of ours.
-fn decide_recipient(router: &Router, address: &str, recipients: &mut Vec<String>) -> String {
+fn decide_recipient(
+    router: &Router,
+    srs: Option<&Srs>,
+    address: &str,
+    recipients: &mut Vec<String>,
+) -> String {
     let Some((local, domain)) = address.rsplit_once('@') else {
         return "501 5.1.3 recipient is not <local@domain>".to_string();
     };
+
+    // The SRS domain is checked before the alias table, and it is never in
+    // it: `config::check` refuses a configuration where it is both. An
+    // address here is not an alias name — it is a signed address that decodes
+    // to somebody else's mailbox anywhere in the world, and the signature is
+    // the only thing between this branch and an open relay.
+    if let Some(srs) = srs.filter(|srs| srs.is_ours(domain)) {
+        return match srs.verify(local, crate::srs::today()) {
+            Ok(mailbox) => {
+                // The decoded address, not the one offered, goes in the
+                // envelope: everything downstream — the alias expansion, the
+                // delivery, the `for` clause of our own `Received` header —
+                // then works on the mailbox the bounce is actually for,
+                // rather than on a domain whose MX record is this host and
+                // whose next hop would be ourselves.
+                info!(
+                    srs = %address,
+                    decoded = %mailbox,
+                    "a bounce came back to a rewritten sender"
+                );
+                recipients.push(mailbox.to_string());
+                "250 2.1.5 recipient accepted".to_string()
+            }
+            Err(refusal) => {
+                // Worth a line at info: this is either a real bounce arriving
+                // after the window, which is mail somebody loses, or somebody
+                // trying the SRS domain as an open relay. An operator cannot
+                // tell those apart without the reason.
+                info!(srs = %address, "refusing an address at the srs domain: {refusal}");
+                refusal.reply().to_string()
+            }
+        };
+    }
 
     match router.resolve(domain, local) {
         Some((_, Route::Reject(reply))) => reply.clone(),
@@ -924,6 +998,24 @@ mod tests {
     }
 
     async fn talk_with(relay: Fake, limit: u64, script: &str) -> Talk {
+        talk_all(relay, limit, None, script).await
+    }
+
+    /// A rewriter with a key made up here rather than written down: a
+    /// key-shaped literal in a source file is a key in a source file.
+    fn test_srs() -> Srs {
+        Srs::new(
+            "srs.mx.test",
+            vec![format!("mxhop-session-test-{}", new_id()).into_bytes()],
+            crate::srs::DEFAULT_MAX_AGE_DAYS,
+        )
+    }
+
+    async fn talk_srs(srs: &Srs, script: &str) -> Talk {
+        talk_all(Fake::accepting(), 26_214_400, Some(srs), script).await
+    }
+
+    async fn talk_all(relay: Fake, limit: u64, srs: Option<&Srs>, script: &str) -> Talk {
         let root = scratch("session");
         let spool = Spool::open(&root).await.unwrap();
         let config = SessionConfig {
@@ -942,12 +1034,14 @@ mod tests {
         let (mut client, server) = duplex(256 * 1024);
         let spool_for_task = spool.clone();
         let relay_for_task = relay.clone();
+        let srs_for_task = srs.cloned();
         let task = tokio::spawn(async move {
             serve(
                 server,
                 "198.51.100.7:40000".to_string(),
                 &config,
                 &test_router(),
+                srs_for_task.as_ref(),
                 &spool_for_task,
                 &relay_for_task,
                 None,
@@ -982,6 +1076,156 @@ mod tests {
                            body\r\n\
                            .\r\n\
                            QUIT\r\n";
+
+    /// What the destination is actually told the sender is. Gmail checks SPF
+    /// against this and nothing else, and before SRS it was the original
+    /// sender — a domain whose record does not list this host.
+    #[tokio::test]
+    async fn the_envelope_sender_handed_to_the_destination_is_rewritten() {
+        let srs = test_srs();
+        let talk = talk_srs(&srs, DELIVER).await;
+
+        let seen = talk.relay.seen.lock().unwrap();
+        let from = seen[0].from.clone().expect("a sender was announced");
+        assert!(
+            from.ends_with("@srs.mx.test"),
+            "the destination has to see our own domain, not elsewhere.test: {from}"
+        );
+        assert_eq!(
+            srs.verify(from.rsplit_once('@').unwrap().0, crate::srs::today())
+                .expect("our own address")
+                .to_string(),
+            "sender@elsewhere.test",
+            "and the original sender has to be recoverable from it, \
+             or the bounce cannot be sent on"
+        );
+    }
+
+    /// **The open-relay test.** A `RCPT TO` at the SRS domain is not an alias
+    /// lookup: it names somebody else's mailbox anywhere in the world, and
+    /// the signature is the only thing that makes relaying to it anything
+    /// other than running an open relay. One character changed has to be a
+    /// 550 and nothing on the wire.
+    #[tokio::test]
+    async fn a_forged_srs_recipient_is_550_not_relayed() {
+        let srs = test_srs();
+        let honest = srs
+            .rewrite(Some("victim@elsewhere.test"), crate::srs::today())
+            .unwrap();
+        // One character of the MAC, flipped. Everything else about the
+        // address is exactly what we would have issued.
+        let mut forged: Vec<char> = honest.chars().collect();
+        forged[6] = if forged[6] == 'A' { 'B' } else { 'A' };
+        let forged: String = forged.into_iter().collect();
+        assert_ne!(forged, honest, "the test has to change something");
+
+        let talk = talk_srs(
+            &srs,
+            &format!(
+                "EHLO mail.elsewhere.test\r\n\
+                 MAIL FROM:<>\r\n\
+                 RCPT TO:<{forged}>\r\n\
+                 QUIT\r\n"
+            ),
+        )
+        .await;
+
+        assert_eq!(
+            talk.codes(),
+            vec!["220", "250", "250", "550", "221"],
+            "a forged SRS address must be refused: {}",
+            talk.out
+        );
+        assert!(
+            talk.out.contains("not an address we issued"),
+            "and the refusal must not say which half was wrong: {}",
+            talk.out
+        );
+        assert!(
+            talk.relay.seen.lock().unwrap().is_empty(),
+            "nothing may leave this host for a forged address"
+        );
+    }
+
+    /// The bounce path. A delivery report comes back to the rewritten sender
+    /// with an empty envelope sender of its own, and has to reach the person
+    /// who wrote the original message.
+    #[tokio::test]
+    async fn a_valid_srs_recipient_is_routed_to_the_decoded_sender() {
+        let srs = test_srs();
+        let wrapped = srs
+            .rewrite(Some("Sender@elsewhere.test"), crate::srs::today())
+            .unwrap();
+
+        let talk = talk_srs(
+            &srs,
+            &format!(
+                "EHLO mail.gmail.test\r\n\
+                 MAIL FROM:<>\r\n\
+                 RCPT TO:<{wrapped}>\r\n\
+                 DATA\r\n\
+                 Subject: Undelivered Mail Returned to Sender\r\n\
+                 \r\n\
+                 sorry\r\n\
+                 .\r\n\
+                 QUIT\r\n"
+            ),
+        )
+        .await;
+
+        assert_eq!(talk.last_code(), "221", "{}", talk.out);
+        let seen = talk.relay.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "{}", talk.out);
+        assert_eq!(
+            seen[0]
+                .to
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            vec!["Sender@elsewhere.test"],
+            "the bounce goes to the person who wrote the message, \
+             with the local part's case as they sent it"
+        );
+        assert_eq!(
+            seen[0].from, None,
+            "and it keeps its own null sender: a bounce that acquired one \
+             could be bounced again"
+        );
+    }
+
+    /// Anything else at the SRS domain is refused rather than looked up. The
+    /// domain is not in `[domains]` — `check` refuses that — so there is no
+    /// alias table behind it, and `550 relaying is not allowed` would be the
+    /// wrong sentence for an address that is simply not one of ours.
+    #[tokio::test]
+    async fn an_ordinary_address_at_the_srs_domain_is_refused() {
+        let srs = test_srs();
+        let talk = talk_srs(
+            &srs,
+            "EHLO mail.elsewhere.test\r\n\
+             MAIL FROM:<>\r\n\
+             RCPT TO:<postmaster@srs.mx.test>\r\n\
+             QUIT\r\n",
+        )
+        .await;
+
+        assert_eq!(talk.codes(), vec!["220", "250", "250", "550", "221"]);
+        assert!(talk.relay.seen.lock().unwrap().is_empty());
+    }
+
+    /// Without an `[srs]` table nothing changes: the sender goes out as it
+    /// arrived. Worth a test of its own because that is the state every
+    /// existing deployment is in, and SRS must not be the thing that starts
+    /// rewriting senders for an operator who never configured it.
+    #[tokio::test]
+    async fn without_srs_the_envelope_sender_is_left_alone() {
+        let talk = talk(DELIVER).await;
+
+        assert_eq!(
+            talk.relay.seen.lock().unwrap()[0].from.as_deref(),
+            Some("sender@elsewhere.test")
+        );
+    }
 
     /// A reply has to leave as one write. `openssl s_client -starttls smtp`
     /// reads the prologue with one `recv` per line and takes a segment
@@ -1703,6 +1947,7 @@ mod tests {
                 "198.51.100.7:40000".to_string(),
                 &config,
                 &test_router(),
+                None,
                 &spool,
                 &Fake::accepting(),
                 None,
@@ -1939,6 +2184,7 @@ mod tests {
                 "198.51.100.7:40000".to_string(),
                 &config,
                 &test_router(),
+                None,
                 &spool_for_task,
                 &Fake::accepting(),
                 Some(acceptor),

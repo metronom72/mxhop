@@ -252,6 +252,18 @@ async fn run(cli: &Cli) -> ExitCode {
         }
     };
 
+    // Without a signing key the service does not start: the alternative is
+    // forwarding every message with the original envelope sender, which is
+    // the failing SPF check this table exists to fix — silently, for as long
+    // as nobody reads a destination's headers.
+    let srs = match open_srs(&config) {
+        Ok(srs) => srs.map(Arc::new),
+        Err(problem) => {
+            error!("{}", problem.message);
+            return ExitCode::FAILURE;
+        }
+    };
+
     let session_config = Arc::new(SessionConfig::from_config(&config));
     let router = Arc::new(config.router.clone());
     let queued = spool.queued().await.map(|q| q.len()).unwrap_or(0);
@@ -266,6 +278,7 @@ async fn run(cli: &Cli) -> ExitCode {
         hostname = %config.hostname,
         domains = config.router.domains().count(),
         aliases = config.router.alias_count(),
+        srs = srs.as_ref().map_or("none".to_string(), |s| s.domain().to_string()),
         queued,
         tls = tls.is_some(),
         "mxhop is accepting mail"
@@ -277,7 +290,7 @@ async fn run(cli: &Cli) -> ExitCode {
         spawn_reload_on_hangup_without_tls();
     }
 
-    accept_loop(listener, session_config, router, spool, relay, tls).await;
+    accept_loop(listener, session_config, router, srs, spool, relay, tls).await;
     ExitCode::SUCCESS
 }
 

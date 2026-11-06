@@ -14,14 +14,17 @@ use crate::routing::Router;
 use crate::smtp::client::Relay;
 use crate::smtp::session::{self, SessionConfig};
 use crate::spool::Spool;
+use crate::srs::Srs;
 use crate::tls::Holder;
 
 /// Accepts connections until the listener fails irrecoverably. One failed
 /// accept is not a reason to stop serving.
+#[allow(clippy::too_many_arguments)]
 pub async fn accept_loop<L>(
     listener: TcpListener,
     config: Arc<SessionConfig>,
     router: Arc<Router>,
+    srs: Option<Arc<Srs>>,
     spool: Arc<Spool>,
     relay: Arc<L>,
     tls: Option<Arc<Holder>>,
@@ -45,6 +48,7 @@ pub async fn accept_loop<L>(
 
         let config = Arc::clone(&config);
         let router = Arc::clone(&router);
+        let srs = srs.clone();
         let spool = Arc::clone(&spool);
         let relay = Arc::clone(&relay);
         tokio::spawn(async move {
@@ -54,6 +58,7 @@ pub async fn accept_loop<L>(
                 peer.clone(),
                 &config,
                 &router,
+                srs.as_deref(),
                 &spool,
                 relay.as_ref(),
                 acceptor,

@@ -2567,6 +2567,7 @@ mod tests {
                     "203.0.113.5:40000".to_string(),
                     &config,
                     &router,
+                    None,
                     &spool,
                     &relay,
                     None,
