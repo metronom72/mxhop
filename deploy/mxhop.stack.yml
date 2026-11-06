@@ -41,19 +41,22 @@ services:
         source: /srv/mxhop/spool
         target: /var/lib/mxhop/spool
 
-      # One TOML file, read-only. It must say listen = "0.0.0.0:2525".
+      # The whole config DIRECTORY, not the single mxhop.toml file. A bind
+      # mount of one file pins an inode: an editor that saves by writing a
+      # temporary file and renaming it over the original leaves the container
+      # reading the old, deleted inode forever, and the operator sees their
+      # edit ignored with nothing in the log. Mounting the directory makes a
+      # rename visible. It also carries tls/ — the certificate pair copied
+      # there for uid 10001, see deploy/README.md.
+      #
+      # Either way an edited config does NOT restart the task:
+      #     docker service update --force mxhop_mxhop
+      # mxhop.toml must say listen = "0.0.0.0:2525"; the [tls] table must
+      # name the paths as they appear inside the container, under
+      # /etc/mxhop/tls.
       - type: bind
-        source: /srv/mxhop/mxhop.toml
-        target: /etc/mxhop/mxhop.toml
-        read_only: true
-
-      # The certificate and key as Caddy or certbot leave them on the host,
-      # read-only: mxhop never writes them, it only rereads them on SIGHUP
-      # after a renewal. The paths inside the container are what the [tls]
-      # table in the config must name.
-      - type: bind
-        source: /var/lib/caddy/certificates/acme-v02.api.letsencrypt.org-directory/mx.example.com
-        target: /etc/mxhop/tls
+        source: /srv/mxhop
+        target: /etc/mxhop
         read_only: true
 
     secrets:
@@ -82,22 +85,59 @@ services:
           # directory of files.
           memory: 256M
 
-    # A session in the middle of DATA needs time to finish. Killed mid-DATA
-    # the sender never gets its 250, so it retries and the recipient may get
-    # the message twice; 60s lets the in-flight messages land instead.
-    stop_grace_period: 60s
+    # tini as pid 1, because mxhop does not handle SIGTERM yet — it
+    # registers SIGHUP only, and the accept loop never returns (graceful
+    # shutdown is in the 0.2 row of the README's status table). The kernel
+    # does not deliver an unhandled signal to pid 1, so with mxhop itself as
+    # pid 1 every `stack deploy`, `service update` and `docker stop` sat out
+    # the whole grace period below and then took a SIGKILL. With tini as pid
+    # 1 the SIGTERM reaches mxhop as an ordinary process, its default action
+    # applies, and the task ends at once.
+    #
+    # tini forwards SIGHUP too, so the certificate reload below still works.
+    init: true
+
+    # What a SIGKILL costs today: nothing half-written becomes deliverable.
+    # The spool writes body and envelope into tmp/, fsyncs them and only then
+    # renames them into queue/; delivery skips an .eml whose .json rename did
+    # not happen, so a kill leaves at worst a stray file, and a sender that
+    # never got its 250 retries. So this period
+    # is not protecting an in-flight DATA — it cannot, nothing stops the
+    # accept loop — and SMTP's own timeouts are 5 minutes per command and 10
+    # minutes inside DATA, which 60s never covered anyway. It is kept short
+    # and will become meaningful when graceful shutdown lands: then mxhop
+    # will stop accepting on SIGTERM, let open sessions finish, and exit
+    # inside this window.
+    stop_grace_period: 30s
 
     cap_drop:
       - ALL # nothing privileged is bound inside the container, see ports
-    security_opt:
-      - no-new-privileges:true
 
-    # Only the config check, because that is all the binary can answer today:
-    # there is no health or metrics endpoint yet. It catches a config or
-    # certificate the task can no longer read; it does not prove the listener
-    # is accepting mail.
+    # security_opt is NOT set here on purpose: `docker stack deploy` ignores
+    # it (it is in the CLI's unsupported-options list and the Swarm converter
+    # never reads it), printing only "Ignoring unsupported options:
+    # security_opt" — so writing it would look like a hardening that is not
+    # applied. It works under `docker compose`/`docker run`
+    # (--security-opt no-new-privileges). cap_drop, init,
+    # stop_grace_period, healthcheck, logging and host-mode ports above ARE
+    # converted and do take effect.
+
+    # An SMTP banner on the loopback, which is what the image's own
+    # HEALTHCHECK does; repeated here so the stack is readable on its own.
+    #
+    # Proves: the listener is up and answers a connection with 220. Does not
+    # prove: TLS, the spool, delivery, or reachability from outside the
+    # container. Deliberately not `mxhop check` — check rereads the
+    # certificate, but the process keeps serving the one it already loaded
+    # when a reload fails, so a renewal that left the key unreadable to uid
+    # 10001 would have Swarm kill a task that was still serving valid TLS,
+    # and the replacement would restart-loop with port 25 closed.
     healthcheck:
-      test: ["CMD", "/usr/local/bin/mxhop", "check"]
+      test:
+        [
+          "CMD-SHELL",
+          "printf 'QUIT\r\n' | nc -w 5 127.0.0.1 2525 | grep -q '^220 '",
+        ]
       interval: 60s
       timeout: 10s
       start_period: 10s

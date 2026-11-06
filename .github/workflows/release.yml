@@ -26,7 +26,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y musl-tools
           rustup target add x86_64-unknown-linux-musl
-          cargo build --release --target x86_64-unknown-linux-musl
+          # --locked: ship the dependency versions Cargo.lock records, not
+          # whatever resolves on the day the tag is pushed.
+          cargo build --locked --release --target x86_64-unknown-linux-musl
           strip target/x86_64-unknown-linux-musl/release/mxhop
       # Name the asset after the tag and the target, so a download that has
       # lost its page still says which build it is.
@@ -65,10 +67,15 @@ jobs:
           # v1.2.3 publishes 1.2.3, 1.2 and 1 — so a stack file can pin as
           # loosely or as tightly as its operator wants. No `latest`: a mail
           # server that updates itself on a tag nobody chose is not wanted.
+          #
+          # The bare major is suppressed for 0.x, per metadata-action's own
+          # guidance: under semver 0.x every minor may break, so a `0` tag
+          # that walked from 0.1 to 0.2 would promise a compatibility that
+          # does not exist. It starts being published at v1.0.0.
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
+            type=semver,pattern={{major}},enable=${{ !startsWith(github.ref, 'refs/tags/v0.') }}
       - name: Build and push
         uses: docker/build-push-action@v6
         with:

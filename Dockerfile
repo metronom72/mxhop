@@ -13,13 +13,25 @@ COPY . .
 
 # Fully static: the final stage shares no libc with the builder, so a
 # dynamically linked binary would not start there.
+#
+# rust-toolchain.toml is kept OUT of the build context (see .dockerignore).
+# With it present cargo resolves `stable`, which is not what this image
+# installs, so rustup would download the day's stable plus rustfmt and clippy
+# on every build — making the image depend on the network and on whatever
+# `stable` means today, and the 1.91 tag above purely cosmetic. Excluded, the
+# build uses the toolchain the base image pins. It is not set as
+# RUSTUP_TOOLCHAIN here because that would have to name an exact patch
+# version, which the 1.91 tag bumps underneath us.
+#
+# --locked: build the dependency versions Cargo.lock records, so the released
+# image contains what CI tested rather than whatever resolved today.
 RUN rustup target add x86_64-unknown-linux-musl \
-    && cargo build --release --target x86_64-unknown-linux-musl \
+    && cargo build --locked --release --target x86_64-unknown-linux-musl \
     && strip target/x86_64-unknown-linux-musl/release/mxhop
 
-# Alpine rather than scratch only because the entrypoint has to run two
-# commands in order and a healthcheck needs something to exec; everything
-# else is the single binary.
+# Alpine rather than scratch because the entrypoint is a shell script and
+# the healthcheck needs busybox nc and grep; everything else is the single
+# binary.
 FROM alpine:3.22
 
 # A fixed uid, so a bind-mounted spool on the host can be chowned to a number
@@ -47,13 +59,24 @@ USER 10001:10001
 
 ENV MXHOP_CONFIG=/etc/mxhop/mxhop.toml
 
-# `check` can answer today and answers quickly: it parses the config and
-# reads the TLS files. It does NOT prove the listener is accepting mail —
-# there is no health endpoint in the binary yet, so claiming more would be a
-# lie. It still catches the case this is here for: a config or certificate
-# the running process can no longer read.
+# An SMTP banner on the loopback. This is deliberately NOT `mxhop check`:
+# check rereads the certificate and key, while the running process keeps
+# serving the certificate it already loaded when a reload fails — by design.
+# So a renewal that leaves the key unreadable to uid 10001 would have failed
+# three probes, had the task killed, and then restart-looped on the
+# entrypoint's own check, closing port 25 for as long as nobody was awake,
+# instead of serving the still-valid old certificate for weeks.
+#
+# What this proves: the listener is up and completes a TCP accept with a 220
+# greeting. What it does not prove: that TLS, the spool or delivery work, or
+# that the port is reachable from outside the container. It fails exactly in
+# the case where a restart is the right answer — a process that is alive but
+# no longer accepting — which `check` never noticed.
+#
+# Port 2525 is hard-coded because the image's own documentation requires
+# listen = "0.0.0.0:2525"; nc and printf are busybox, already in the image.
 HEALTHCHECK --interval=60s --timeout=10s --start-period=10s --retries=3 \
-    CMD ["/usr/local/bin/mxhop", "check"]
+    CMD printf 'QUIT\r\n' | nc -w 5 127.0.0.1 2525 | grep -q '^220 '
 
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["run"]
