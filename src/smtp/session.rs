@@ -522,6 +522,7 @@ where
         by: config.hostname.clone(),
         id: id.clone(),
         esmtp: state.esmtp,
+        tls: state.outcome.tls,
         recipients: state.recipients.clone(),
         at_unix_ms: now_unix_ms(),
     }

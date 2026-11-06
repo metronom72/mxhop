@@ -505,8 +505,12 @@ pub struct Trace {
     pub by: String,
     /// The queue id, which is how this hop is found in two logs at once.
     pub id: String,
-    /// Whether the client said EHLO (`ESMTP`) rather than HELO (`SMTP`).
+    /// Whether the client said EHLO (`ESMTP`/`ESMTPS`) rather than HELO
+    /// (`SMTP`).
     pub esmtp: bool,
+    /// Whether the session was inside TLS when the message arrived, which is
+    /// the difference between `ESMTP` and `ESMTPS`.
+    pub tls: bool,
     /// Every envelope recipient. The `for` clause is written only when there
     /// is exactly one.
     pub recipients: Vec<String>,
@@ -529,7 +533,16 @@ impl Trace {
             Ok(ip) => ip.to_string(),
             Err(_) => "unknown".to_string(),
         };
-        let proto = if self.esmtp { "ESMTP" } else { "SMTP" };
+        // RFC 3848 names four protocols, and the one for an ESMTP session
+        // carried inside TLS is `ESMTPS`. Not cosmetic: this field is what
+        // Gmail reads to decide whether to show the recipient that the hop
+        // was encrypted, so writing `ESMTP` for a TLS session reports our own
+        // link as plaintext.
+        let proto = match (self.esmtp, self.tls) {
+            (true, true) => "ESMTPS",
+            (true, false) => "ESMTP",
+            (false, _) => "SMTP",
+        };
 
         let mut parts = vec![
             format!("Received: from {helo} ({ptr} [{ip}])"),
@@ -968,6 +981,7 @@ mod tests {
             by: "mx.tooling.ninja".into(),
             id: "0000001762400000-000001-1a2b".into(),
             esmtp: true,
+            tls: false,
             recipients: recipients.iter().map(|s| s.to_string()).collect(),
             at_unix_ms: 1_762_423_302_000,
         }
@@ -1021,6 +1035,30 @@ mod tests {
         assert!(
             header.starts_with("Received: from unknown ("),
             "a name that is not domain-shaped is reported as unknown: {header}"
+        );
+    }
+
+    /// RFC 3848's keyword for an ESMTP session inside TLS is `ESMTPS`, and
+    /// Gmail's security indicator reads exactly this field: a header that
+    /// says `ESMTP` for an encrypted hop reports our own link as plaintext
+    /// to the recipient.
+    #[test]
+    fn a_session_inside_tls_says_esmtps() {
+        let encrypted = Trace {
+            tls: true,
+            ..trace("x.test", &["one@example.com"])
+        };
+
+        assert!(
+            encrypted.header().contains("with ESMTPS id"),
+            "{}",
+            encrypted.header()
+        );
+        assert!(
+            !trace("x.test", &["one@example.com"])
+                .header()
+                .contains("ESMTPS"),
+            "and a plaintext session must not claim it"
         );
     }
 
