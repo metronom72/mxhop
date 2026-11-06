@@ -17,11 +17,13 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::time::timeout;
 use tokio_rustls::TlsAcceptor;
-use tracing::info;
+use tracing::{error, info};
 
 use crate::config::Config;
 use crate::envelope::{Envelope, now_unix_ms};
+use crate::policy::{self, Decision, Limits, Trace};
 use crate::routing::{Route, Router};
+use crate::smtp::client::{Delivery, Relay};
 use crate::smtp::command::{self, Command};
 use crate::smtp::wire::{self, WireError};
 use crate::spool::{Spool, new_id};
@@ -45,6 +47,12 @@ pub const DATA_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// this is the only thing that can end the session.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long the peer's reverse lookup may take before the trace says
+/// `unknown`. Two seconds because the sending server is waiting on the final
+/// dot while this happens, and a PTR record is a nicety: nothing is decided
+/// on it, so a slow resolver must cost the message almost nothing.
+pub const PTR_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// What the session needs to know about itself.
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
@@ -55,6 +63,9 @@ pub struct SessionConfig {
     pub command_timeout: Duration,
     pub data_timeout: Duration,
     pub handshake_timeout: Duration,
+    pub ptr_timeout: Duration,
+    /// What counts as a loop. See [`crate::policy::Limits`].
+    pub limits: Limits,
 }
 
 impl SessionConfig {
@@ -67,6 +78,8 @@ impl SessionConfig {
             command_timeout: COMMAND_TIMEOUT,
             data_timeout: DATA_TIMEOUT,
             handshake_timeout: HANDSHAKE_TIMEOUT,
+            ptr_timeout: PTR_TIMEOUT,
+            limits: Limits::default(),
         }
     }
 }
@@ -74,7 +87,8 @@ impl SessionConfig {
 /// What happened, for the log line.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Outcome {
-    /// Messages accepted into the queue.
+    /// Messages handed on, in whole or in part — the ones the sending server
+    /// was told 250 for.
     pub accepted: usize,
     /// Whether the client said QUIT rather than vanishing.
     pub quit: bool,
@@ -89,6 +103,9 @@ struct State {
     /// `from` is `Some(None)` for the null sender, which is a sender — just
     /// not one you can reply to.
     helo: Option<String>,
+    /// Whether the client said EHLO rather than HELO, which is the `ESMTP`
+    /// or `SMTP` the trace records.
+    esmtp: bool,
     from: Option<Option<String>>,
     recipients: Vec<String>,
     errors: u32,
@@ -102,6 +119,7 @@ impl State {
     /// earn ten more by starting TLS.
     fn after_handshake(&mut self) {
         self.helo = None;
+        self.esmtp = false;
         self.from = None;
         self.recipients.clear();
         self.outcome.tls = true;
@@ -122,16 +140,18 @@ enum Step {
 /// `tls` is the certificate snapshot this connection was accepted with, or
 /// `None` when no certificate is configured. TLS here is opportunistic and
 /// never required: this is an MX, and refusing plaintext loses mail.
-pub async fn serve<S>(
+pub async fn serve<S, L>(
     stream: S,
     peer: String,
     config: &SessionConfig,
     router: &Router,
     spool: &Spool,
+    relay: &L,
     tls: Option<TlsAcceptor>,
 ) -> Result<Outcome, WireError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
+    L: Relay,
 {
     // One `BufReader` over the whole stream, written through `get_mut`: the
     // split halves that a session normally wants are exactly what makes the
@@ -145,7 +165,18 @@ where
     )
     .await?;
 
-    match talk(&mut reader, &mut state, config, router, spool, &peer, &tls).await? {
+    match talk(
+        &mut reader,
+        &mut state,
+        config,
+        router,
+        spool,
+        relay,
+        &peer,
+        &tls,
+    )
+    .await?
+    {
         Step::Done => return Ok(state.outcome),
         Step::StartTls => {}
     }
@@ -198,7 +229,17 @@ where
 
     // Inside the tunnel `talk` answers a second STARTTLS itself, so the only
     // way back here is `Done`.
-    let step = talk(&mut reader, &mut state, config, router, spool, &peer, &tls).await?;
+    let step = talk(
+        &mut reader,
+        &mut state,
+        config,
+        router,
+        spool,
+        relay,
+        &peer,
+        &tls,
+    )
+    .await?;
 
     // `close_notify`, so the sender's own log does not record our goodbye as a
     // truncation attack. A client that has already gone is not an error here.
@@ -210,17 +251,20 @@ where
 }
 
 /// The command loop, over whatever the stream currently is.
-async fn talk<S>(
+#[allow(clippy::too_many_arguments)]
+async fn talk<S, L>(
     reader: &mut BufReader<S>,
     state: &mut State,
     config: &SessionConfig,
     router: &Router,
     spool: &Spool,
+    relay: &L,
     peer: &str,
     tls: &Option<TlsAcceptor>,
 ) -> Result<Step, WireError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
+    L: Relay,
 {
     loop {
         let line = match timeout(config.command_timeout, wire::read_line(reader)).await {
@@ -251,6 +295,7 @@ where
         match command {
             Command::Ehlo(name) => {
                 state.helo = Some(name.clone());
+                state.esmtp = true;
                 state.from = None;
                 state.recipients.clear();
                 let mut greeting = format!(
@@ -272,6 +317,7 @@ where
 
             Command::Helo(name) => {
                 state.helo = Some(name);
+                state.esmtp = false;
                 state.from = None;
                 state.recipients.clear();
                 say(reader.get_mut(), &format!("250 {}", config.hostname)).await?;
@@ -374,37 +420,11 @@ where
                     Ok(Err(e)) => return Err(e),
                 };
 
-                let envelope = Envelope {
-                    id: new_id(),
-                    from: state.from.clone().flatten(),
-                    to: state.recipients.clone(),
-                    helo: state.helo.clone().unwrap_or_default(),
-                    peer: peer.to_string(),
-                    received_at_unix_ms: now_unix_ms(),
-                    size: body.len() as u64,
-                    received: String::new(),
-                    last_reply: None,
-                };
-
-                match spool.store(&envelope, &body).await {
-                    Ok(()) => {
-                        say(
-                            reader.get_mut(),
-                            &format!("250 2.0.0 queued as {}", envelope.id),
-                        )
-                        .await?;
-                        state.outcome.accepted += 1;
-                    }
-                    Err(_) => {
-                        // Temporary: the sender keeps the message and will
-                        // try again, which is where it belongs if our disk is
-                        // unhappy.
-                        say(
-                            reader.get_mut(),
-                            "451 4.3.0 cannot queue the message right now",
-                        )
-                        .await?;
-                    }
+                let (reply, delivered) =
+                    hand_on(config, router, spool, relay, peer, state, body).await;
+                say(reader.get_mut(), &reply).await?;
+                if delivered {
+                    state.outcome.accepted += 1;
                 }
 
                 state.from = None;
@@ -455,6 +475,161 @@ where
             }
         }
     }
+}
+
+/// Everything between the final dot and the reply: the trace, the decision,
+/// the deliveries, and whatever is left over.
+///
+/// Nothing is stored before delivery is attempted. While the message is only
+/// on the wire the sending server still owns it, and that is the one place a
+/// message can wait that has a retry queue today.
+async fn hand_on<L>(
+    config: &SessionConfig,
+    router: &Router,
+    spool: &Spool,
+    relay: &L,
+    peer: &str,
+    state: &State,
+    body: Vec<u8>,
+) -> (String, bool)
+where
+    L: Relay,
+{
+    let id = new_id();
+    let helo = state.helo.clone().unwrap_or_default();
+
+    // The peer's own name, under a short clock: nothing is decided on it, so
+    // a resolver that is thinking must not cost the sending server its
+    // session. `unknown` in the trace is the honest answer.
+    let address = peer.parse::<std::net::SocketAddr>();
+    let ptr = match &address {
+        Ok(address) => timeout(config.ptr_timeout, relay.ptr(address.ip()))
+            .await
+            .unwrap_or(None),
+        // A peer that is not an address at all happens only in a test, and
+        // the header says `unknown` rather than guessing.
+        Err(_) => None,
+    };
+    let ip = match &address {
+        Ok(address) => address.ip().to_string(),
+        Err(_) => peer.to_string(),
+    };
+
+    let received = Trace {
+        helo: helo.clone(),
+        ptr,
+        ip,
+        by: config.hostname.clone(),
+        id: id.clone(),
+        esmtp: state.esmtp,
+        recipients: state.recipients.clone(),
+        at_unix_ms: now_unix_ms(),
+    }
+    .header();
+
+    let envelope = Envelope {
+        id,
+        from: state.from.clone().flatten(),
+        to: state.recipients.clone(),
+        helo,
+        peer: peer.to_string(),
+        received_at_unix_ms: now_unix_ms(),
+        size: body.len() as u64,
+        received: received.clone(),
+        last_reply: None,
+    };
+
+    // The message's own trace, read before anything leaves: the loop that
+    // bites a forwarder is not in the alias table but in somebody else's
+    // filter rule.
+    let head = policy::Head::scan(&body, &config.hostname);
+    let plan = match policy::decide(&envelope, router, &head, &config.limits) {
+        Decision::Refuse(reply) => {
+            info!(
+                %peer,
+                id = %envelope.id,
+                received = head.received_count,
+                by_us = head.by_us_count,
+                "refusing to relay: {reply}"
+            );
+            return (reply.to_string(), false);
+        }
+        Decision::Deliver(plan) => plan,
+    };
+
+    // One `Arc` for every group: the body is handed to each delivery without
+    // being copied, which for a 25 MiB message to three domains is the
+    // difference between one copy and four.
+    let body: std::sync::Arc<[u8]> = body.into();
+    let mut outcomes = Vec::with_capacity(plan.groups.len());
+    for group in &plan.groups {
+        // Sequentially, on purpose. The inbound sender is waiting, but three
+        // concurrent deliveries would also mean three connections out of one
+        // inbound session, which is how a forwarder becomes an amplifier.
+        outcomes.push(
+            relay
+                .deliver(Delivery::new(
+                    plan.sender.clone(),
+                    group.recipients.clone(),
+                    received.clone().into_bytes(),
+                    std::sync::Arc::clone(&body),
+                ))
+                .await,
+        );
+    }
+
+    let verdict = policy::reply_for(&outcomes, &envelope.id);
+    let delivered = (200..300).contains(&verdict.reply.code);
+
+    if verdict.hold.is_empty() {
+        info!(
+            %peer,
+            id = %envelope.id,
+            domains = plan.groups.len(),
+            "relayed: {}",
+            verdict.reply
+        );
+        return (verdict.reply.to_string(), delivered);
+    }
+
+    // Some of it arrived, so the sender is told 250 and must not send it
+    // again — which makes the rest ours. It is written to the spool before
+    // the 250 goes out, in that order: a crash in between then leaves the
+    // sending server still holding the message rather than nobody holding it.
+    let held = Envelope {
+        to: verdict.hold.iter().map(ToString::to_string).collect(),
+        last_reply: verdict.held_reason.as_ref().map(ToString::to_string),
+        ..envelope.clone()
+    };
+    match spool.store(&held, &body).await {
+        // Error level because nothing collects these yet: until the
+        // retry-queue milestone they sit in `queue/`, and an operator has to
+        // be able to see that they are there.
+        Ok(()) => error!(
+            %peer,
+            id = %held.id,
+            held = held.to.join(", "),
+            "part of the message was not delivered and is held in the queue with no \
+             retry: {}",
+            verdict
+                .held_reason
+                .as_ref()
+                .map_or_else(|| "no reason recorded".to_string(), ToString::to_string)
+        ),
+        // The sender is still told 250: the copies that did arrive have
+        // arrived, and asking for the message again would deliver those
+        // twice. These recipients have lost their copy — the same hole a
+        // permanent refusal in a mixed outcome falls into, and it closes only
+        // when mxhop can send a DSN of its own.
+        Err(e) => error!(
+            %peer,
+            id = %held.id,
+            held = held.to.join(", "),
+            "part of the message was not delivered and could not be held either: {e}"
+        ),
+    }
+
+    (verdict.reply.to_string(), delivered)
 }
 
 /// Counts one refusal and says goodbye if the client has made too many.
@@ -517,6 +692,7 @@ where
 mod tests {
     use super::*;
     use crate::routing::Mailbox;
+    use crate::smtp::client;
     use std::path::PathBuf;
     use tokio::io::{AsyncReadExt, duplex};
 
@@ -554,9 +730,86 @@ mod tests {
         r
     }
 
+    /// A destination that answers however the test tells it to, and keeps
+    /// what it was handed.
+    ///
+    /// The session must never be near a socket in a test, and this is the
+    /// whole of what it asks of the delivery side: hand this on, and what is
+    /// the peer called.
+    #[derive(Clone, Default)]
+    struct Fake {
+        seen: std::sync::Arc<std::sync::Mutex<Vec<Delivery>>>,
+        /// What each destination domain says. Anything not listed accepts.
+        answers: std::collections::BTreeMap<String, client::Verdict>,
+        ptr: Option<String>,
+    }
+
+    impl Fake {
+        fn accepting() -> Self {
+            Self {
+                ptr: Some("mail.elsewhere.test".into()),
+                ..Self::default()
+            }
+        }
+
+        fn answering(domain: &str, verdict: client::Verdict) -> Self {
+            let mut fake = Self::accepting();
+            fake.answers.insert(domain.to_string(), verdict);
+            fake
+        }
+
+        fn deliveries(&self) -> Vec<Delivery> {
+            self.seen.lock().unwrap().clone()
+        }
+
+        fn only(&self) -> Delivery {
+            let seen = self.deliveries();
+            assert_eq!(seen.len(), 1, "expected one delivery, got {}", seen.len());
+            seen.into_iter().next().unwrap()
+        }
+    }
+
+    impl Relay for Fake {
+        async fn deliver(&self, delivery: Delivery) -> client::Outcome {
+            let domain = delivery.to[0].domain().to_string();
+            let verdict = self
+                .answers
+                .get(&domain)
+                .cloned()
+                .unwrap_or(client::Verdict::Accepted);
+            let results = delivery
+                .to
+                .iter()
+                .map(|mailbox| client::RecipientResult {
+                    mailbox: mailbox.clone(),
+                    verdict: verdict.clone(),
+                })
+                .collect();
+            self.seen.lock().unwrap().push(delivery);
+            client::Outcome {
+                host: Some(format!("mx.{domain}")),
+                results,
+            }
+        }
+
+        async fn ptr(&self, _ip: std::net::IpAddr) -> Option<String> {
+            self.ptr.clone()
+        }
+    }
+
+    /// A reply from a destination, as it would arrive off the wire.
+    fn theirs(code: u16, enhanced: &str, text: &str) -> client::Reply {
+        client::Reply {
+            code,
+            enhanced: Some(enhanced.to_string()),
+            text: text.to_string(),
+        }
+    }
+
     struct Talk {
         out: String,
         spool: Spool,
+        relay: Fake,
         outcome: Outcome,
     }
 
@@ -577,6 +830,10 @@ mod tests {
     }
 
     async fn talk_limited(limit: u64, script: &str) -> Talk {
+        talk_with(Fake::accepting(), limit, script).await
+    }
+
+    async fn talk_with(relay: Fake, limit: u64, script: &str) -> Talk {
         let root = scratch("session");
         let spool = Spool::open(&root).await.unwrap();
         let config = SessionConfig {
@@ -587,10 +844,13 @@ mod tests {
             command_timeout: Duration::from_secs(10),
             data_timeout: Duration::from_secs(10),
             handshake_timeout: Duration::from_secs(10),
+            ptr_timeout: Duration::from_secs(10),
+            limits: Limits::default(),
         };
 
         let (mut client, server) = duplex(256 * 1024);
         let spool_for_task = spool.clone();
+        let relay_for_task = relay.clone();
         let task = tokio::spawn(async move {
             serve(
                 server,
@@ -598,6 +858,7 @@ mod tests {
                 &config,
                 &test_router(),
                 &spool_for_task,
+                &relay_for_task,
                 None,
             )
             .await
@@ -612,6 +873,7 @@ mod tests {
         Talk {
             out,
             spool,
+            relay,
             outcome,
         }
     }
@@ -769,7 +1031,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_complete_delivery_is_accepted_and_stored() {
+    async fn a_complete_delivery_is_accepted_and_handed_on() {
         let t = talk(DELIVER).await;
 
         assert_eq!(
@@ -778,16 +1040,13 @@ mod tests {
         );
         assert_eq!(t.outcome.accepted, 1);
 
-        let queued = t.spool.queued().await.unwrap();
-        assert_eq!(queued.len(), 1);
-        assert_eq!(queued[0].from.as_deref(), Some("sender@elsewhere.test"));
-        assert_eq!(queued[0].to, vec!["hi@example.com"]);
-        assert_eq!(queued[0].helo, "mail.elsewhere.test");
-        assert_eq!(queued[0].peer, "198.51.100.7:40000");
-
-        let body = t.spool.body(&queued[0].id).await.unwrap();
+        // What used to be read back out of the spool is read off the
+        // delivery: a message that arrived is handed on inside the session
+        // and never stored.
+        let delivery = t.relay.only();
+        assert_eq!(delivery.from.as_deref(), Some("sender@elsewhere.test"));
         assert_eq!(
-            String::from_utf8(body).unwrap(),
+            String::from_utf8(delivery.body.to_vec()).unwrap(),
             "Subject: hello\r\n\r\nbody\r\n"
         );
     }
@@ -795,37 +1054,55 @@ mod tests {
     #[tokio::test]
     async fn the_acceptance_names_the_queue_id_so_the_log_can_be_followed() {
         let t = talk(DELIVER).await;
-        let queued = t.spool.queued().await.unwrap();
+        let head = String::from_utf8(t.relay.only().head.clone()).unwrap();
+        let id = head
+            .split("with ESMTP id ")
+            .nth(1)
+            .and_then(|rest| rest.split("\r\n").next())
+            .expect("the trace names the id")
+            .to_string();
 
         assert!(
-            t.out.contains(&queued[0].id),
-            "the sender's log and ours have to be joinable: {}",
+            t.out.contains(&id),
+            "the sender's log, our trace and ours have to be joinable: {} / {head}",
             t.out
         );
     }
 
     #[tokio::test]
-    async fn dot_stuffing_is_undone_before_storing() {
+    async fn dot_stuffing_is_undone_before_the_message_leaves() {
         let script = "EHLO x.test\r\nMAIL FROM:<a@b.test>\r\nRCPT TO:<hi@example.com>\r\nDATA\r\n\
                       a line\r\n..stuffed\r\n.\r\nQUIT\r\n";
         let t = talk(script).await;
-        let queued = t.spool.queued().await.unwrap();
 
         assert_eq!(
-            String::from_utf8(t.spool.body(&queued[0].id).await.unwrap()).unwrap(),
-            "a line\r\n.stuffed\r\n"
+            String::from_utf8(t.relay.only().body.to_vec()).unwrap(),
+            "a line\r\n.stuffed\r\n",
+            "the client's stuffing is the transport's, not the message's; the \
+             outbound side puts its own back"
         );
     }
 
     #[tokio::test]
-    async fn every_accepted_recipient_is_on_the_envelope() {
+    async fn every_accepted_recipient_reaches_a_delivery() {
         let script = "EHLO x.test\r\nMAIL FROM:<a@b.test>\r\n\
                       RCPT TO:<hi@example.com>\r\nRCPT TO:<team@example.com>\r\n\
                       DATA\r\nbody\r\n.\r\nQUIT\r\n";
         let t = talk(script).await;
-        let queued = t.spool.queued().await.unwrap();
 
-        assert_eq!(queued[0].to, vec!["hi@example.com", "team@example.com"]);
+        let mut reached: Vec<String> = t
+            .relay
+            .deliveries()
+            .iter()
+            .flat_map(|d| d.to.iter())
+            .map(ToString::to_string)
+            .collect();
+        reached.sort();
+        assert_eq!(
+            reached,
+            vec!["a@gmail.test", "b@fastmail.test", "me@gmail.test"],
+            "both aliases are expanded, and me@ and a@ are different mailboxes"
+        );
     }
 
     #[tokio::test]
@@ -834,13 +1111,21 @@ mod tests {
                       RCPT TO:<nobody@example.com>\r\nRCPT TO:<hi@example.com>\r\n\
                       DATA\r\nbody\r\n.\r\nQUIT\r\n";
         let t = talk(script).await;
-        let queued = t.spool.queued().await.unwrap();
 
         assert_eq!(
             t.codes(),
             vec!["220", "250", "250", "550", "250", "354", "250", "221"]
         );
-        assert_eq!(queued[0].to, vec!["hi@example.com"]);
+        assert_eq!(
+            t.relay
+                .only()
+                .to
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            vec!["me@gmail.test"],
+            "the refused recipient is not on the delivery either"
+        );
     }
 
     #[tokio::test]
@@ -865,7 +1150,13 @@ mod tests {
         let t = talk(script).await;
 
         assert_eq!(t.outcome.accepted, 2);
-        assert_eq!(t.spool.queued().await.unwrap().len(), 2);
+        assert_eq!(
+            t.relay.deliveries().len(),
+            3,
+            "two messages, and the second one's alias leads to two domains: three \
+             connections, and nothing stored for any of them"
+        );
+        assert!(t.spool.queued().await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -873,10 +1164,274 @@ mod tests {
         let script =
             "EHLO x.test\r\nMAIL FROM:<>\r\nRCPT TO:<hi@example.com>\r\nDATA\r\nb\r\n.\r\nQUIT\r\n";
         let t = talk(script).await;
-        let queued = t.spool.queued().await.unwrap();
 
         assert_eq!(t.outcome.accepted, 1);
-        assert!(queued[0].is_bounce());
+        assert!(
+            t.relay.only().from.is_none(),
+            "a bounce goes out with the null sender it arrived with, or the \
+             destination can bounce it back at us"
+        );
+    }
+
+    // ------------------------------------------------- handing the message on
+
+    /// The whole point of the milestone. Before this the session answered
+    /// `250 queued as …` and the message sat in `queue/` with nothing to
+    /// collect it, so every sender was told the mail had been accepted and
+    /// nobody ever received it.
+    #[tokio::test]
+    async fn a_delivered_message_is_not_stored() {
+        let t = talk(DELIVER).await;
+
+        assert_eq!(t.last_code(), "221");
+        assert!(
+            t.out.contains("250 2.0.0 delivered as "),
+            "the sender is told it was delivered, not queued: {}",
+            t.out
+        );
+        assert_eq!(t.outcome.accepted, 1);
+        assert!(
+            t.spool.queued().await.unwrap().is_empty(),
+            "nothing is left over, so nothing is in the queue"
+        );
+        assert_eq!(
+            t.relay
+                .only()
+                .to
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            vec!["me@gmail.test"],
+            "the alias is resolved before the message leaves"
+        );
+    }
+
+    /// The stored message is the sender's bytes and nothing else, and the
+    /// trace is prepended on the wire. A `Received` baked into the stored
+    /// file would be written twice on a retry.
+    #[tokio::test]
+    async fn the_received_header_is_prepended_on_the_wire() {
+        let t = talk(DELIVER).await;
+        let delivery = t.relay.only();
+        let head = String::from_utf8(delivery.head.clone()).unwrap();
+
+        assert!(
+            head.starts_with(
+                "Received: from mail.elsewhere.test (mail.elsewhere.test [198.51.100.7])\r\n"
+            ),
+            "{head:?}"
+        );
+        assert!(
+            head.contains("by mx.test (mxhop) with ESMTP id "),
+            "{head:?}"
+        );
+        assert!(
+            head.contains("for <hi@example.com>;"),
+            "one recipient, so the for clause is written: {head:?}"
+        );
+        assert_eq!(
+            String::from_utf8(delivery.body.to_vec()).unwrap(),
+            "Subject: hello\r\n\r\nbody\r\n",
+            "the message itself is untouched"
+        );
+    }
+
+    /// A crafted HELO name reaching the header would let a stranger forge a
+    /// trace line — or an `Authentication-Results` the destination believes.
+    /// The session is the place this arrives from, so it is checked here too
+    /// and not only in `policy`.
+    #[tokio::test]
+    async fn a_crafted_helo_cannot_forge_a_header_through_the_session() {
+        // A HELO name that is not domain-shaped: the parser keeps it, and
+        // only the sanitising stops it reaching the header.
+        let script = "EHLO not a domain\r\nMAIL FROM:<a@b.test>\r\nRCPT TO:<hi@example.com>\r\n\
+                      DATA\r\nbody\r\n.\r\nQUIT\r\n";
+        let t = talk(script).await;
+        let head = String::from_utf8(t.relay.only().head.clone()).unwrap();
+
+        assert!(
+            head.starts_with("Received: from unknown ("),
+            "a name that is not domain-shaped is reported as unknown: {head:?}"
+        );
+        for line in head.trim_end_matches("\r\n").split("\r\n").skip(1) {
+            assert!(
+                line.starts_with(' ') || line.starts_with('\t'),
+                "every line after the first is a fold: {line:?}"
+            );
+        }
+    }
+
+    /// The reply a forwarder exists to relay. Gmail's own sentence tells the
+    /// person who mistyped an address what is wrong with it; "delivery
+    /// failed, contact your postmaster" from a host they have never heard of
+    /// does not.
+    #[tokio::test]
+    async fn a_destination_5xx_reaches_the_sending_server_inside_the_same_session() {
+        let refusing = Fake::answering(
+            "gmail.test",
+            client::Verdict::Refused(theirs(
+                550,
+                "5.1.1",
+                "The email account that you tried to reach does not exist.",
+            )),
+        );
+        let t = talk_with(refusing, 26_214_400, DELIVER).await;
+
+        assert_eq!(
+            t.codes(),
+            vec!["220", "250", "250", "250", "354", "550", "221"]
+        );
+        assert!(
+            t.out.contains(
+                "550 5.1.1 mx.gmail.test said: The email account that you tried to reach \
+                 does not exist."
+            ),
+            "the destination's own code and words, attributed: {}",
+            t.out
+        );
+        assert_eq!(t.outcome.accepted, 0);
+        assert!(
+            t.spool.queued().await.unwrap().is_empty(),
+            "a refusal is nobody's to retry, so nothing is kept"
+        );
+    }
+
+    /// A deferral means nothing is known yet. The sending server still has
+    /// the message and a retry queue of its own; mxhop has neither.
+    #[tokio::test]
+    async fn a_deferral_is_451_and_the_spool_stays_empty() {
+        let slow = Fake::answering(
+            "gmail.test",
+            client::Verdict::Deferred(theirs(451, "4.3.2", "Try again later")),
+        );
+        let t = talk_with(slow, 26_214_400, DELIVER).await;
+
+        assert_eq!(t.last_code(), "221");
+        assert!(
+            t.out
+                .contains("451 4.3.2 mx.gmail.test said: Try again later"),
+            "{}",
+            t.out
+        );
+        assert_eq!(t.outcome.accepted, 0);
+        assert!(
+            t.spool.queued().await.unwrap().is_empty(),
+            "answering 451 and keeping it too would make us responsible for a retry \
+             we cannot perform"
+        );
+    }
+
+    /// One of two destinations took it, so the sender must not send it again
+    /// — which means 250 — and the other recipient's copy is ours to keep.
+    #[tokio::test]
+    async fn a_mixed_outcome_is_250_and_holds_the_rest() {
+        let half = Fake::answering(
+            "fastmail.test",
+            client::Verdict::Deferred(theirs(451, "4.3.2", "Try again later")),
+        );
+        let script = "EHLO x.test\r\nMAIL FROM:<a@b.test>\r\nRCPT TO:<team@example.com>\r\n\
+                      DATA\r\nbody\r\n.\r\nQUIT\r\n";
+        let t = talk_with(half, 26_214_400, script).await;
+
+        assert!(t.out.contains("250 2.0.0 delivered as "), "{}", t.out);
+        let queued = t.spool.queued().await.unwrap();
+        assert_eq!(queued.len(), 1, "the undelivered copy is held");
+        assert_eq!(
+            queued[0].to,
+            vec!["b@fastmail.test"],
+            "held for the recipient that has not had it, and nobody else"
+        );
+        assert!(
+            queued[0].received.starts_with("Received: from x.test"),
+            "the trace travels with the held copy so a retry sends identical bytes: {:?}",
+            queued[0].received
+        );
+        assert!(
+            queued[0]
+                .last_reply
+                .as_deref()
+                .is_some_and(|r| r.contains("Try again later")),
+            "the operator reading queue/ has to see why it is there: {:?}",
+            queued[0].last_reply
+        );
+        assert_eq!(
+            String::from_utf8(t.spool.body(&queued[0].id).await.unwrap()).unwrap(),
+            "body\r\n",
+            "the stored file is the message as it arrived, with no header of ours in it"
+        );
+    }
+
+    /// The guarantee the spool gave before anything was delivered, kept: a
+    /// half-written message in `tmp/` is either renamed into the queue whole
+    /// or is not there at all.
+    #[tokio::test]
+    async fn a_crash_between_delivery_and_250_leaves_nothing_in_tmp() {
+        let half = Fake::answering(
+            "fastmail.test",
+            client::Verdict::Deferred(theirs(451, "4.3.2", "Try again later")),
+        );
+        let script = "EHLO x.test\r\nMAIL FROM:<a@b.test>\r\nRCPT TO:<team@example.com>\r\n\
+                      DATA\r\nbody\r\n.\r\nQUIT\r\n";
+        let t = talk_with(half, 26_214_400, script).await;
+
+        assert_eq!(
+            std::fs::read_dir(t.spool.tmp_dir()).unwrap().count(),
+            0,
+            "tmp/ is a staging area, and anything left in it is a message nobody \
+             will ever look at"
+        );
+    }
+
+    /// One alias leading to two destinations is two connections, and each
+    /// one carries only its own recipient: an envelope that named the other
+    /// would tell each destination where else the alias forwards.
+    #[tokio::test]
+    async fn two_destinations_are_two_deliveries() {
+        let script = "EHLO x.test\r\nMAIL FROM:<a@b.test>\r\nRCPT TO:<team@example.com>\r\n\
+                      DATA\r\nbody\r\n.\r\nQUIT\r\n";
+        let t = talk_with(Fake::accepting(), 26_214_400, script).await;
+
+        let mut domains: Vec<String> = t
+            .relay
+            .deliveries()
+            .iter()
+            .map(|d| d.to[0].domain().to_string())
+            .collect();
+        domains.sort();
+        assert_eq!(domains, vec!["fastmail.test", "gmail.test"]);
+        for delivery in t.relay.deliveries() {
+            assert_eq!(delivery.to.len(), 1);
+            assert!(
+                String::from_utf8(delivery.head.clone())
+                    .unwrap()
+                    .contains("for <team@example.com>;"),
+                "the for clause names the address the sender wrote to — the alias — \
+                 and so says nothing about where the alias forwards"
+            );
+        }
+    }
+
+    /// The loop the alias table cannot see, arriving as a real message: our
+    /// own name already in the trace three times means the message has been
+    /// here before and is going round.
+    #[tokio::test]
+    async fn a_message_that_has_been_here_three_times_is_refused_554() {
+        let script = "EHLO x.test\r\nMAIL FROM:<a@b.test>\r\nRCPT TO:<hi@example.com>\r\nDATA\r\n\
+                      Received: from a.test by mx.test with ESMTP id 1\r\n\
+                      Received: from b.test by mx.test with ESMTP id 2\r\n\
+                      Received: from c.test by mx.test with ESMTP id 3\r\n\
+                      Subject: round and round\r\n\
+                      \r\n\
+                      body\r\n.\r\nQUIT\r\n";
+        let t = talk(script).await;
+
+        assert_eq!(t.last_code(), "221");
+        assert!(t.out.contains("554 5.4.6"), "{}", t.out);
+        assert!(
+            t.relay.deliveries().is_empty(),
+            "a message in a loop is not handed on"
+        );
+        assert!(t.spool.queued().await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -985,6 +1540,8 @@ mod tests {
             command_timeout: Duration::from_millis(50),
             data_timeout: Duration::from_millis(50),
             handshake_timeout: Duration::from_millis(50),
+            ptr_timeout: Duration::from_secs(10),
+            limits: Limits::default(),
         };
 
         let (mut client, server) = duplex(4096);
@@ -995,6 +1552,7 @@ mod tests {
                 &config,
                 &test_router(),
                 &spool,
+                &Fake::accepting(),
                 None,
             )
             .await
@@ -1216,6 +1774,8 @@ mod tests {
             command_timeout: Duration::from_secs(10),
             data_timeout: Duration::from_secs(10),
             handshake_timeout: Duration::from_millis(200),
+            ptr_timeout: Duration::from_secs(10),
+            limits: Limits::default(),
         };
 
         let (client, server) = duplex(256 * 1024);
@@ -1227,6 +1787,7 @@ mod tests {
                 &config,
                 &test_router(),
                 &spool_for_task,
+                &Fake::accepting(),
                 Some(acceptor),
             )
             .await
@@ -1296,7 +1857,8 @@ mod tests {
 
         assert_eq!(outcome.accepted, 1, "{rest}");
         assert!(!outcome.tls);
-        assert_eq!(served.spool.queued().await.unwrap().len(), 1);
+        assert!(rest.contains("250 2.0.0 delivered as "), "{rest}");
+        assert!(served.spool.queued().await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1318,7 +1880,8 @@ mod tests {
             outcome.tls,
             "the log line has to say the session was encrypted"
         );
-        assert_eq!(served.spool.queued().await.unwrap().len(), 1);
+        assert!(rest.contains("250 2.0.0 delivered as "), "{rest}");
+        assert!(served.spool.queued().await.unwrap().is_empty());
     }
 
     /// RFC 3207 §4.2. If this is forgotten, an EHLO or MAIL an attacker

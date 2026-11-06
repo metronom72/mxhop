@@ -1168,6 +1168,72 @@ fn left(want: Duration, deadline: Instant) -> Result<Duration, Fail> {
     Ok(want.min(remaining))
 }
 
+// ------------------------------------------------------- the session's view of us
+
+/// Delivery as the inbound session needs it: hand this message on, and tell
+/// me what the peer's address is called.
+///
+/// A trait because a session test cannot be allowed near the network, and
+/// because the two questions the session asks are the whole of what it needs
+/// — no resolver, no connector and no budget reach [`crate::smtp::session`].
+pub trait Relay {
+    fn deliver(&self, delivery: Delivery) -> impl std::future::Future<Output = Outcome> + Send;
+
+    /// The peer's reverse DNS, or `None` when it has none or DNS did not say.
+    /// A trace with `unknown` in it is honest; a session that waits on a
+    /// broken resolver is not, so the caller puts this under a clock.
+    fn ptr(&self, ip: IpAddr) -> impl std::future::Future<Output = Option<String>> + Send;
+}
+
+/// The real one: the system resolver, a TCP socket, and port 25.
+pub struct Direct<R> {
+    pub resolver: R,
+    pub out: Outbound,
+}
+
+impl<R> Direct<R> {
+    pub fn new(resolver: R, out: Outbound) -> Self {
+        Self { resolver, out }
+    }
+}
+
+impl<R> Relay for Direct<R>
+where
+    R: Resolve + Sync,
+{
+    async fn deliver(&self, delivery: Delivery) -> Outcome {
+        deliver(&self.resolver, &Tcp, &self.out, &delivery).await
+    }
+
+    async fn ptr(&self, ip: IpAddr) -> Option<String> {
+        self.resolver.ptr(ip).await.ok()
+    }
+}
+
+/// A relay that answers "accepted" and hands the message nowhere.
+///
+/// It exists for the tests that are about something else — the accept loop,
+/// the TLS handshake — and that would otherwise have to reach the network to
+/// get past the final dot. It is deliberately not reachable from any
+/// configuration: a forwarder that silently discards mail is the worst
+/// failure this program has.
+#[doc(hidden)]
+#[derive(Debug, Default, Clone)]
+pub struct Blackhole;
+
+impl Relay for Blackhole {
+    async fn deliver(&self, delivery: Delivery) -> Outcome {
+        Outcome {
+            host: Some("blackhole.invalid".to_string()),
+            results: Outcome::all(&delivery.to, Verdict::Accepted),
+        }
+    }
+
+    async fn ptr(&self, _ip: IpAddr) -> Option<String> {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1521,6 +1587,27 @@ mod tests {
 
     // ------------------------------------------------------------- a slow DNS
 
+    /// A relay that keeps what the inbound session handed it, so the test
+    /// can check the bytes instead of reading them back out of the spool —
+    /// a delivered message is no longer stored anywhere.
+    #[derive(Default, Clone)]
+    struct Capture(Arc<std::sync::Mutex<Vec<Delivery>>>);
+
+    impl Relay for Capture {
+        async fn deliver(&self, delivery: Delivery) -> Outcome {
+            let results = Outcome::all(&delivery.to, Verdict::Accepted);
+            self.0.lock().unwrap().push(delivery);
+            Outcome {
+                host: Some("mx.gmail.test".to_string()),
+                results,
+            }
+        }
+
+        async fn ptr(&self, _ip: IpAddr) -> Option<String> {
+            Some("sender.test".to_string())
+        }
+    }
+
     /// A resolver that answers correctly, eventually. The question a delivery
     /// budget has to answer is what happens while DNS is thinking, and a
     /// table answers instantly.
@@ -1538,6 +1625,11 @@ mod tests {
         async fn addrs(&self, host: &str) -> Result<Vec<IpAddr>, DnsError> {
             tokio::time::sleep(self.delay).await;
             Resolve::addrs(&self.inner, host).await
+        }
+
+        async fn ptr(&self, ip: IpAddr) -> Result<String, DnsError> {
+            tokio::time::sleep(self.delay).await;
+            Resolve::ptr(&self.inner, ip).await
         }
     }
 
@@ -2265,11 +2357,15 @@ mod tests {
             command_timeout: Duration::from_secs(5),
             data_timeout: Duration::from_secs(5),
             handshake_timeout: Duration::from_secs(5),
+            ptr_timeout: Duration::from_secs(5),
+            limits: crate::policy::Limits::default(),
         };
 
+        let relay = Capture::default();
         let (client, server) = duplex(256 * 1024);
         let served = {
             let spool = spool.clone();
+            let relay = relay.clone();
             tokio::spawn(async move {
                 crate::smtp::session::serve(
                     server,
@@ -2277,6 +2373,7 @@ mod tests {
                     &config,
                     &router,
                     &spool,
+                    &relay,
                     None,
                 )
                 .await
@@ -2306,13 +2403,20 @@ mod tests {
         // closed pipe. That is what every real session looks like.
         let _ = served.await.expect("the task");
 
-        let queued = spool.queued().await.expect("the queue");
-        assert_eq!(queued.len(), 1, "exactly one message should have landed");
-        let stored = spool.body(&queued[0].id).await.expect("the stored message");
         assert!(
-            stored.ends_with(&[HEAD, body].concat()),
+            spool.queued().await.expect("the queue").is_empty(),
+            "a message handed on is not stored: the queue is for what is left over"
+        );
+        let relayed = relay.0.lock().unwrap().clone();
+        assert_eq!(relayed.len(), 1, "exactly one message should have landed");
+        assert!(
+            relayed[0].body.ends_with(&[HEAD, body].concat()),
             "the message has to arrive byte for byte, dot-stuffing undone at \
              the far end"
+        );
+        assert!(
+            relayed[0].head.starts_with(b"Received: from "),
+            "and leave with our own trace in front of it"
         );
     }
 

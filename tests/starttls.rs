@@ -210,6 +210,8 @@ async fn a_reload_is_seen_by_the_next_connection_and_not_the_current_one() {
         command_timeout: std::time::Duration::from_secs(10),
         data_timeout: std::time::Duration::from_secs(10),
         handshake_timeout: std::time::Duration::from_secs(10),
+        ptr_timeout: std::time::Duration::from_secs(10),
+        limits: mxhop::policy::Limits::default(),
     });
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -221,6 +223,7 @@ async fn a_reload_is_seen_by_the_next_connection_and_not_the_current_one() {
         config,
         Arc::new(router()),
         Arc::clone(&spool),
+        Arc::new(mxhop::smtp::client::Blackhole),
         Some(Arc::clone(&holder)),
     ));
 
@@ -260,6 +263,9 @@ async fn a_reload_is_seen_by_the_next_connection_and_not_the_current_one() {
     first.send("QUIT\r\n").await;
     second.send("QUIT\r\n").await;
 
-    assert_eq!(spool.queued().await.unwrap().len(), 1);
+    assert!(
+        spool.queued().await.unwrap().is_empty(),
+        "the message was handed on inside the session, so nothing is left in the queue"
+    );
     loop_task.abort();
 }

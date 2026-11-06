@@ -297,6 +297,10 @@ pub struct Verdict {
     /// The recipients whose copy has not been delivered and has not been
     /// refused either, so the message has to be kept for them.
     pub hold: Vec<Mailbox>,
+    /// What the destination said about the held recipients, for the operator
+    /// reading `queue/` and for the envelope's own record. Nothing acts on
+    /// it: there is no retry queue yet.
+    pub held_reason: Option<Reply>,
 }
 
 /// Collapses every destination's answer into the one reply SMTP allows.
@@ -339,6 +343,7 @@ pub fn reply_for(outcomes: &[Outcome], id: &str) -> Verdict {
                 text: format!("delivered as {id}"),
             },
             hold: deferred.iter().map(|(_, _, m)| (*m).clone()).collect(),
+            held_reason: deferred.first().map(|(_, reply, _)| (*reply).clone()),
         };
     }
 
@@ -404,6 +409,7 @@ pub fn reply_for(outcomes: &[Outcome], id: &str) -> Verdict {
     Verdict {
         reply,
         hold: Vec::new(),
+        held_reason: None,
     }
 }
 

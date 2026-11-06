@@ -49,6 +49,16 @@ impl fmt::Display for DnsError {
 pub trait Resolve {
     fn mx(&self, domain: &str) -> impl Future<Output = Result<Vec<Target>, DnsError>> + Send;
     fn addrs(&self, host: &str) -> impl Future<Output = Result<Vec<IpAddr>, DnsError>> + Send;
+    /// The name an address claims, for the `Received` header of an inbound
+    /// session. One name: a trace records what the peer looked like, and a
+    /// list of every PTR record is not a fact about this connection.
+    ///
+    /// Unverified on purpose — the forward lookup that would confirm it is
+    /// another two queries while a sending server waits on us, and nothing is
+    /// decided on the strength of this name. It is written down, and the
+    /// address beside it in the same header is the part that cannot be
+    /// claimed.
+    fn ptr(&self, ip: IpAddr) -> impl Future<Output = Result<String, DnsError>> + Send;
 }
 
 /// Why a domain cannot be delivered to at all.
@@ -270,6 +280,23 @@ impl Resolve for Hickory {
             .unwrap_or_default();
         Ok(v4.into_iter().chain(v6).collect())
     }
+
+    async fn ptr(&self, ip: IpAddr) -> Result<String, DnsError> {
+        match self.inner.reverse_lookup(ip).await {
+            Ok(answer) => answer
+                .answers()
+                .iter()
+                .filter_map(|record| match &record.data {
+                    hickory_resolver::proto::rr::RData::PTR(ptr) => Some(ptr),
+                    _ => None,
+                })
+                .map(|ptr| normalise(&ptr.0.to_utf8()))
+                .next()
+                .ok_or(DnsError::NotFound),
+            Err(e) if e.is_no_records_found() => Err(DnsError::NotFound),
+            Err(e) => Err(DnsError::Failed(e.to_string())),
+        }
+    }
 }
 
 /// The A records of an answer. An A lookup's answer section can carry a
@@ -305,6 +332,7 @@ fn v6_of(answer: &hickory_resolver::lookup::Lookup) -> Vec<IpAddr> {
 pub struct Table {
     mx: std::collections::BTreeMap<String, Result<Vec<Target>, DnsError>>,
     addrs: std::collections::BTreeMap<String, Result<Vec<IpAddr>, DnsError>>,
+    ptrs: std::collections::BTreeMap<IpAddr, Result<String, DnsError>>,
 }
 
 impl Table {
@@ -338,6 +366,12 @@ impl Table {
         self
     }
 
+    /// The name an address reverse-resolves to.
+    pub fn ptr(mut self, ip: IpAddr, name: &str) -> Self {
+        self.ptrs.insert(ip, Ok(normalise(name)));
+        self
+    }
+
     pub fn addr_error(mut self, host: &str, e: DnsError) -> Self {
         self.addrs.insert(normalise(host), Err(e));
         self
@@ -355,6 +389,13 @@ impl Resolve for Table {
     async fn addrs(&self, host: &str) -> Result<Vec<IpAddr>, DnsError> {
         self.addrs
             .get(&normalise(host))
+            .cloned()
+            .unwrap_or(Err(DnsError::NotFound))
+    }
+
+    async fn ptr(&self, ip: IpAddr) -> Result<String, DnsError> {
+        self.ptrs
+            .get(&ip)
             .cloned()
             .unwrap_or(Err(DnsError::NotFound))
     }
