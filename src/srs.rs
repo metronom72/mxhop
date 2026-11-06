@@ -368,6 +368,27 @@ fn day_of_base32(tt: &str) -> Option<u32> {
     Some(day % DAYS)
 }
 
+/// Reads the secret file and builds the rewriter the service runs with.
+///
+/// Separate from [`Srs::new`] so that every rule about the file's *contents*
+/// stays testable without a filesystem, and so that `check` and `run` fail
+/// the same way on the same file: `check` answers "would `run` start?", and a
+/// key that cannot be read is a service that cannot sign.
+pub fn open(settings: &crate::config::SrsSettings) -> Result<Srs, String> {
+    let contents = std::fs::read_to_string(&settings.secret_file).map_err(|e| {
+        format!(
+            "the srs secret file {} cannot be read: {e} — generate one with \
+             `head -c 32 /dev/urandom | base64 > {} && chmod 600 {}`",
+            settings.secret_file.display(),
+            settings.secret_file.display(),
+            settings.secret_file.display()
+        )
+    })?;
+    let keys = Srs::keys_from(&contents)
+        .map_err(|e| format!("the srs secret file {} {e}", settings.secret_file.display()))?;
+    Ok(Srs::new(&settings.domain, keys, settings.max_age_days))
+}
+
 /// Today, as the counter the addresses carry: days since the Unix epoch,
 /// modulo 1024. The one impure function in the file, and it takes nothing and
 /// decides nothing.

@@ -35,6 +35,27 @@ pub struct Config {
     /// Where the certificate lives, when one is configured at all. Absent
     /// means plaintext only, which is a supported way to run an MX.
     pub tls: Option<TlsPaths>,
+    /// The SRS domain and its secret file, when sender rewriting is
+    /// configured. Absent means forwarded mail keeps the original envelope
+    /// sender — which is how mail arrives at Gmail with a failing SPF check,
+    /// so this is a table an operator wants, not an optional nicety.
+    pub srs: Option<SrsSettings>,
+}
+
+/// The `[srs]` table as the file states it, with the secret still on disk.
+///
+/// The secret is never in the TOML and never in git: this carries the path,
+/// and [`crate::srs::Srs::keys_from`] reads it where the filesystem is
+/// allowed — the same division the `[tls]` paths follow, so that `load_str`
+/// stays a pure function of the file's text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SrsSettings {
+    pub domain: String,
+    pub secret_file: PathBuf,
+    pub max_age_days: u32,
+    /// The line of the `[srs]` table, so a problem found when the secret file
+    /// is *read* can still be reported where the operator typed it.
+    pub line: Option<usize>,
 }
 
 /// The two PEM files, and the line of the `[tls]` table so that a problem
@@ -165,6 +186,77 @@ pub fn load_str(src: &str) -> Result<Config, Vec<Problem>> {
             certificate: tls.certificate.get_ref().clone(),
             key: tls.key.get_ref().clone(),
             line: line_of_text(src, "[tls]"),
+        }
+    });
+
+    let srs = raw.srs.as_ref().map(|srs| {
+        let domain = srs.domain.get_ref().to_ascii_lowercase();
+        if !is_qualified(&domain) {
+            problems.push(at(
+                src,
+                srs.domain.span(),
+                format!(
+                    "srs.domain must be a fully qualified name, like srs.example.com — \
+                     {:?} is not, and it is the domain whose SPF record has to name this \
+                     host for forwarded mail to pass SPF",
+                    srs.domain.get_ref()
+                ),
+            ));
+        }
+        if !srs.secret_file.get_ref().is_absolute() {
+            problems.push(at(
+                src,
+                srs.secret_file.span(),
+                format!(
+                    "srs.secret_file must be an absolute path: {} depends on the working \
+                     directory, and a signing key read from the wrong file means every \
+                     bounce in flight stops verifying",
+                    srs.secret_file.get_ref().display()
+                ),
+            ));
+        }
+        let max_age_days = match &srs.max_age_days {
+            None => crate::srs::DEFAULT_MAX_AGE_DAYS,
+            Some(v) if *v.get_ref() == 0 => {
+                problems.push(at(
+                    src,
+                    v.span(),
+                    "srs.max_age_days must be at least 1: zero expires every rewritten \
+                     address at the next midnight, which looks like SRS working until \
+                     the first bounce arrives a day late"
+                        .to_string(),
+                ));
+                crate::srs::DEFAULT_MAX_AGE_DAYS
+            }
+            Some(v) => *v.get_ref(),
+        };
+        // Our own alias lookup would shadow the bounce path: `RCPT TO` at a
+        // domain in `[domains]` is resolved against the alias table, and the
+        // signed address would be looked up as an alias name, refused as "no
+        // such address here" — or, with a catch-all, forwarded to a human
+        // instead of to the person the bounce is for.
+        if raw
+            .domains
+            .keys()
+            .any(|listed| listed.eq_ignore_ascii_case(&domain))
+        {
+            problems.push(at(
+                src,
+                srs.domain.span(),
+                format!(
+                    "{domain} is the srs domain and is also listed in [domains]: \
+                     remove it from [domains], or give srs a domain of its own — \
+                     the alias table is consulted first, so bounces coming back to a \
+                     rewritten sender would be answered by an alias lookup instead of \
+                     being decoded"
+                ),
+            ));
+        }
+        SrsSettings {
+            domain,
+            secret_file: srs.secret_file.get_ref().clone(),
+            max_age_days,
+            line: line_of_text(src, "[srs]"),
         }
     });
 
@@ -319,6 +411,7 @@ pub fn load_str(src: &str) -> Result<Config, Vec<Problem>> {
         },
         router,
         tls,
+        srs,
     })
 }
 
@@ -435,6 +528,15 @@ struct Raw {
     #[serde(default)]
     domains: BTreeMap<String, RawDomain>,
     tls: Option<RawTls>,
+    srs: Option<RawSrs>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSrs {
+    domain: Spanned<String>,
+    secret_file: Spanned<PathBuf>,
+    max_age_days: Option<Spanned<u32>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1014,6 +1116,86 @@ hi = "me-at-gmail.com"
         assert!(
             p.contains("key"),
             "a certificate without its key cannot serve a handshake: {p}"
+        );
+    }
+
+    const SRS: &str = "\n[srs]\ndomain = \"srs.example.com\"\nsecret_file = \"/run/srs.key\"\n";
+
+    #[test]
+    fn an_srs_block_loads_with_the_default_window() {
+        let src = format!("{MINIMAL}{SRS}");
+        let c = load_str(&src).expect("an srs block should load");
+        let srs = c.srs.expect("srs should be configured");
+
+        assert_eq!(srs.domain, "srs.example.com");
+        assert_eq!(srs.secret_file, PathBuf::from("/run/srs.key"));
+        assert_eq!(srs.max_age_days, crate::srs::DEFAULT_MAX_AGE_DAYS);
+        assert_eq!(
+            srs.line,
+            Some(line_with(&src, "[srs]")),
+            "a secret file problem found later has to be reportable at a line"
+        );
+    }
+
+    /// If the SRS domain were also a forwarded domain, every `RCPT TO` at it
+    /// would hit the alias table first and the bounce path would never be
+    /// reached — so bounces would come back and be refused, or worse, land
+    /// silently in a catch-all.
+    #[test]
+    fn check_refuses_an_srs_domain_that_also_has_aliases() {
+        let src = "
+hostname = \"mx.example.com\"
+listen = \"0.0.0.0:25\"
+spool_dir = \"/var/lib/mxhop/spool\"
+
+[srs]
+domain = \"srs.example.com\"
+secret_file = \"/run/srs.key\"
+
+[domains.\"srs.example.com\".aliases]
+hi = \"me@gmail.com\"
+";
+        let p = only_problem(src);
+
+        assert!(p.contains("srs.example.com"), "{p}");
+        assert!(
+            p.contains("[domains]"),
+            "the operator has to be told which of the two to remove: {p}"
+        );
+    }
+
+    #[test]
+    fn the_srs_domain_has_to_be_a_domain_and_the_secret_file_absolute() {
+        let src = format!("{MINIMAL}\n[srs]\ndomain = \"srs\"\nsecret_file = \"srs.key\"\n");
+        let found = problems(&src);
+
+        assert_eq!(found.len(), 2, "both are wrong: {found:#?}");
+        assert!(
+            found.iter().any(|p| p.contains("fully qualified")),
+            "{found:#?}"
+        );
+        assert!(found.iter().any(|p| p.contains("absolute")), "{found:#?}");
+    }
+
+    #[test]
+    fn an_srs_expiry_window_of_zero_days_is_refused() {
+        // Zero would expire every address the moment the clock ticked past
+        // midnight, which looks like SRS working until the first bounce
+        // arrives on the second day.
+        let src = format!("{MINIMAL}{SRS}max_age_days = 0\n");
+        let p = only_problem(&src);
+
+        assert!(p.contains("max_age_days"), "{p}");
+    }
+
+    #[test]
+    fn an_srs_block_needs_both_the_domain_and_the_secret_file() {
+        let src = format!("{MINIMAL}\n[srs]\ndomain = \"srs.example.com\"\n");
+        let p = only_problem(&src);
+
+        assert!(
+            p.contains("secret_file"),
+            "a domain with no key cannot sign anything: {p}"
         );
     }
 }

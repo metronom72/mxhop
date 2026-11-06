@@ -13,6 +13,7 @@ use mxhop::server::accept_loop;
 use mxhop::smtp::client::{self, Delivery, Direct, Outbound, Tcp, Verdict};
 use mxhop::smtp::session::SessionConfig;
 use mxhop::spool::Spool;
+use mxhop::srs::{self, Srs};
 use mxhop::telemetry;
 use mxhop::tls::Holder;
 
@@ -111,15 +112,43 @@ fn check(cli: &Cli) -> ExitCode {
         }
     };
 
+    // The same reason the certificate is read here: `run` refuses to start
+    // without a signing key, and a `check` that only looked at the path would
+    // pass a configuration whose every forwarded message then goes out with
+    // the original sender and fails SPF at the destination.
+    let srs = match open_srs(&config) {
+        Ok(srs) => srs,
+        Err(problem) => {
+            report(cli, &[problem]);
+            return ExitCode::FAILURE;
+        }
+    };
+
     let domains: Vec<&str> = config.router.domains().collect();
     println!(
-        "{}: ok — {} on {}, {} {} for {}{}",
+        "{}: ok — {} on {}, {} {} for {}{}{}",
         cli.config.display(),
         config.hostname,
         config.listen,
         config.router.alias_count(),
         plural(config.router.alias_count(), "alias", "aliases"),
         domains.join(", "),
+        match &srs {
+            // The key count, because rotation is the operation that goes
+            // wrong quietly: a file whose old key was dropped verifies
+            // nothing that is already in flight, and the only moment an
+            // operator can notice is before the restart.
+            Some(srs) => format!(
+                ", SRS at {} ({} {}, {} day window)",
+                srs.domain(),
+                srs.key_count(),
+                plural(srs.key_count(), "key", "keys"),
+                srs.max_age_days()
+            ),
+            None => ", no SRS — forwarded mail keeps the original envelope sender \
+                      and will fail SPF"
+                .to_string(),
+        },
         match &tls {
             // The user is part of the answer: the files were read with this
             // user's permissions, and `run` will read them with the service
@@ -146,6 +175,18 @@ fn open_tls(config: &Config) -> Result<Option<Arc<Holder>>, Problem> {
     Holder::open(paths).map(Some).map_err(|e| Problem {
         line,
         message: e.to_string(),
+    })
+}
+
+/// Reads the SRS secret file, if one is configured, and turns a file problem
+/// into a [`Problem`] at the line of the `[srs]` table.
+fn open_srs(config: &Config) -> Result<Option<Srs>, Problem> {
+    let Some(settings) = config.srs.as_ref() else {
+        return Ok(None);
+    };
+    srs::open(settings).map(Some).map_err(|message| Problem {
+        line: settings.line,
+        message,
     })
 }
 

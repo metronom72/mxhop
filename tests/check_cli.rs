@@ -155,3 +155,98 @@ fn the_ok_line_names_the_user_that_read_the_certificate() {
         "the ok line has to say which user read the files: {stdout}"
     );
 }
+
+/// `check` answers "would `run` start?", and `run` cannot sign an envelope
+/// sender with a key that is not there. A `check` that only looked at the
+/// path would pass a configuration whose every forwarded message then went
+/// out with the original sender and failed SPF.
+#[test]
+fn check_reads_the_srs_secret_and_fails_at_the_srs_line() {
+    let body = format!(
+        "{GOOD}\n[srs]\ndomain = \"srs.example.com\"\nsecret_file = \"/nonexistent/srs.key\"\n"
+    );
+    let path = write_config("missing-srs-key.toml", &body);
+    let out = run_check(&path);
+
+    assert!(
+        !out.status.success(),
+        "a signing key that is not there must not pass check"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("/nonexistent/srs.key"), "{stderr}");
+    assert!(
+        stderr.contains(":9:"),
+        "reported at the [srs] line, which is where the fix is typed: {stderr}"
+    );
+}
+
+/// A short key is guessable offline from one SRS address found in a
+/// `Received` header, and a guessed key makes this host an open relay. The
+/// refusal has to say what to type instead, because "too short" on its own
+/// invites a slightly longer guess.
+#[test]
+fn check_refuses_a_secret_file_too_short_to_sign_with() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("check_cli");
+    fs::create_dir_all(&dir).expect("temp dir");
+    let key = dir.join("short-srs.key");
+    fs::write(&key, "nowherenear\n").expect("write key");
+
+    let body = format!(
+        "{GOOD}\n[srs]\ndomain = \"srs.example.com\"\nsecret_file = {:?}\n",
+        key.display().to_string()
+    );
+    let path = write_config("short-srs-key.toml", &body);
+    let out = run_check(&path);
+
+    assert!(
+        !out.status.success(),
+        "an 11-byte signing key must not pass"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("at least 16"), "{stderr}");
+    assert!(
+        stderr.contains("/dev/urandom"),
+        "the refusal has to say what to type: {stderr}"
+    );
+}
+
+/// The ok line is what an operator reads after a deploy, and whether the
+/// envelope sender is being rewritten is the single fact that decides whether
+/// forwarded mail passes SPF at the destination.
+#[test]
+fn the_ok_line_says_whether_the_envelope_sender_is_rewritten() {
+    let plain = run_check(&write_config("no-srs.toml", GOOD));
+    let stdout = String::from_utf8_lossy(&plain.stdout);
+    assert!(stdout.contains("no SRS"), "{stdout}");
+
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("check_cli");
+    fs::create_dir_all(&dir).expect("temp dir");
+    let key = dir.join("ok-srs.key");
+    // Generated here rather than written down: a key-shaped literal in a
+    // source file is a key in a source file.
+    fs::write(
+        &key,
+        format!(
+            "{:032x}\n",
+            u128::from(std::process::id()).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        ),
+    )
+    .expect("write key");
+
+    let body = format!(
+        "{GOOD}\n[srs]\ndomain = \"srs.example.com\"\nsecret_file = {:?}\n",
+        key.display().to_string()
+    );
+    let out = run_check(&write_config("ok-srs.toml", &body));
+
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("srs.example.com"),
+        "the ok line has to name the SRS domain: {stdout}"
+    );
+}
