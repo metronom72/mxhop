@@ -3,6 +3,7 @@
 //! The binary is a thin shell around this library, so the tests drive the same
 //! entry points the service uses.
 
+pub mod auth;
 pub mod config;
 pub mod dns;
 pub mod envelope;
