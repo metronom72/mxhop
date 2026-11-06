@@ -140,16 +140,28 @@ noreply = { reject = "550 5.1.1 this address does not accept mail" }
 # ever refuses is mail whose own domain asked every receiver to refuse it:
 #
 #     DMARC fails and the domain publishes p=reject   -> 550 5.7.1
-#     DMARC cannot be checked, policy reject/unknown  -> 451 4.7.1, try again
+#     p=reject in hand, the check could not finish    -> 451 4.7.1, try again
+#     the check could not be done at all, no policy   -> forwarded, dmarc=temperror
 #     DMARC fails under p=quarantine                  -> forwarded, header says so
 #     DMARC fails under p=none, or there is no record  -> forwarded
 #     anything else, SPF failures included            -> forwarded
 #
-# Defer only where a definite answer could have refused. A resolver that is
-# not answering therefore holds up mail from p=reject domains and nothing
-# else — and a 451 is retried, so nothing is lost either way. Nothing here is
+# Defer only where a definite answer could have refused. Nothing here is
 # silent: every refusal names the domain and the policy, in a sentence the
 # sending server reads.
+#
+# The third line is deliberate and there is no setting for it. An unreadable
+# policy could have been p=reject, but "no policy" is not produced only by a
+# broken `_dmarc` at the sender: mail-auth abandons the whole DMARC tree walk
+# on the first non-NXDOMAIN failure at any level, so a REFUSED answer, a
+# flaky authoritative server or a DNSSEC-bogus zone anywhere in a domain's
+# `_dmarc` ancestry arrives as "no policy" — and so does mxhop's own expired
+# DNS budget, which one dead `include:` in an ordinary sender's SPF record
+# can spend. A retry gets the same answer, so deferring there is a bounce
+# after the sender's retry window, over DNS that never affected delivery
+# before. The forgery it would have caught needs that domain's *own* `_dmarc`
+# to be unanswerable, which a forger does not control, and the destination
+# re-evaluates DMARC with its own resolver anyway.
 #
 # This matters more for a forwarder than for an ordinary MX. After SRS every
 # message mxhop forwards passes SPF at the destination, so without this check
@@ -159,13 +171,22 @@ noreply = { reject = "550 5.1.1 this address does not accept mail" }
 #
 # [auth]
 #
-# false switches the whole thing off: no lookups, no header, no refusals. Use
-# it if something in front of mxhop already does this and writes the header.
+# false switches the whole thing off: no lookups, no header, no refusals, and
+# the message's bytes leave exactly as they arrived. Use it if something in
+# front of mxhop already does this and writes the header — including when that
+# box signs its header with this host's name, which is the natural thing for
+# the same operator to configure. With the check on, a header already in the
+# message under *this host's* name is deleted before ours is written (RFC 8601
+# §5 requires it: otherwise a sender writes our finding for us). With the
+# check off mxhop has no finding, so it deletes nothing.
 # enabled = true
 #
 # "off" evaluates everything and writes the header, and never refuses or
-# defers. That is the setting for watching what enforcement *would* do before
-# turning it on. `mxhop check` refuses `enforce` together with
+# defers — but it logs, at info, the code it would have sent together with the
+# domain and the policy. That is the setting for watching what enforcement
+# *would* do for a week before turning it on, and without that log line the
+# week would be blind: the only other trace is the header, in a mailbox at the
+# destination. `mxhop check` refuses `enforce` together with
 # `enabled = false`: with no lookups there is no result to enforce, and the
 # pair reads like a setting without being one.
 # enforce = "dmarc"

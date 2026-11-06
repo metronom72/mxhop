@@ -230,8 +230,9 @@ Only one thing is ever refused:
 
 | what DMARC says | what mxhop does |
 |---|---|
-| fails, and the domain publishes `p=reject` | `550 5.7.1`, naming the domain |
-| could not be checked, and the policy is `p=reject` or unknown | `451 4.7.1` — try again |
+| fails, and the domain publishes `p=reject` | `550 5.7.1`, naming the domain and the policy |
+| `p=reject` is in hand but the check could not be finished | `451 4.7.1` — try again |
+| could not be checked at all, so no policy is known | forwarded, with `dmarc=temperror` in the header |
 | fails under `p=quarantine` | forwarded, with `policy.dmarc=quarantine` in the header |
 | fails under `p=none`, or there is no record | forwarded |
 | anything else, SPF failures included | forwarded |
@@ -239,6 +240,22 @@ Only one thing is ever refused:
 The rule in one sentence: **defer only where a definite answer could have
 refused.** A resolver that cannot answer never becomes a permanent refusal,
 and never becomes an open door either.
+
+The third row is the one worth arguing. An unreadable policy *could* have been
+`p=reject`, so deferring looks like the cautious reading — but it is not the
+sender's `_dmarc` record alone that produces it. `mail-auth` abandons the whole
+DMARC tree walk on the first non-NXDOMAIN failure at any level, so a REFUSED
+answer, a flaky authoritative server or a DNSSEC-bogus zone anywhere in a
+domain's `_dmarc` ancestry arrives here as "no policy" — and so does mxhop's
+own expired DNS budget, which one dead `include:` in an ordinary sender's SPF
+record can spend. A retry gets the same answer, so a 451 there is a bounce
+after the sender's retry window, over DNS that never affected delivery before.
+What it buys is small and not an attacker's to arrange: a forgery of a
+`p=reject` domain gets through only while *that domain's own* `_dmarc` is
+unanswerable, and the destination re-evaluates DMARC with its own resolver
+regardless. Accepting and stamping on `temperror` is what OpenDMARC, rspamd and
+Gmail all do. There is no setting for this; a third knob nobody sets correctly
+is worse than one well-argued default.
 
 Why the one refusal matters here specifically: after SRS *every* message mxhop
 forwards passes SPF at the destination, because the envelope sender is at a
@@ -262,12 +279,18 @@ The whole thing is one table:
 
 ```toml
 [auth]              # the whole table is optional; absent is this
-enabled = true      # false: no lookups, no header, no refusals
-enforce = "dmarc"   # or "off": evaluate and stamp, never refuse or defer
+enabled = true      # false: no lookups, no header, no refusals, no byte changed
+enforce = "dmarc"   # or "off": evaluate, stamp and log, never refuse or defer
 ```
 
+`enforce = "off"` logs each verdict it would have acted on, at info, with the
+code, the domain and the policy — which is what makes it usable for watching
+enforcement for a week before switching it on.
+
 An `Authentication-Results` header that arrives already claiming mxhop's own
-`hostname` is removed before the message is checked ([RFC 8601 §5][rfc8601]).
+`hostname` is removed before the message is checked ([RFC 8601 §5][rfc8601]),
+unless `enabled = false`, in which case mxhop has no finding of its own and
+deletes nothing.
 It is the one place mxhop changes the bytes of a message, and it is the
 deletion of one header — another host's results are left alone. Without it a
 sender writes the header itself, under your name, and nothing downstream can
