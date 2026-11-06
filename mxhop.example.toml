@@ -87,3 +87,38 @@ noreply = { reject = "550 5.1.1 this address does not accept mail" }
 # A second domain looks the same.
 [domains."example.org".aliases]
 "*" = "me@gmail.com"
+
+# Sender rewriting (SRS). Without this table forwarded mail keeps the original
+# sender in its envelope, the destination checks SPF against a domain whose
+# record does not name this server, and the check fails — Gmail junks mail that
+# shape. Worse, any bounce the destination issues after accepting goes to that
+# original sender, who never wrote to you.
+#
+# The domain must have an MX record pointing at this host and an SPF record
+# naming its address, and it must NOT appear in [domains] above: the alias
+# table is consulted first, so a domain in both would have its bounces
+# answered by an alias lookup instead of being decoded. `mxhop check` refuses
+# that configuration.
+#
+#     srs.example.com.   MX   10 mx.example.com.
+#     srs.example.com.   TXT  "v=spf1 ip4:203.0.113.10 -all"
+#
+# The signing key is never in this file. Generate it on the server:
+#
+#     head -c 32 /dev/urandom | base64 > /etc/mxhop/srs.key
+#     chmod 600 /etc/mxhop/srs.key
+#
+# To rotate it, put the new key on the first line and keep the old one below
+# it for at least max_age_days: the first line signs and every line verifies,
+# so bounces already in flight still come home.
+#
+# [srs]
+# domain = "srs.example.com"
+# secret_file = "/etc/mxhop/srs.key"
+
+# How many days a rewritten address stays valid. 21 is the default, and what
+# postsrsd uses. Most legitimate delivery reports arrive within five days, so
+# most of the window is there for out-of-office replies and slow servers —
+# shorten it if you would rather have a narrower replay window than catch a
+# late report.
+# max_age_days = 21
