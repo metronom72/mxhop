@@ -1,0 +1,162 @@
+# An example single-node Swarm stack for mxhop. Copy it, edit the paths and
+# the image tag, then:
+#
+#     docker stack config -c deploy/mxhop.stack.yml      # look at it first
+#     docker stack deploy -c deploy/mxhop.stack.yml mxhop
+#
+# See deploy/README.md for what has to exist on the host first.
+version: "3.8"
+
+services:
+  mxhop:
+    # Pin a version. A forwarder that pulls `latest` on every redeploy
+    # changes the mail path without anyone choosing to.
+    image: ghcr.io/metronom72/mxhop:0.1.0
+
+    # Host-mode publishing, not the default ingress mesh. The mesh NATs
+    # incoming connections through an overlay address, so the process would
+    # see every sender as 10.0.x.x: the `Received` header it writes would
+    # name the wrong peer, the logs would be useless for telling a spammer
+    # from a mailing list, and an SPF check (once that lands) would evaluate
+    # the overlay address instead of the sender's. Host mode hands the real
+    # client address to the task.
+    #
+    # The container listens on 2525; 25 is published by the host side, so the
+    # process never needs CAP_NET_BIND_SERVICE and `cap_drop: ALL` can stay.
+    ports:
+      - target: 2525
+        published: 25
+        protocol: tcp
+        mode: host
+
+    volumes:
+      # The spool is a bind mount from a host path, deliberately not a named
+      # volume: `docker system prune --volumes` deletes named volumes, and
+      # this directory holds mail that has been accepted and not yet
+      # delivered — a prune would destroy it, and the sender was already told
+      # the message was taken. A host path is also what lets an operator
+      # `ls` and `cat` the queue without entering the container.
+      # Must be owned by uid 10001 (the image's mxhop user).
+      - type: bind
+        source: /srv/mxhop/spool
+        target: /var/lib/mxhop/spool
+
+      # The whole config DIRECTORY, not the single mxhop.toml file. A bind
+      # mount of one file pins an inode: an editor that saves by writing a
+      # temporary file and renaming it over the original leaves the container
+      # reading the old, deleted inode forever, and the operator sees their
+      # edit ignored with nothing in the log. Mounting the directory makes a
+      # rename visible. It also carries tls/ — the certificate pair copied
+      # there for uid 10001, see deploy/README.md.
+      #
+      # Either way an edited config does NOT restart the task:
+      #     docker service update --force mxhop_mxhop
+      # mxhop.toml must say listen = "0.0.0.0:2525"; the [tls] table must
+      # name the paths as they appear inside the container, under
+      # /etc/mxhop/tls.
+      - type: bind
+        source: /srv/mxhop
+        target: /etc/mxhop
+        read_only: true
+
+    secrets:
+      # Mounted at /run/secrets/mxhop_srs_secret. Nothing reads it yet — SRS
+      # is not implemented — but this is where the file will be, so the
+      # config can name the path on the day it lands. A Docker secret rather
+      # than an environment variable because the environment of a task is
+      # visible to anything that can run `docker inspect`.
+      - mxhop_srs_secret
+
+    deploy:
+      replicas: 1 # single node, and a host-mode port 25 cannot be shared
+      update_config:
+        # stop-first, not the default start-first. With a host-mode port the
+        # new task cannot bind 25 while the old one still holds it: a
+        # start-first update would loop on "address already in use" and the
+        # rollout would never converge.
+        order: stop-first
+        failure_action: rollback
+      restart_policy:
+        condition: on-failure
+      resources:
+        limits:
+          # A bound on the damage a runaway session can do to the rest of the
+          # node. Generous for a process whose state is a config file and a
+          # directory of files.
+          memory: 256M
+
+    # tini as pid 1. Not because SIGTERM is currently lost — it is not:
+    # measured on this image, mxhop as pid 1 exits at once with 143, because
+    # tokio's signal driver installs a handler for SIGTERM even though mxhop
+    # only ever asks it for SIGHUP, and a caught signal IS delivered to pid
+    # 1. That is an implementation detail of the async runtime, not anything
+    # this program states, and the day it changes every deploy would silently
+    # start waiting out the grace period below and then SIGKILLing. tini
+    # makes the behaviour the stack's own: SIGTERM reaches mxhop as an
+    # ordinary process with an ordinary default action. It also reaps the
+    # zombies a pid 1 otherwise has to.
+    #
+    # What is NOT true today either way: a graceful stop. mxhop registers
+    # SIGHUP only and the accept loop never returns, so the exit cuts open
+    # sessions off mid-command. Graceful shutdown is the 0.2 row of the root
+    # README's status table.
+    #
+    # tini forwards SIGHUP too, so the certificate reload below still works.
+    init: true
+
+    # What an abrupt exit costs today: nothing half-written becomes
+    # deliverable. The spool writes body and envelope into tmp/, fsyncs them
+    # and only then renames them into queue/; delivery skips an .eml whose
+    # .json rename did not happen, so the worst a kill leaves is a stray
+    # file, and a sender that never got its 250 retries.
+    #
+    # So this period is not protecting an in-flight DATA — it cannot,
+    # nothing stops the accept loop — and SMTP's own timeouts are 5 minutes
+    # per command and 10 minutes inside DATA, which the 60s that used to be
+    # here never covered either. It is kept short, and becomes meaningful
+    # only when graceful shutdown lands: then mxhop will stop accepting on
+    # SIGTERM, let open sessions finish, and exit inside this window.
+    stop_grace_period: 30s
+
+    cap_drop:
+      - ALL # nothing privileged is bound inside the container, see ports
+
+    # security_opt is NOT set here on purpose: `docker stack deploy` ignores
+    # it (it is in the CLI's unsupported-options list and the Swarm converter
+    # never reads it), printing only "Ignoring unsupported options:
+    # security_opt" — so writing it would look like a hardening that is not
+    # applied. It works under `docker compose`/`docker run`
+    # (--security-opt no-new-privileges). cap_drop, init,
+    # stop_grace_period, healthcheck, logging and host-mode ports above ARE
+    # converted and do take effect.
+
+    # An SMTP banner on the loopback, which is what the image's own
+    # HEALTHCHECK does; repeated here so the stack is readable on its own.
+    #
+    # Proves: the listener is up and answers a connection with 220. Does not
+    # prove: TLS, the spool, delivery, or reachability from outside the
+    # container. Deliberately not `mxhop check` — check rereads the
+    # certificate, but the process keeps serving the one it already loaded
+    # when a reload fails, so a renewal that left the key unreadable to uid
+    # 10001 would have Swarm kill a task that was still serving valid TLS,
+    # and the replacement would restart-loop with port 25 closed.
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "printf 'QUIT\r\n' | nc -w 5 127.0.0.1 2525 | grep -q '^220 '",
+        ]
+      interval: 60s
+      timeout: 10s
+      start_period: 10s
+      retries: 3
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+secrets:
+  mxhop_srs_secret:
+    external: true # created once by hand, see deploy/README.md
