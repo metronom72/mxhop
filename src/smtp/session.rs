@@ -4,12 +4,20 @@
 //! drive the real state machine through a pipe. What it does *not* do is
 //! decide policy: whether a recipient is ours comes from the [`Router`], and
 //! nothing here looks inside the message.
+//!
+//! STARTTLS makes the stream type change in the middle of the conversation,
+//! which is why the loop lives in [`talk`] and [`serve`] is an orchestrator:
+//! `talk` runs over the plaintext stream, hands back [`Step::StartTls`], and
+//! `serve` runs it again over the TLS stream. Two monomorphisations and no
+//! enum of streams.
 
 use std::io;
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::time::timeout;
+use tokio_rustls::TlsAcceptor;
+use tracing::info;
 
 use crate::config::Config;
 use crate::envelope::{Envelope, now_unix_ms};
@@ -32,6 +40,11 @@ pub const MAX_ERRORS: u32 = 10;
 pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 pub const DATA_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
+/// How long the TLS handshake may take. A client that has said `STARTTLS` and
+/// then nothing is past the point where an SMTP timeout could answer it, so
+/// this is the only thing that can end the session.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// What the session needs to know about itself.
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
@@ -41,6 +54,7 @@ pub struct SessionConfig {
     pub max_errors: u32,
     pub command_timeout: Duration,
     pub data_timeout: Duration,
+    pub handshake_timeout: Duration,
 }
 
 impl SessionConfig {
@@ -52,6 +66,7 @@ impl SessionConfig {
             max_errors: MAX_ERRORS,
             command_timeout: COMMAND_TIMEOUT,
             data_timeout: DATA_TIMEOUT,
+            handshake_timeout: HANDSHAKE_TIMEOUT,
         }
     }
 }
@@ -63,44 +78,154 @@ pub struct Outcome {
     pub accepted: usize,
     /// Whether the client said QUIT rather than vanishing.
     pub quit: bool,
+    /// Whether the session ended up inside a TLS tunnel.
+    pub tls: bool,
+}
+
+/// Everything the loop knows. The three facts a transaction is made of, plus
+/// what the connection itself has become.
+#[derive(Debug, Default)]
+struct State {
+    /// `from` is `Some(None)` for the null sender, which is a sender — just
+    /// not one you can reply to.
+    helo: Option<String>,
+    from: Option<Option<String>>,
+    recipients: Vec<String>,
+    errors: u32,
+    outcome: Outcome,
+}
+
+impl State {
+    /// RFC 3207 §4.2: the handshake resets the session to the state right
+    /// after the greeting. The error count is not reset — it is ours, not the
+    /// client's, and a client that has already made nine mistakes does not
+    /// earn ten more by starting TLS.
+    fn after_handshake(&mut self) {
+        self.helo = None;
+        self.from = None;
+        self.recipients.clear();
+        self.outcome.tls = true;
+    }
+}
+
+/// Why [`talk`] came back.
+enum Step {
+    /// The conversation is over; the outcome is in the [`State`].
+    Done,
+    /// The client asked for a handshake and may have one.
+    StartTls,
 }
 
 /// Serves one session to its end. A client that disappears is not an error:
 /// it happens all day, and nothing was promised to it.
+///
+/// `tls` is the certificate snapshot this connection was accepted with, or
+/// `None` when no certificate is configured. TLS here is opportunistic and
+/// never required: this is an MX, and refusing plaintext loses mail.
 pub async fn serve<S>(
     stream: S,
     peer: String,
     config: &SessionConfig,
     router: &Router,
     spool: &Spool,
+    tls: Option<TlsAcceptor>,
 ) -> Result<Outcome, WireError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let (read_half, mut out) = tokio::io::split(stream);
-    let mut reader = BufReader::new(read_half);
-    let mut outcome = Outcome::default();
+    // One `BufReader` over the whole stream, written through `get_mut`: the
+    // split halves that a session normally wants are exactly what makes the
+    // stream impossible to swap out mid-conversation.
+    let mut reader = BufReader::new(stream);
+    let mut state = State::default();
 
-    say(&mut out, &format!("220 {} mxhop ready", config.hostname)).await?;
+    say(
+        reader.get_mut(),
+        &format!("220 {} mxhop ready", config.hostname),
+    )
+    .await?;
 
-    // The three facts a transaction is made of. `from` is `Some(None)` for
-    // the null sender, which is a sender — just not one you can reply to.
-    let mut helo: Option<String> = None;
-    let mut from: Option<Option<String>> = None;
-    let mut recipients: Vec<String> = Vec::new();
-    let mut errors = 0u32;
+    match talk(&mut reader, &mut state, config, router, spool, &peer, &tls).await? {
+        Step::Done => return Ok(state.outcome),
+        Step::StartTls => {}
+    }
 
+    // `talk` only asks for this when a certificate was configured.
+    let acceptor = tls.clone().expect("STARTTLS is offered with a certificate");
+
+    // **CVE-2011-0411.** Anything already buffered arrived in plaintext and
+    // was not sent by whoever is about to hold the other end of the tunnel.
+    // `BufReader::into_inner` discards its buffer by design, so this check has
+    // to come before the upgrade, and refusing is the only safe answer:
+    // replaying the bytes inside the tunnel is the vulnerability, and so is
+    // running them before it.
+    if !reader.buffer().is_empty() {
+        say(
+            reader.get_mut(),
+            "554 5.5.1 commands sent before the TLS handshake are not accepted",
+        )
+        .await?;
+        return Ok(state.outcome);
+    }
+
+    say(reader.get_mut(), "220 2.0.0 go ahead").await?;
+
+    let plain = reader.into_inner();
+    let encrypted = match timeout(config.handshake_timeout, acceptor.accept(plain)).await {
+        Ok(Ok(encrypted)) => encrypted,
+        // A handshake that did not happen admits no SMTP reply: there is no
+        // agreed encoding left to send one in. Scanners do this all day, and
+        // it is not a session failure.
+        Ok(Err(e)) => {
+            info!(%peer, "TLS handshake failed: {e}");
+            return Ok(state.outcome);
+        }
+        Err(_) => {
+            info!(%peer, "TLS handshake timed out");
+            return Ok(state.outcome);
+        }
+    };
+
+    state.after_handshake();
+    let mut reader = BufReader::new(encrypted);
+
+    // Inside the tunnel `talk` answers a second STARTTLS itself, so the only
+    // way back here is `Done`.
+    let step = talk(&mut reader, &mut state, config, router, spool, &peer, &tls).await?;
+
+    // `close_notify`, so the sender's own log does not record our goodbye as a
+    // truncation attack. A client that has already gone is not an error here.
+    let _ = reader.get_mut().shutdown().await;
+
+    match step {
+        Step::Done | Step::StartTls => Ok(state.outcome),
+    }
+}
+
+/// The command loop, over whatever the stream currently is.
+async fn talk<S>(
+    reader: &mut BufReader<S>,
+    state: &mut State,
+    config: &SessionConfig,
+    router: &Router,
+    spool: &Spool,
+    peer: &str,
+    tls: &Option<TlsAcceptor>,
+) -> Result<Step, WireError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     loop {
-        let line = match timeout(config.command_timeout, wire::read_line(&mut reader)).await {
+        let line = match timeout(config.command_timeout, wire::read_line(reader)).await {
             Err(_) => {
-                say(&mut out, "421 4.4.2 timeout waiting for a command").await?;
-                return Ok(outcome);
+                say(reader.get_mut(), "421 4.4.2 timeout waiting for a command").await?;
+                return Ok(Step::Done);
             }
             Ok(Ok(line)) => line,
-            Ok(Err(WireError::Closed)) => return Ok(outcome),
+            Ok(Err(WireError::Closed)) => return Ok(Step::Done),
             Ok(Err(WireError::LineTooLong)) => {
-                say(&mut out, "500 5.5.6 command line too long").await?;
-                return Ok(outcome);
+                say(reader.get_mut(), "500 5.5.6 command line too long").await?;
+                return Ok(Step::Done);
             }
             Ok(Err(e)) => return Err(e),
         };
@@ -108,11 +233,9 @@ where
         let command = match command::parse(&line) {
             Ok(command) => command,
             Err(e) => {
-                say(&mut out, &e.to_string()).await?;
-                errors += 1;
-                if errors >= config.max_errors {
-                    say(&mut out, "421 4.7.0 too many errors, goodbye").await?;
-                    return Ok(outcome);
+                say(reader.get_mut(), &e.to_string()).await?;
+                if too_many_errors(reader, state, config).await? {
+                    return Ok(Step::Done);
                 }
                 continue;
             }
@@ -120,41 +243,68 @@ where
 
         match command {
             Command::Ehlo(name) => {
-                helo = Some(name.clone());
-                from = None;
-                recipients.clear();
-                let greeting = format!(
+                state.helo = Some(name.clone());
+                state.from = None;
+                state.recipients.clear();
+                let mut greeting = format!(
                     "250-{} greets {}\r\n\
                      250-SIZE {}\r\n\
                      250-8BITMIME\r\n\
-                     250-PIPELINING\r\n\
-                     250 ENHANCEDSTATUSCODES",
+                     250-PIPELINING\r\n",
                     config.hostname, name, config.max_message_bytes
                 );
+                // Advertised only when there is a certificate to serve, and
+                // never once the tunnel is up: RFC 3207 §4.2 forbids
+                // re-offering it.
+                if tls.is_some() && !state.outcome.tls {
+                    greeting.push_str("250-STARTTLS\r\n");
+                }
+                greeting.push_str("250 ENHANCEDSTATUSCODES");
+                let out = reader.get_mut();
                 out.write_all(greeting.as_bytes()).await?;
                 out.write_all(b"\r\n").await?;
                 out.flush().await?;
             }
 
             Command::Helo(name) => {
-                helo = Some(name);
-                from = None;
-                recipients.clear();
-                say(&mut out, &format!("250 {}", config.hostname)).await?;
+                state.helo = Some(name);
+                state.from = None;
+                state.recipients.clear();
+                say(reader.get_mut(), &format!("250 {}", config.hostname)).await?;
+            }
+
+            // Allowed before EHLO on purpose: HELO-only clients exist, and a
+            // client that wants encryption first is not making a mistake.
+            Command::StartTls => {
+                if state.outcome.tls {
+                    say(reader.get_mut(), "503 5.5.1 TLS is already active").await?;
+                } else if tls.is_none() {
+                    say(reader.get_mut(), "502 5.5.1 STARTTLS is not offered here").await?;
+                    if too_many_errors(reader, state, config).await? {
+                        return Ok(Step::Done);
+                    }
+                } else {
+                    // `serve` says `220` — it owns the stream from here.
+                    return Ok(Step::StartTls);
+                }
             }
 
             Command::Mail {
                 from: sender, size, ..
             } => {
-                if helo.is_none() {
-                    say(&mut out, "503 5.5.1 say EHLO first").await?;
-                } else if from.is_some() {
-                    say(&mut out, "503 5.5.1 a message is already in progress").await?;
+                if state.helo.is_none() {
+                    say(reader.get_mut(), "503 5.5.1 say EHLO first").await?;
+                } else if state.from.is_some() {
+                    say(
+                        reader.get_mut(),
+                        "503 5.5.1 a message is already in progress",
+                    )
+                    .await?;
                 } else if size.is_some_and(|size| size > config.max_message_bytes) {
                     // The client said how big it is. Reading it anyway would
                     // waste both sides' time.
                     say(
-                        &mut out,
+                        reader.get_mut(),
                         &format!(
                             "552 5.3.4 message larger than the {} byte limit",
                             config.max_message_bytes
@@ -162,41 +312,45 @@ where
                     )
                     .await?;
                 } else {
-                    from = Some(sender);
-                    recipients.clear();
-                    say(&mut out, "250 2.1.0 sender accepted").await?;
+                    state.from = Some(sender);
+                    state.recipients.clear();
+                    say(reader.get_mut(), "250 2.1.0 sender accepted").await?;
                 }
             }
 
             Command::Rcpt(address) => {
-                if from.is_none() {
-                    say(&mut out, "503 5.5.1 say MAIL FROM first").await?;
-                } else if recipients.len() >= config.max_recipients {
+                if state.from.is_none() {
+                    say(reader.get_mut(), "503 5.5.1 say MAIL FROM first").await?;
+                } else if state.recipients.len() >= config.max_recipients {
                     // Temporary on purpose: the client should send the rest
                     // in another message rather than give up on them.
-                    say(&mut out, "452 4.5.3 too many recipients for one message").await?;
+                    say(
+                        reader.get_mut(),
+                        "452 4.5.3 too many recipients for one message",
+                    )
+                    .await?;
                 } else {
-                    let reply = decide_recipient(router, &address, &mut recipients);
-                    say(&mut out, &reply).await?;
+                    let reply = decide_recipient(router, &address, &mut state.recipients);
+                    say(reader.get_mut(), &reply).await?;
                 }
             }
 
             Command::Data => {
-                if recipients.is_empty() {
-                    say(&mut out, "503 5.5.1 no accepted recipients").await?;
+                if state.recipients.is_empty() {
+                    say(reader.get_mut(), "503 5.5.1 no accepted recipients").await?;
                     continue;
                 }
-                say(&mut out, "354 end your message with a single dot").await?;
+                say(reader.get_mut(), "354 end your message with a single dot").await?;
 
                 let body = match timeout(
                     config.data_timeout,
-                    wire::read_body(&mut reader, config.max_message_bytes),
+                    wire::read_body(reader, config.max_message_bytes),
                 )
                 .await
                 {
                     Err(_) => {
-                        say(&mut out, "421 4.4.2 timeout inside DATA").await?;
-                        return Ok(outcome);
+                        say(reader.get_mut(), "421 4.4.2 timeout inside DATA").await?;
+                        return Ok(Step::Done);
                     }
                     Ok(Ok(body)) => body,
                     Ok(Err(WireError::TooLarge { limit })) => {
@@ -204,73 +358,115 @@ where
                         // already refused; draining it is work on behalf of
                         // whoever sent it.
                         say(
-                            &mut out,
+                            reader.get_mut(),
                             &format!("552 5.3.4 message larger than {limit} bytes"),
                         )
                         .await?;
-                        return Ok(outcome);
+                        return Ok(Step::Done);
                     }
-                    Ok(Err(WireError::UnterminatedBody | WireError::Closed)) => return Ok(outcome),
+                    Ok(Err(WireError::UnterminatedBody | WireError::Closed)) => {
+                        return Ok(Step::Done);
+                    }
                     Ok(Err(e)) => return Err(e),
                 };
 
                 let envelope = Envelope {
                     id: new_id(),
-                    from: from.clone().flatten(),
-                    to: recipients.clone(),
-                    helo: helo.clone().unwrap_or_default(),
-                    peer: peer.clone(),
+                    from: state.from.clone().flatten(),
+                    to: state.recipients.clone(),
+                    helo: state.helo.clone().unwrap_or_default(),
+                    peer: peer.to_string(),
                     received_at_unix_ms: now_unix_ms(),
                     size: body.len() as u64,
                 };
 
                 match spool.store(&envelope, &body).await {
                     Ok(()) => {
-                        say(&mut out, &format!("250 2.0.0 queued as {}", envelope.id)).await?;
-                        outcome.accepted += 1;
+                        say(
+                            reader.get_mut(),
+                            &format!("250 2.0.0 queued as {}", envelope.id),
+                        )
+                        .await?;
+                        state.outcome.accepted += 1;
                     }
                     Err(_) => {
                         // Temporary: the sender keeps the message and will
                         // try again, which is where it belongs if our disk is
                         // unhappy.
-                        say(&mut out, "451 4.3.0 cannot queue the message right now").await?;
+                        say(
+                            reader.get_mut(),
+                            "451 4.3.0 cannot queue the message right now",
+                        )
+                        .await?;
                     }
                 }
 
-                from = None;
-                recipients.clear();
+                state.from = None;
+                state.recipients.clear();
             }
 
             Command::Rset => {
-                from = None;
-                recipients.clear();
-                say(&mut out, "250 2.0.0 reset").await?;
+                state.from = None;
+                state.recipients.clear();
+                say(reader.get_mut(), "250 2.0.0 reset").await?;
             }
 
-            Command::Noop => say(&mut out, "250 2.0.0 ok").await?,
+            Command::Noop => say(reader.get_mut(), "250 2.0.0 ok").await?,
 
             Command::Quit => {
-                say(&mut out, &format!("221 2.0.0 {} closing", config.hostname)).await?;
-                outcome.quit = true;
-                return Ok(outcome);
+                say(
+                    reader.get_mut(),
+                    &format!("221 2.0.0 {} closing", config.hostname),
+                )
+                .await?;
+                state.outcome.quit = true;
+                return Ok(Step::Done);
             }
 
             // An alias table is not a directory for strangers to read, so the
             // answer is the same whether the address exists or not.
-            Command::Vrfy => say(&mut out, "252 2.5.2 cannot verify, will try to deliver").await?,
+            Command::Vrfy => {
+                say(
+                    reader.get_mut(),
+                    "252 2.5.2 cannot verify, will try to deliver",
+                )
+                .await?
+            }
 
-            Command::Help => say(&mut out, "214 2.0.0 https://github.com/metronom72/mxhop").await?,
+            Command::Help => {
+                say(
+                    reader.get_mut(),
+                    "214 2.0.0 https://github.com/metronom72/mxhop",
+                )
+                .await?
+            }
 
             Command::Unknown(_) => {
-                say(&mut out, "500 5.5.2 command not recognised").await?;
-                errors += 1;
-                if errors >= config.max_errors {
-                    say(&mut out, "421 4.7.0 too many errors, goodbye").await?;
-                    return Ok(outcome);
+                say(reader.get_mut(), "500 5.5.2 command not recognised").await?;
+                if too_many_errors(reader, state, config).await? {
+                    return Ok(Step::Done);
                 }
             }
         }
     }
+}
+
+/// Counts one refusal and says goodbye if the client has made too many.
+/// `true` means the session is over.
+async fn too_many_errors<S>(
+    reader: &mut BufReader<S>,
+    state: &mut State,
+    config: &SessionConfig,
+) -> Result<bool, WireError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    state.errors += 1;
+    if state.errors >= config.max_errors {
+        say(reader.get_mut(), "421 4.7.0 too many errors, goodbye").await?;
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 /// The reply for one `RCPT TO`, and the recipient added to the envelope if it
@@ -377,6 +573,7 @@ mod tests {
             max_errors: 4,
             command_timeout: Duration::from_secs(10),
             data_timeout: Duration::from_secs(10),
+            handshake_timeout: Duration::from_secs(10),
         };
 
         let (mut client, server) = duplex(256 * 1024);
@@ -388,6 +585,7 @@ mod tests {
                 &config,
                 &test_router(),
                 &spool_for_task,
+                None,
             )
             .await
         });
@@ -439,11 +637,6 @@ mod tests {
         assert!(
             !t.out.contains("SMTPUTF8"),
             "offering it would mean promising to carry addresses we refuse: {}",
-            t.out
-        );
-        assert!(
-            !t.out.contains("STARTTLS"),
-            "not until it is actually implemented: {}",
             t.out
         );
     }
@@ -633,9 +826,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn starttls_is_refused_for_now_rather_than_pretended() {
+    async fn starttls_without_a_certificate_is_refused_as_not_offered() {
         let t = talk("EHLO x.test\r\nSTARTTLS\r\nQUIT\r\n").await;
-        assert_eq!(t.codes(), vec!["220", "250", "500", "221"]);
+
+        assert_eq!(t.codes(), vec!["220", "250", "502", "221"]);
+        assert!(
+            t.out.contains("502 5.5.1 STARTTLS is not offered here"),
+            "a client that asks for something not advertised gets told, not hung up on: {}",
+            t.out
+        );
     }
 
     #[tokio::test]
@@ -725,6 +924,7 @@ mod tests {
             max_errors: 4,
             command_timeout: Duration::from_millis(50),
             data_timeout: Duration::from_millis(50),
+            handshake_timeout: Duration::from_millis(50),
         };
 
         let (mut client, server) = duplex(4096);
@@ -735,6 +935,7 @@ mod tests {
                 &config,
                 &test_router(),
                 &spool,
+                None,
             )
             .await
         });
@@ -770,5 +971,390 @@ mod tests {
                 .is_none(),
             "and nothing in tmp either"
         );
+    }
+
+    // --------------------------------------------------------------- STARTTLS
+
+    use crate::config::TlsPaths;
+    use crate::tls::{Holder, testing};
+    use rustls_pki_types::pem::PemObject;
+    use std::sync::Arc;
+    use tokio::io::{AsyncBufReadExt, DuplexStream};
+    use tokio_rustls::TlsConnector;
+    use tokio_rustls::rustls::{self, ClientConfig};
+
+    /// A server-side acceptor for a freshly generated certificate, together
+    /// with the leaf DER, so a test can say *which* certificate was served.
+    fn acceptor(common_name: &str) -> (tokio_rustls::TlsAcceptor, Vec<u8>) {
+        let dir = testing::scratch("session-tls");
+        let (crt, key) = testing::write(&dir, "mx", common_name);
+        let der = rustls_pki_types::CertificateDer::from_pem_file(&crt)
+            .expect("read the leaf back")
+            .as_ref()
+            .to_vec();
+        let holder = Holder::open(TlsPaths {
+            certificate: crt,
+            key,
+            line: None,
+        })
+        .expect("a generated pair loads");
+        (holder.acceptor(), der)
+    }
+
+    /// These tests are about mxhop's side of the handshake, not about PKI, so
+    /// the client checks nothing. The boilerplate buys one thing:
+    /// `peer_certificates()`, which is how a test proves which certificate
+    /// came out of the holder.
+    #[derive(Debug)]
+    struct AcceptAnything(Arc<rustls::crypto::CryptoProvider>);
+
+    impl rustls::client::danger::ServerCertVerifier for AcceptAnything {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &rustls_pki_types::CertificateDer<'_>,
+            _intermediates: &[rustls_pki_types::CertificateDer<'_>],
+            _server_name: &rustls_pki_types::ServerName<'_>,
+            _ocsp: &[u8],
+            _now: rustls_pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &rustls_pki_types::CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls12_signature(
+                message,
+                cert,
+                dss,
+                &self.0.signature_verification_algorithms,
+            )
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &rustls_pki_types::CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls13_signature(
+                message,
+                cert,
+                dss,
+                &self.0.signature_verification_algorithms,
+            )
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            self.0.signature_verification_algorithms.supported_schemes()
+        }
+    }
+
+    fn connector() -> TlsConnector {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let config = ClientConfig::builder_with_provider(Arc::clone(&provider))
+            .with_safe_default_protocol_versions()
+            .expect("the default versions")
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAnything(provider)))
+            .with_no_client_auth();
+        TlsConnector::from(Arc::new(config))
+    }
+
+    /// The client's side of a session: whole replies in, commands out.
+    struct Peer<S> {
+        io: BufReader<S>,
+    }
+
+    impl<S: AsyncRead + AsyncWrite + Unpin> Peer<S> {
+        fn new(io: S) -> Self {
+            Self {
+                io: BufReader::new(io),
+            }
+        }
+
+        /// One reply, continuation lines included.
+        async fn reply(&mut self) -> String {
+            let mut whole = String::new();
+            loop {
+                let mut line = String::new();
+                if self.io.read_line(&mut line).await.expect("read a reply") == 0 {
+                    break;
+                }
+                let continues = line.as_bytes().get(3) == Some(&b'-');
+                whole.push_str(&line);
+                if !continues {
+                    break;
+                }
+            }
+            whole
+        }
+
+        async fn send(&mut self, text: &str) {
+            let io = self.io.get_mut();
+            io.write_all(text.as_bytes()).await.expect("write");
+            io.flush().await.expect("flush");
+        }
+
+        /// Whatever is left once the server is finished.
+        async fn rest(&mut self) -> String {
+            let mut rest = String::new();
+            self.io.read_to_string(&mut rest).await.expect("read rest");
+            rest
+        }
+    }
+
+    struct Served {
+        spool: Spool,
+        task: tokio::task::JoinHandle<Result<Outcome, WireError>>,
+    }
+
+    async fn serve_with_tls(common_name: &str) -> (Peer<DuplexStream>, Served, Vec<u8>) {
+        let (acceptor, der) = acceptor(common_name);
+        let root = scratch("session-tls");
+        let spool = Spool::open(&root).await.unwrap();
+        let config = SessionConfig {
+            hostname: "mx.test".into(),
+            max_message_bytes: 26_214_400,
+            max_recipients: 3,
+            max_errors: 4,
+            command_timeout: Duration::from_secs(10),
+            data_timeout: Duration::from_secs(10),
+            handshake_timeout: Duration::from_millis(200),
+        };
+
+        let (client, server) = duplex(256 * 1024);
+        let spool_for_task = spool.clone();
+        let task = tokio::spawn(async move {
+            serve(
+                server,
+                "198.51.100.7:40000".to_string(),
+                &config,
+                &test_router(),
+                &spool_for_task,
+                Some(acceptor),
+            )
+            .await
+        });
+
+        (Peer::new(client), Served { spool, task }, der)
+    }
+
+    async fn upgrade(
+        client: Peer<DuplexStream>,
+        expected_leaf: &[u8],
+    ) -> Peer<impl AsyncRead + AsyncWrite + Unpin> {
+        assert!(
+            client.io.buffer().is_empty(),
+            "the test client must not swallow bytes meant for the tunnel"
+        );
+        let name = rustls_pki_types::ServerName::try_from("mx.test").unwrap();
+        let stream = connector()
+            .connect(name, client.io.into_inner())
+            .await
+            .expect("the handshake should succeed");
+
+        let served = stream
+            .get_ref()
+            .1
+            .peer_certificates()
+            .expect("the server sent a certificate")[0]
+            .as_ref()
+            .to_vec();
+        assert_eq!(
+            served, expected_leaf,
+            "the certificate must be the one the holder loaded"
+        );
+
+        Peer::new(stream)
+    }
+
+    #[tokio::test]
+    async fn ehlo_offers_starttls_only_with_a_certificate() {
+        let plain = talk("EHLO x.test\r\nQUIT\r\n").await;
+        assert!(
+            !plain.out.contains("STARTTLS"),
+            "nothing is advertised that is not configured: {}",
+            plain.out
+        );
+
+        let (mut client, served, _) = serve_with_tls("mx.test").await;
+        client.reply().await;
+        client.send("EHLO x.test\r\n").await;
+        let greeting = client.reply().await;
+        client.send("QUIT\r\n").await;
+        client.reply().await;
+        served.task.await.unwrap().unwrap();
+
+        assert!(greeting.contains("250-STARTTLS"), "{greeting}");
+    }
+
+    /// An implementation that requires TLS loses mail: this is an MX, and a
+    /// sender that offers no TLS still has to be able to deliver.
+    #[tokio::test]
+    async fn plaintext_delivery_still_works_when_tls_is_configured() {
+        let (mut client, served, _) = serve_with_tls("mx.test").await;
+        client.reply().await;
+        client.send(DELIVER).await;
+        let rest = client.rest().await;
+        let outcome = served.task.await.unwrap().unwrap();
+
+        assert_eq!(outcome.accepted, 1, "{rest}");
+        assert!(!outcome.tls);
+        assert_eq!(served.spool.queued().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_message_is_delivered_inside_the_tunnel() {
+        let (mut client, served, der) = serve_with_tls("mx.test").await;
+        client.reply().await;
+        client.send("EHLO x.test\r\n").await;
+        client.reply().await;
+        client.send("STARTTLS\r\n").await;
+        assert!(client.reply().await.starts_with("220 2.0.0"));
+
+        let mut inside = upgrade(client, &der).await;
+        inside.send(DELIVER).await;
+        let rest = inside.rest().await;
+        let outcome = served.task.await.unwrap().unwrap();
+
+        assert_eq!(outcome.accepted, 1, "{rest}");
+        assert!(
+            outcome.tls,
+            "the log line has to say the session was encrypted"
+        );
+        assert_eq!(served.spool.queued().await.unwrap().len(), 1);
+    }
+
+    /// RFC 3207 §4.2. If this is forgotten, an EHLO or MAIL an attacker
+    /// injected before the handshake is honoured inside the tunnel, and the
+    /// spooled envelope's `helo` claims an identity nobody authenticated.
+    #[tokio::test]
+    async fn the_handshake_discards_helo_and_envelope() {
+        let (mut client, served, der) = serve_with_tls("mx.test").await;
+        client.reply().await;
+        client.send("EHLO before.test\r\n").await;
+        client.reply().await;
+        client.send("MAIL FROM:<a@b.test>\r\n").await;
+        client.reply().await;
+        client.send("STARTTLS\r\n").await;
+        client.reply().await;
+
+        let mut inside = upgrade(client, &der).await;
+        inside.send("MAIL FROM:<a@b.test>\r\n").await;
+        let answer = inside.reply().await;
+        inside.send("QUIT\r\n").await;
+        inside.reply().await;
+        served.task.await.unwrap().unwrap();
+
+        assert!(
+            answer.starts_with("503"),
+            "the greeting went with everything else: {answer}"
+        );
+    }
+
+    #[tokio::test]
+    async fn after_the_handshake_ehlo_no_longer_offers_starttls() {
+        let (mut client, served, der) = serve_with_tls("mx.test").await;
+        client.reply().await;
+        client.send("STARTTLS\r\n").await;
+        client.reply().await;
+
+        let mut inside = upgrade(client, &der).await;
+        inside.send("EHLO x.test\r\n").await;
+        let greeting = inside.reply().await;
+        inside.send("QUIT\r\n").await;
+        inside.reply().await;
+        served.task.await.unwrap().unwrap();
+
+        assert!(
+            !greeting.contains("STARTTLS"),
+            "RFC 3207 §4.2 forbids re-offering it: {greeting}"
+        );
+    }
+
+    #[tokio::test]
+    async fn starttls_twice_is_refused() {
+        let (mut client, served, der) = serve_with_tls("mx.test").await;
+        client.reply().await;
+        client.send("STARTTLS\r\n").await;
+        client.reply().await;
+
+        let mut inside = upgrade(client, &der).await;
+        inside.send("STARTTLS\r\n").await;
+        let answer = inside.reply().await;
+        inside.send("QUIT\r\n").await;
+        inside.reply().await;
+        served.task.await.unwrap().unwrap();
+
+        assert!(answer.starts_with("503 5.5.1"), "{answer}");
+    }
+
+    /// CVE-2011-0411. Bytes pipelined behind STARTTLS belong to the plaintext
+    /// conversation; replaying them inside the tunnel would let anyone on the
+    /// path inject commands the client believes it sent encrypted.
+    #[tokio::test]
+    async fn commands_pipelined_behind_starttls_are_not_replayed() {
+        let (mut client, served, _) = serve_with_tls("mx.test").await;
+        client.reply().await;
+        client
+            .send("EHLO x.test\r\nSTARTTLS\r\nMAIL FROM:<attacker@evil.test>\r\n")
+            .await;
+        client.reply().await; // the EHLO
+        let answer = client.reply().await;
+        let rest = client.rest().await;
+        let outcome = served.task.await.unwrap().unwrap();
+
+        assert!(
+            answer.starts_with("554 5.5.1"),
+            "the injected line ends the session rather than riding into the tunnel: {answer}"
+        );
+        assert!(
+            !answer.contains("220") && !rest.contains("220"),
+            "and no handshake may begin: {answer}{rest}"
+        );
+        assert_eq!(outcome.accepted, 0);
+        assert!(!outcome.tls);
+    }
+
+    #[tokio::test]
+    async fn a_failed_handshake_ends_the_session_quietly() {
+        let (mut client, served, _) = serve_with_tls("mx.test").await;
+        client.reply().await;
+        client.send("STARTTLS\r\n").await;
+        assert!(client.reply().await.starts_with("220"));
+
+        // Not a TLS ClientHello. Scanners do this all day, and it is not a
+        // session failure.
+        client.send("GET / HTTP/1.1\r\n\r\n").await;
+        let rest = client.rest().await;
+        let outcome = served.task.await.unwrap().expect("not a session failure");
+
+        assert!(
+            !rest.contains("500") && !rest.contains("421"),
+            "a broken handshake admits no SMTP reply: {rest:?}"
+        );
+        assert!(!outcome.tls);
+        assert!(!outcome.quit);
+    }
+
+    #[tokio::test]
+    async fn a_client_that_stalls_in_the_handshake_is_dropped() {
+        let (mut client, served, _) = serve_with_tls("mx.test").await;
+        client.reply().await;
+        client.send("STARTTLS\r\n").await;
+        client.reply().await;
+
+        // Says nothing at all: only the handshake timeout can end this.
+        let outcome = timeout(Duration::from_secs(5), served.task)
+            .await
+            .expect("a stalled handshake must not hold the task open")
+            .unwrap()
+            .unwrap();
+
+        assert!(!outcome.tls);
     }
 }

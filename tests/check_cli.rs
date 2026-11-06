@@ -83,3 +83,38 @@ fn a_missing_file_is_reported_as_such() {
         "the path has to be in the message: {stderr}"
     );
 }
+
+/// Without a `[tls]` block mxhop speaks plaintext only, and the ok line has to
+/// say so: an operator who thinks TLS is on and is wrong finds out from
+/// somebody else's deferral log.
+#[test]
+fn check_says_whether_there_is_a_certificate() {
+    let path = write_config("no-tls.toml", GOOD);
+    let out = run_check(&path);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    assert!(stdout.contains("no TLS"), "{stdout}");
+}
+
+/// `check` answers "would `run` start?", and `run` refuses to start on a
+/// certificate it cannot read. A `check` that only looked at the paths would
+/// pass a configuration that then fails to boot.
+#[test]
+fn check_reads_the_certificate_and_fails_at_the_tls_line() {
+    let body = format!(
+        "{GOOD}\n[tls]\ncertificate = \"/nonexistent/mx.crt\"\nkey = \"/nonexistent/mx.key\"\n"
+    );
+    let path = write_config("broken-tls.toml", &body);
+    let out = run_check(&path);
+
+    assert!(
+        !out.status.success(),
+        "a certificate that is not there must not pass check"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("/nonexistent/mx.crt"), "{stderr}");
+    assert!(
+        stderr.contains(":9:"),
+        "reported at the [tls] line, which is where the fix is typed: {stderr}"
+    );
+}
