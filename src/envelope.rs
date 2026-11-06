@@ -25,6 +25,18 @@ pub struct Envelope {
     pub received_at_unix_ms: u64,
     /// The size of the stored message in bytes.
     pub size: u64,
+    /// The `Received` header mxhop built for this hop, which is prepended on
+    /// the wire and never stored in the message file. A held copy has to be
+    /// retried with the identical bytes — a second attempt that re-derives
+    /// the header would claim a time the message did not arrive at, and a
+    /// different trace would break the only thread an operator can follow
+    /// through two logs.
+    #[serde(default)]
+    pub received: String,
+    /// What the destination last said about this message, for the operator
+    /// reading `queue/`. Not acted on: there is no retry queue yet.
+    #[serde(default)]
+    pub last_reply: Option<String>,
 }
 
 impl Envelope {
@@ -53,6 +65,8 @@ mod tests {
             peer: "198.51.100.7:40000".into(),
             received_at_unix_ms: 1_762_400_000_000,
             size: 42,
+            received: "Received: from mail.elsewhere.test\r\n".into(),
+            last_reply: None,
         }
     }
 

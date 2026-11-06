@@ -144,6 +144,8 @@ mod tests {
             peer: "198.51.100.7:40000".into(),
             received_at_unix_ms: crate::envelope::now_unix_ms(),
             size: body_len,
+            received: String::new(),
+            last_reply: None,
         }
     }
 

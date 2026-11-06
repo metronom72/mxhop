@@ -382,6 +382,8 @@ where
                     peer: peer.to_string(),
                     received_at_unix_ms: now_unix_ms(),
                     size: body.len() as u64,
+                    received: String::new(),
+                    last_reply: None,
                 };
 
                 match spool.store(&envelope, &body).await {
