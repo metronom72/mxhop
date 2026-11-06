@@ -63,6 +63,15 @@ pub struct Delivery {
     pub body: Arc<[u8]>,
     /// Whether the message carries bytes with the high bit set.
     pub eight_bit: bool,
+    /// When this message's whole delivery has to be over, shared by every
+    /// destination group of one inbound message. `None` means "start one from
+    /// `Budget::overall` now", which is right for a single delivery and wrong
+    /// for a group of them.
+    ///
+    /// It lives on the delivery rather than in [`Outbound`] because
+    /// [`Outbound`] is configuration, shared by every message and every
+    /// connection, and this is one message's clock.
+    pub deadline: Option<Instant>,
 }
 
 impl Delivery {
@@ -76,7 +85,19 @@ impl Delivery {
             head,
             body,
             eight_bit,
+            deadline: None,
         }
+    }
+
+    /// The same delivery, due by a deadline the caller already holds.
+    ///
+    /// The caller is the inbound session, which delivers one message's
+    /// destination groups one after another: it sets this once so that the
+    /// groups divide one budget instead of each starting a fresh one.
+    #[must_use]
+    pub fn due_by(mut self, deadline: Instant) -> Self {
+        self.deadline = Some(deadline);
+        self
     }
 
     /// What `SIZE` is compared against: the bytes that will be written,
@@ -392,7 +413,13 @@ where
     R: Resolve,
     C: Connect,
 {
-    let deadline = Instant::now() + out.budget.overall;
+    // The caller's deadline when it has one: one inbound message's groups are
+    // delivered in turn and share the sender's patience, so each one taking a
+    // whole `Budget::overall` would multiply it by the number of destination
+    // domains.
+    let deadline = delivery
+        .deadline
+        .unwrap_or_else(|| Instant::now() + out.budget.overall);
 
     let Some(domain) = delivery.domain() else {
         return Outcome {
@@ -2358,6 +2385,7 @@ mod tests {
             data_timeout: Duration::from_secs(5),
             handshake_timeout: Duration::from_secs(5),
             ptr_timeout: Duration::from_secs(5),
+            relay_budget: crate::smtp::session::RELAY_BUDGET,
             limits: crate::policy::Limits::default(),
         };
 

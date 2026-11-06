@@ -53,6 +53,17 @@ pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 /// on it, so a slow resolver must cost the message almost nothing.
 pub const PTR_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How long everything after the final dot may take: the reverse lookup, and
+/// every destination group's delivery together.
+///
+/// Five minutes, not the delivery side's own 180 s per domain. The sending
+/// server is holding its connection open for all of this, and Postfix gives
+/// up on an unanswered final dot after ten minutes
+/// (`smtp_data_done_timeout`) and resends — so the ceiling has to be
+/// comfortably under that however many destination domains one alias fans
+/// out to, or the domains that already accepted get a second copy.
+pub const RELAY_BUDGET: Duration = Duration::from_secs(300);
+
 /// What the session needs to know about itself.
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
@@ -64,6 +75,9 @@ pub struct SessionConfig {
     pub data_timeout: Duration,
     pub handshake_timeout: Duration,
     pub ptr_timeout: Duration,
+    /// Everything after the final dot, shared by every destination group of
+    /// one message. See [`RELAY_BUDGET`].
+    pub relay_budget: Duration,
     /// What counts as a loop. See [`crate::policy::Limits`].
     pub limits: Limits,
 }
@@ -79,6 +93,7 @@ impl SessionConfig {
             data_timeout: DATA_TIMEOUT,
             handshake_timeout: HANDSHAKE_TIMEOUT,
             ptr_timeout: PTR_TIMEOUT,
+            relay_budget: RELAY_BUDGET,
             limits: Limits::default(),
         }
     }
@@ -562,6 +577,26 @@ where
     // being copied, which for a 25 MiB message to three domains is the
     // difference between one copy and four.
     let body: std::sync::Arc<[u8]> = body.into();
+
+    // One deadline for the whole message, not one per destination domain.
+    //
+    // The groups are delivered in turn, so a per-group budget multiplies:
+    // four destination domains at `Budget::overall` each is up to twelve
+    // minutes, while Postfix abandons an unanswered final dot after ten
+    // (`smtp_data_done_timeout`) and resends — and every domain that had
+    // already accepted gets a second copy. A duplicate produced by nothing
+    // but arithmetic is the worst kind.
+    //
+    // The alternative was to cap the destination domains per alias in
+    // `config::check`. Rejected: it refuses a configuration that is not
+    // wrong — an alias fanning out to five people is an ordinary thing to
+    // want — and it would still be wrong for one slow domain, since the cap
+    // bounds the count and not the time. Sharing the clock bounds the thing
+    // that actually has to be bounded, and costs the last group its chance
+    // when the earlier ones were slow, which is the right trade: a deferral
+    // is retried, a duplicate is not undone.
+    let deadline = std::time::Instant::now() + config.relay_budget;
+
     let mut outcomes = Vec::with_capacity(plan.groups.len());
     for group in &plan.groups {
         // Sequentially, on purpose. The inbound sender is waiting, but three
@@ -569,12 +604,15 @@ where
         // inbound session, which is how a forwarder becomes an amplifier.
         outcomes.push(
             relay
-                .deliver(Delivery::new(
-                    plan.sender.clone(),
-                    group.recipients.clone(),
-                    received.clone().into_bytes(),
-                    std::sync::Arc::clone(&body),
-                ))
+                .deliver(
+                    Delivery::new(
+                        plan.sender.clone(),
+                        group.recipients.clone(),
+                        received.clone().into_bytes(),
+                        std::sync::Arc::clone(&body),
+                    )
+                    .due_by(deadline),
+                )
                 .await,
         );
     }
@@ -876,6 +914,7 @@ mod tests {
             data_timeout: Duration::from_secs(10),
             handshake_timeout: Duration::from_secs(10),
             ptr_timeout: Duration::from_secs(10),
+            relay_budget: RELAY_BUDGET,
             limits: Limits::default(),
         };
 
@@ -1392,6 +1431,35 @@ mod tests {
         );
     }
 
+    /// Every destination group shares one deadline, because the inbound
+    /// sender's patience is one thing and not one thing per domain.
+    ///
+    /// The groups are delivered one after another, so a per-group budget
+    /// multiplies: four destination domains at 180 s each is up to twelve
+    /// minutes, and Postfix gives up on an unanswered final dot after ten
+    /// (`smtp_data_done_timeout`) and **resends**. The domains that already
+    /// accepted then get a second copy — a duplicate caused by nothing but
+    /// arithmetic.
+    #[tokio::test]
+    async fn every_destination_group_shares_one_deadline() {
+        let script = "EHLO x.test\r\nMAIL FROM:<a@b.test>\r\nRCPT TO:<team@example.com>\r\n\
+                      DATA\r\nbody\r\n.\r\nQUIT\r\n";
+        let t = talk_with(Fake::accepting(), 26_214_400, script).await;
+
+        let deadlines: Vec<_> = t
+            .relay
+            .deliveries()
+            .iter()
+            .map(|d| d.deadline.expect("a deadline set by the session"))
+            .collect();
+
+        assert_eq!(deadlines.len(), 2, "two destination domains");
+        assert_eq!(
+            deadlines[0], deadlines[1],
+            "one deadline for the whole message, not one per domain"
+        );
+    }
+
     /// One alias leading to two destinations is two connections, and each
     /// one carries only its own recipient: an envelope that named the other
     /// would tell each destination where else the alias forwards.
@@ -1563,6 +1631,7 @@ mod tests {
             data_timeout: Duration::from_millis(50),
             handshake_timeout: Duration::from_millis(50),
             ptr_timeout: Duration::from_secs(10),
+            relay_budget: RELAY_BUDGET,
             limits: Limits::default(),
         };
 
@@ -1797,6 +1866,7 @@ mod tests {
             data_timeout: Duration::from_secs(10),
             handshake_timeout: Duration::from_millis(200),
             ptr_timeout: Duration::from_secs(10),
+            relay_budget: RELAY_BUDGET,
             limits: Limits::default(),
         };
 
