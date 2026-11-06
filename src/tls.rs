@@ -33,12 +33,30 @@ pub enum TlsError {
 impl fmt::Display for TlsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            TlsError::Unreadable { path, source } => write!(
-                f,
-                "{} cannot be read: {source} — point it at the PEM Caddy or certbot writes, \
-                 and give the mxhop user read access",
-                path.display()
-            ),
+            TlsError::Unreadable { path, source } => {
+                write!(
+                    f,
+                    "{} cannot be read: {source} — point it at the PEM Caddy or certbot writes, \
+                     and give the mxhop user read access",
+                    path.display()
+                )?;
+                // A 0600 key owned by Caddy reads fine for root and for
+                // nobody else, so the same file produces a passing `check`
+                // run by an admin and a failing `run` as the service user —
+                // or the opposite, this refusal, while the service user's
+                // access is already correct. Either way the user that did the
+                // reading has to be in the sentence, otherwise the operator
+                // goes off to fix permissions that were never broken.
+                if source.kind() == io::ErrorKind::PermissionDenied {
+                    write!(
+                        f,
+                        " — this ran as {}, which says nothing about the user the service runs \
+                         as: `sudo -u mxhop mxhop check` reads the files the way `run` will",
+                        current_user()
+                    )?;
+                }
+                Ok(())
+            }
             TlsError::NoCertificate(path) => write!(
                 f,
                 "{} contains no \"-----BEGIN CERTIFICATE-----\" block — Caddy writes the \
@@ -54,8 +72,9 @@ impl fmt::Display for TlsError {
             TlsError::Mismatch { certificate, key } => write!(
                 f,
                 "the key in {} does not belong to the certificate in {} — if Caddy or certbot \
-                 has just renewed, one file is new and the other is not yet; reload again in \
-                 a moment",
+                 has just renewed, one file is new and the other is not yet: a reload a moment \
+                 later picks up the finished pair, while at startup nothing is retrying, so \
+                 the two files have to be made to match before mxhop will start",
                 key.display(),
                 certificate.display()
             ),
@@ -122,6 +141,19 @@ impl Holder {
     pub fn paths(&self) -> &TlsPaths {
         &self.paths
     }
+}
+
+/// The user this process is running as, as a shell prompt would show it.
+///
+/// Read from the environment rather than from the system's user database:
+/// mxhop has no C dependency for `getpwuid` and does not want one for a line
+/// of prose. `sudo -u` sets `USER`, which is the case this exists for; a unit
+/// file that scrubs the environment leaves it unknown, and an unknown user is
+/// still better than implying the wrong one.
+pub fn current_user() -> String {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_else(|_| "an unnamed user".to_string())
 }
 
 fn build(paths: &TlsPaths) -> Result<(Arc<ServerConfig>, Fingerprint), TlsError> {
@@ -295,6 +327,49 @@ mod tests {
         let dir = scratch("tls-provider");
         let (crt, key) = write(&dir, "mx", "mx.test");
         Holder::open(paths(crt, key)).expect("the provider is named, not looked up");
+    }
+
+    /// The message an admin gets when `[tls]` points at Caddy's 0600 key.
+    /// Without the user in it, "give the mxhop user read access" sends them
+    /// to fix permissions that may already be right, while the real
+    /// difference is which user is doing the reading.
+    #[test]
+    fn a_file_that_cannot_be_opened_says_which_user_could_not_open_it() {
+        let dir = scratch("tls-permission");
+        let (crt, key) = write(&dir, "mx", "mx.test");
+        std::fs::set_permissions(&crt, std::os::unix::fs::PermissionsExt::from_mode(0o000))
+            .expect("drop the mode");
+
+        // root reads it anyway, and then there is nothing to assert.
+        if std::fs::File::open(&crt).is_ok() {
+            return;
+        }
+
+        let e = Holder::open(paths(crt, key)).expect_err("0000 is not readable");
+        let said = e.to_string();
+
+        assert!(said.contains(&current_user()), "{said}");
+        assert!(
+            said.contains("sudo -u mxhop mxhop check"),
+            "it has to name the command that reads the files as `run` will: {said}"
+        );
+    }
+
+    /// The same text is printed at startup, where no reload is coming, and on
+    /// SIGHUP, where one might. "reload again in a moment" alone is advice
+    /// that does nothing for the startup case.
+    #[test]
+    fn the_mismatch_message_reads_at_startup_as_well_as_on_reload() {
+        let dir = scratch("tls-mismatch-wording");
+        let (crt, _) = write(&dir, "one", "one.test");
+        let (_, key) = write(&dir, "two", "two.test");
+
+        let said = Holder::open(paths(crt, key))
+            .expect_err("the key belongs to the other one")
+            .to_string();
+
+        assert!(said.contains("reload"), "{said}");
+        assert!(said.contains("startup"), "{said}");
     }
 
     /// A Caddy renewal that is half-finished leaves a new certificate beside
