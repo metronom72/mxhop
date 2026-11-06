@@ -118,3 +118,40 @@ fn check_reads_the_certificate_and_fails_at_the_tls_line() {
         "reported at the [tls] line, which is where the fix is typed: {stderr}"
     );
 }
+
+/// A certificate the admin can read and the service user may not is the
+/// ordinary case — Caddy writes the key 0600 — so the ok line has to say
+/// whose permissions were used. Without it, "ok" reads as a promise about the
+/// service user that `check` never made.
+#[test]
+fn the_ok_line_names_the_user_that_read_the_certificate() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("check_cli");
+    fs::create_dir_all(&dir).expect("temp dir");
+    let generated = rcgen::generate_simple_self_signed(["mx.example.com".to_string()])
+        .expect("generate a certificate");
+    let crt = dir.join("ok-line.crt");
+    let key = dir.join("ok-line.key");
+    fs::write(&crt, generated.cert.pem()).expect("write certificate");
+    fs::write(&key, generated.signing_key.serialize_pem()).expect("write key");
+
+    let body = format!(
+        "{GOOD}\n[tls]\ncertificate = {:?}\nkey = {:?}\n",
+        crt.display().to_string(),
+        key.display().to_string()
+    );
+    let path = write_config("ok-tls.toml", &body);
+    let out = run_check(&path);
+
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let user = std::env::var("USER").unwrap_or_default();
+    assert!(!user.is_empty(), "this test needs USER to be set");
+    assert!(
+        stdout.contains(&user),
+        "the ok line has to say which user read the files: {stdout}"
+    );
+}

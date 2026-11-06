@@ -160,6 +160,13 @@ where
     // replaying the bytes inside the tunnel is the vulnerability, and so is
     // running them before it.
     if !reader.buffer().is_empty() {
+        // Worth a line: this is somebody trying the CVE on a live MX, and
+        // without it the attempt is invisible — the session simply ends, and
+        // the operator has no way to see it happening.
+        info!(
+            %peer,
+            "commands were pipelined behind STARTTLS; refusing rather than upgrading"
+        );
         say(
             reader.get_mut(),
             "554 5.5.1 commands sent before the TLS handshake are not accepted",
@@ -1104,6 +1111,38 @@ mod tests {
         }
     }
 
+    /// Collects log output so a test can assert a line was written.
+    /// `#[tokio::test]` builds a current-thread runtime, so the session task
+    /// spawned inside the test body is polled on this same thread and sees
+    /// the subscriber `set_default` installed here.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl Captured {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().expect("captured logs")).into_owned()
+        }
+    }
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("captured logs").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for Captured {
+        type Writer = Self;
+
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
     fn connector() -> TlsConnector {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let config = ClientConfig::builder_with_provider(Arc::clone(&provider))
@@ -1371,6 +1410,17 @@ mod tests {
         assert!(!outcome.tls);
     }
 
+    /// Looks like an SMTP reply: three digits and a space or a hyphen. Used
+    /// to assert the *absence* of any reply, which naming two codes cannot
+    /// do — a stray `say("554 …")` on a path that must stay silent would slip
+    /// past a test that only looks for `500` and `421`.
+    fn is_reply_line(line: &str) -> bool {
+        let bytes = line.as_bytes();
+        bytes.len() >= 4
+            && bytes[..3].iter().all(u8::is_ascii_digit)
+            && (bytes[3] == b' ' || bytes[3] == b'-')
+    }
+
     #[tokio::test]
     async fn a_failed_handshake_ends_the_session_quietly() {
         let (mut client, served, _) = serve_with_tls("mx.test").await;
@@ -1378,18 +1428,63 @@ mod tests {
         client.send("STARTTLS\r\n").await;
         assert!(client.reply().await.starts_with("220"));
 
-        // Not a TLS ClientHello. Scanners do this all day, and it is not a
-        // session failure.
-        client.send("GET / HTTP/1.1\r\n\r\n").await;
+        // Not a TLS ClientHello but a whole plaintext SMTP transaction: the
+        // case of an attacker's commands arriving *after* the go-ahead.
+        // Scanners send nonsense here all day and that is not a session
+        // failure; what must never happen is mxhop answering in the clear, or
+        // spooling a message, on a connection it has already promised to
+        // encrypt.
+        client.send(DELIVER).await;
         let rest = client.rest().await;
         let outcome = served.task.await.unwrap().expect("not a session failure");
 
+        let replied: Vec<&str> = rest.lines().filter(|line| is_reply_line(line)).collect();
         assert!(
-            !rest.contains("500") && !rest.contains("421"),
-            "a broken handshake admits no SMTP reply: {rest:?}"
+            replied.is_empty(),
+            "a broken handshake admits no SMTP reply at all — there is no agreed encoding \
+             left to send one in: {replied:?} in {rest:?}"
         );
+        assert_eq!(
+            served.spool.queued().await.unwrap().len(),
+            0,
+            "and nothing sent after the go-ahead may reach the queue"
+        );
+        assert_eq!(outcome.accepted, 0);
         assert!(!outcome.tls);
         assert!(!outcome.quit);
+    }
+
+    /// The reply alone leaves no trace: an operator watching an MX being
+    /// probed for CVE-2011-0411 sees a session that simply ended.
+    #[tokio::test]
+    async fn an_injection_behind_starttls_is_logged_with_the_peer() {
+        let logs = Captured::default();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(logs.clone())
+                .with_max_level(tracing::Level::INFO)
+                .finish(),
+        );
+
+        let (mut client, served, _) = serve_with_tls("mx.test").await;
+        client.reply().await;
+        client
+            .send("EHLO x.test\r\nSTARTTLS\r\nMAIL FROM:<attacker@evil.test>\r\n")
+            .await;
+        client.reply().await; // the EHLO
+        client.reply().await; // the refusal
+        client.rest().await;
+        served.task.await.unwrap().unwrap();
+
+        let written = logs.text();
+        assert!(
+            written.contains("198.51.100.7"),
+            "the peer is the only part an operator can act on: {written}"
+        );
+        assert!(
+            written.contains("pipelined behind STARTTLS"),
+            "and the line has to say what was attempted: {written}"
+        );
     }
 
     #[tokio::test]

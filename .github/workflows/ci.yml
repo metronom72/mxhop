@@ -29,3 +29,15 @@ jobs:
         run: cargo test --all-targets --all-features
       - name: Release build
         run: cargo build --release
+      # The README promises a static binary that runs on any Linux, and
+      # nothing in the repo built one: a glibc release only proves it runs on
+      # the distribution that built it. `ring` compiles C for the target, so
+      # a musl target that is merely added is not a musl build that links —
+      # the only way to know is to do it on every change, here, where it is
+      # free for a public repository.
+      - name: Static (musl) release build
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          rustup target add x86_64-unknown-linux-musl
+          cargo build --release --target x86_64-unknown-linux-musl

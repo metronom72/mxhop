@@ -38,6 +38,13 @@ max_message_bytes = 26214400
 #
 #     systemctl reload mxhop      # or: kill -HUP $(pidof mxhop)
 #
+# `systemctl reload` only works if the unit has an ExecReload line:
+#
+#     ExecReload=/bin/kill -HUP $MAINPID
+#
+# Without it systemd refuses with "job type reload is not applicable", and the
+# renewed certificate sits on disk unread until the next restart.
+#
 # A reload that cannot read the files logs a warning and keeps serving the
 # certificate it already has. Startup is the opposite: a [tls] block whose
 # files are unreadable stops the service, because starting plaintext-only
