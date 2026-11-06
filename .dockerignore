@@ -1,0 +1,9 @@
+# Keep the build context to the sources: target/ is gigabytes and is rebuilt
+# for a different libc anyway, and local runtime state is not input.
+/target
+/.git
+/.github
+/spool
+/deploy
+*.pem
+.env

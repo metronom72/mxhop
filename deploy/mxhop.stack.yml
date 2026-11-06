@@ -1,0 +1,114 @@
+# An example single-node Swarm stack for mxhop. Copy it, edit the paths and
+# the image tag, then:
+#
+#     docker stack config -c deploy/mxhop.stack.yml      # look at it first
+#     docker stack deploy -c deploy/mxhop.stack.yml mxhop
+#
+# See deploy/README.md for what has to exist on the host first.
+version: "3.8"
+
+services:
+  mxhop:
+    # Pin a version. A forwarder that pulls `latest` on every redeploy
+    # changes the mail path without anyone choosing to.
+    image: ghcr.io/metronom72/mxhop:0.1.0
+
+    # Host-mode publishing, not the default ingress mesh. The mesh NATs
+    # incoming connections through an overlay address, so the process would
+    # see every sender as 10.0.x.x: the `Received` header it writes would
+    # name the wrong peer, the logs would be useless for telling a spammer
+    # from a mailing list, and an SPF check (once that lands) would evaluate
+    # the overlay address instead of the sender's. Host mode hands the real
+    # client address to the task.
+    #
+    # The container listens on 2525; 25 is published by the host side, so the
+    # process never needs CAP_NET_BIND_SERVICE and `cap_drop: ALL` can stay.
+    ports:
+      - target: 2525
+        published: 25
+        protocol: tcp
+        mode: host
+
+    volumes:
+      # The spool is a bind mount from a host path, deliberately not a named
+      # volume: `docker system prune --volumes` deletes named volumes, and
+      # this directory holds mail that has been accepted and not yet
+      # delivered — a prune would destroy it, and the sender was already told
+      # the message was taken. A host path is also what lets an operator
+      # `ls` and `cat` the queue without entering the container.
+      # Must be owned by uid 10001 (the image's mxhop user).
+      - type: bind
+        source: /srv/mxhop/spool
+        target: /var/lib/mxhop/spool
+
+      # One TOML file, read-only. It must say listen = "0.0.0.0:2525".
+      - type: bind
+        source: /srv/mxhop/mxhop.toml
+        target: /etc/mxhop/mxhop.toml
+        read_only: true
+
+      # The certificate and key as Caddy or certbot leave them on the host,
+      # read-only: mxhop never writes them, it only rereads them on SIGHUP
+      # after a renewal. The paths inside the container are what the [tls]
+      # table in the config must name.
+      - type: bind
+        source: /var/lib/caddy/certificates/acme-v02.api.letsencrypt.org-directory/mx.example.com
+        target: /etc/mxhop/tls
+        read_only: true
+
+    secrets:
+      # Mounted at /run/secrets/mxhop_srs_secret. Nothing reads it yet — SRS
+      # is not implemented — but this is where the file will be, so the
+      # config can name the path on the day it lands. A Docker secret rather
+      # than an environment variable because the environment of a task is
+      # visible to anything that can run `docker inspect`.
+      - mxhop_srs_secret
+
+    deploy:
+      replicas: 1 # single node, and a host-mode port 25 cannot be shared
+      update_config:
+        # stop-first, not the default start-first. With a host-mode port the
+        # new task cannot bind 25 while the old one still holds it: a
+        # start-first update would loop on "address already in use" and the
+        # rollout would never converge.
+        order: stop-first
+        failure_action: rollback
+      restart_policy:
+        condition: on-failure
+      resources:
+        limits:
+          # A bound on the damage a runaway session can do to the rest of the
+          # node. Generous for a process whose state is a config file and a
+          # directory of files.
+          memory: 256M
+
+    # A session in the middle of DATA needs time to finish. Killed mid-DATA
+    # the sender never gets its 250, so it retries and the recipient may get
+    # the message twice; 60s lets the in-flight messages land instead.
+    stop_grace_period: 60s
+
+    cap_drop:
+      - ALL # nothing privileged is bound inside the container, see ports
+    security_opt:
+      - no-new-privileges:true
+
+    # Only the config check, because that is all the binary can answer today:
+    # there is no health or metrics endpoint yet. It catches a config or
+    # certificate the task can no longer read; it does not prove the listener
+    # is accepting mail.
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/mxhop", "check"]
+      interval: 60s
+      timeout: 10s
+      start_period: 10s
+      retries: 3
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+secrets:
+  mxhop_srs_secret:
+    external: true # created once by hand, see deploy/README.md
