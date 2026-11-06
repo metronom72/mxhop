@@ -134,7 +134,15 @@ fn shuffle<T>(items: &mut [T]) {
     if items.len() < 2 {
         return;
     }
-    let mut state = crate::envelope::now_unix_ms() ^ ((std::process::id() as u64) << 32);
+    // The counter is what makes two calls in the same millisecond differ.
+    // Without it the seed is constant for as long as the clock reads the same,
+    // and every message in a burst picks the same exchanger — which is the
+    // thing the shuffle exists to prevent.
+    static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nth = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut state = crate::envelope::now_unix_ms()
+        ^ ((std::process::id() as u64) << 32)
+        ^ nth.wrapping_mul(0x9e37_79b9_7f4a_7c15);
     for i in (1..items.len()).rev() {
         // xorshift64; good enough to break a tie, and nothing else rests on
         // it.
@@ -355,8 +363,10 @@ mod tests {
             &[(10, "a.example.com"), (10, "b.example.com")],
         );
 
+        // Twenty tries, all inside one millisecond: a seed that only moves
+        // with the clock would give the same order for every one of them.
         let mut seen = std::collections::BTreeSet::new();
-        for _ in 0..200 {
+        for _ in 0..20 {
             let found = targets(&table, "example.com").await.unwrap();
             seen.insert(hosts(&found).join(","));
         }
@@ -364,7 +374,8 @@ mod tests {
         assert_eq!(
             seen.len(),
             2,
-            "both orders should appear over 200 tries, saw {seen:?}"
+            "both orders should appear over 20 tries in the same \
+             millisecond, saw {seen:?}"
         );
     }
 
