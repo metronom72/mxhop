@@ -1392,27 +1392,6 @@ mod tests {
         );
     }
 
-    /// The guarantee the spool gave before anything was delivered, kept: a
-    /// half-written message in `tmp/` is either renamed into the queue whole
-    /// or is not there at all.
-    #[tokio::test]
-    async fn a_crash_between_delivery_and_250_leaves_nothing_in_tmp() {
-        let half = Fake::answering(
-            "fastmail.test",
-            client::Verdict::Deferred(theirs(451, "4.3.2", "Try again later")),
-        );
-        let script = "EHLO x.test\r\nMAIL FROM:<a@b.test>\r\nRCPT TO:<team@example.com>\r\n\
-                      DATA\r\nbody\r\n.\r\nQUIT\r\n";
-        let t = talk_with(half, 26_214_400, script).await;
-
-        assert_eq!(
-            std::fs::read_dir(t.spool.tmp_dir()).unwrap().count(),
-            0,
-            "tmp/ is a staging area, and anything left in it is a message nobody \
-             will ever look at"
-        );
-    }
-
     /// One alias leading to two destinations is two connections, and each
     /// one carries only its own recipient: an envelope that named the other
     /// would tell each destination where else the alias forwards.

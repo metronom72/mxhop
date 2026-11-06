@@ -55,13 +55,44 @@ impl Spool {
         let sidecar = format!("{}.json", envelope.id);
 
         let json = serde_json::to_vec_pretty(envelope).map_err(io::Error::other)?;
-        durable_write(&self.tmp.join(&message), body).await?;
-        durable_write(&self.tmp.join(&sidecar), &json).await?;
+        let staged = [self.tmp.join(&message), self.tmp.join(&sidecar)];
+
+        // Every exit between here and the last rename has to sweep `tmp/`.
+        // Returning the error on its own leaves a copy of the message in a
+        // directory nothing ever reads again: delivery looks in `queue/`, so
+        // a leaked `tmp/<id>.eml` is undeliverable and invisible at once, and
+        // it is the full message, so a spool that fails intermittently fills
+        // the disk with mail nobody can see. A failed store means the caller
+        // answers 4xx and the sending server keeps the message, which is the
+        // copy that matters.
+        let result = self.stage_and_rename(&message, &sidecar, body, &json).await;
+        if result.is_err() {
+            for path in &staged {
+                // Already renamed, or never created: either way there is
+                // nothing to clean up, and the store's own error is the one
+                // worth reporting.
+                let _ = fs::remove_file(path).await;
+            }
+        }
+        result
+    }
+
+    /// The staging and the two renames, so that [`Spool::store`] has one
+    /// place to clean up from.
+    async fn stage_and_rename(
+        &self,
+        message: &str,
+        sidecar: &str,
+        body: &[u8],
+        json: &[u8],
+    ) -> io::Result<()> {
+        durable_write(&self.tmp.join(message), body).await?;
+        durable_write(&self.tmp.join(sidecar), json).await?;
 
         // The message first, its envelope second: delivery looks for
         // envelopes, so the message becomes visible only once both are there.
-        fs::rename(self.tmp.join(&message), self.queue.join(&message)).await?;
-        fs::rename(self.tmp.join(&sidecar), self.queue.join(&sidecar)).await?;
+        fs::rename(self.tmp.join(message), self.queue.join(message)).await?;
+        fs::rename(self.tmp.join(sidecar), self.queue.join(sidecar)).await?;
         sync_dir(&self.queue).await
     }
 
@@ -154,6 +185,57 @@ mod tests {
             .expect("read dir")
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect()
+    }
+
+    /// `tmp/` is a staging area, and anything left in it is a message
+    /// nobody will ever look at again: delivery reads `queue/`, so a leaked
+    /// `tmp/<id>.eml` is a copy of somebody's mail that is both undeliverable
+    /// and invisible.
+    ///
+    /// The failure is forced by taking the write bit off `queue/`, which is
+    /// how this happens in production — a full disk or a mode somebody fixed
+    /// by hand — so the two files are written and flushed and then the rename
+    /// into `queue/` is refused. The session-level version of this test
+    /// asserted `tmp/` was empty after a *successful* store, which was true
+    /// before any of this existed and exercised no failure at all.
+    #[tokio::test]
+    async fn a_store_that_fails_part_way_leaves_nothing_behind_in_tmp() {
+        let root = scratch("store-fails");
+        let spool = Spool::open(&root).await.unwrap();
+
+        let mut mode = std::fs::metadata(spool.queue_dir()).unwrap().permissions();
+        mode.set_readonly(true);
+        std::fs::set_permissions(spool.queue_dir(), mode).unwrap();
+
+        let failed = spool.store(&envelope("stuck", 5), b"hello").await;
+
+        // Put the directory back first, so a failing assertion below does not
+        // leave an unreadable scratch directory behind.
+        let mut mode = std::fs::metadata(spool.queue_dir()).unwrap().permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            mode.set_mode(0o755);
+        }
+        #[cfg(not(unix))]
+        mode.set_readonly(false);
+        std::fs::set_permissions(spool.queue_dir(), mode).unwrap();
+
+        assert!(
+            failed.is_err(),
+            "a queue directory that cannot be written to is not a successful store"
+        );
+        assert_eq!(
+            names(spool.tmp_dir()),
+            BTreeSet::new(),
+            "the store failed, so the caller will answer 4xx and the sending server \
+             keeps the message — our half-written copy has to go"
+        );
+        assert_eq!(
+            names(spool.queue_dir()),
+            BTreeSet::new(),
+            "and nothing half-arrived in the queue either"
+        );
     }
 
     #[tokio::test]
