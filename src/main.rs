@@ -99,7 +99,15 @@ fn check(cli: &Cli) -> ExitCode {
         plural(config.router.alias_count(), "alias", "aliases"),
         domains.join(", "),
         match &tls {
-            Some(holder) => format!(", STARTTLS with {}", holder.paths().certificate.display()),
+            // The user is part of the answer: the files were read with this
+            // user's permissions, and `run` will read them with the service
+            // user's. Printing it is what lets an operator notice that the
+            // two are not the same before mail is involved.
+            Some(holder) => format!(
+                ", STARTTLS with {} (read as {})",
+                holder.paths().certificate.display(),
+                mxhop::tls::current_user()
+            ),
             None => ", no TLS".to_string(),
         },
     );
