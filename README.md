@@ -28,7 +28,7 @@ been proved end to end. Do not point an MX record at it.
 | Outbound SMTP client | done |
 | Synchronous relay, hop limit — **0.1** | done |
 | SRS and bounce decoding | done |
-| SPF/DKIM/DMARC and `Authentication-Results` | planned |
+| SPF/DKIM/DMARC and `Authentication-Results` | done |
 | Queue, retries, per-host backoff | planned |
 | DSNs for queued failures | planned |
 | Metrics, health, graceful shutdown — **0.2** | planned |
@@ -217,6 +217,63 @@ it for at least `srs.max_age_days`: the first line signs and every line
 verifies, so bounces already in flight — carrying addresses signed with the
 retired key — still come home. Dropping the old key immediately destroys
 every delivery report that has not arrived yet.
+
+## What arriving mail is checked for
+
+Every message is checked once, at the end of `DATA`, before anything leaves:
+SPF for both the HELO name and the envelope sender **as it arrived**, DKIM
+for every signature, and DMARC over the `From:` header. What was found goes
+into an `Authentication-Results` header written directly under mxhop's own
+`Received`, and the stored message is otherwise untouched.
+
+Only one thing is ever refused:
+
+| what DMARC says | what mxhop does |
+|---|---|
+| fails, and the domain publishes `p=reject` | `550 5.7.1`, naming the domain |
+| could not be checked, and the policy is `p=reject` or unknown | `451 4.7.1` — try again |
+| fails under `p=quarantine` | forwarded, with `policy.dmarc=quarantine` in the header |
+| fails under `p=none`, or there is no record | forwarded |
+| anything else, SPF failures included | forwarded |
+
+The rule in one sentence: **defer only where a definite answer could have
+refused.** A resolver that cannot answer never becomes a permanent refusal,
+and never becomes an open door either.
+
+Why the one refusal matters here specifically: after SRS *every* message mxhop
+forwards passes SPF at the destination, because the envelope sender is at a
+domain whose SPF record is this host. So a forged `From: service@paypal.com`
+would reach Gmail with a clean envelope and mxhop's address on it, Gmail would
+refuse it, and the refusal would be counted against *your* reputation — every
+time. With two destinations it is worse than a refusal: the lax one accepts,
+mxhop answers `250`, and Gmail's refusal becomes a lost copy with nothing to
+report it. The domain owner already asked every receiver to reject that
+message; while the sending server still holds it, the refusal costs nobody
+anything.
+
+SPF alone decides nothing, which is why nothing is refused at `MAIL FROM`: an
+SPF hard failure with an aligned DKIM pass is a DMARC *pass*, and that is
+exactly what mail forwarded to you by somebody else looks like.
+
+This is identity, not intent. It says nothing about a correctly signed message
+from a throwaway domain, and content filtering stays out of a forwarder.
+
+The whole thing is one table:
+
+```toml
+[auth]              # the whole table is optional; absent is this
+enabled = true      # false: no lookups, no header, no refusals
+enforce = "dmarc"   # or "off": evaluate and stamp, never refuse or defer
+```
+
+An `Authentication-Results` header that arrives already claiming mxhop's own
+`hostname` is removed before the message is checked ([RFC 8601 §5][rfc8601]).
+It is the one place mxhop changes the bytes of a message, and it is the
+deletion of one header — another host's results are left alone. Without it a
+sender writes the header itself, under your name, and nothing downstream can
+tell the claim from the finding.
+
+[rfc8601]: https://www.rfc-editor.org/rfc/rfc8601#section-5
 
 ## Why this exists
 

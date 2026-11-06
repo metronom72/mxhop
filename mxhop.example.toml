@@ -129,3 +129,43 @@ noreply = { reject = "550 5.1.1 this address does not accept mail" }
 # an address carries wraps every 1024 days, so a larger number switches
 # expiry off instead of widening it, and `mxhop check` refuses it.
 # max_age_days = 7
+
+# What arriving mail is checked for: SPF, DKIM and DMARC, once, at the end of
+# DATA — before anything leaves, while the sending server still holds the
+# message. What was found is written into an `Authentication-Results` header
+# directly under mxhop's own `Received`; nothing else in the message changes.
+#
+# The whole table is optional, and leaving it out is the same as what is
+# written below. The default is on, and enforcing, because the only thing it
+# ever refuses is mail whose own domain asked every receiver to refuse it:
+#
+#     DMARC fails and the domain publishes p=reject   -> 550 5.7.1
+#     DMARC cannot be checked, policy reject/unknown  -> 451 4.7.1, try again
+#     DMARC fails under p=quarantine                  -> forwarded, header says so
+#     DMARC fails under p=none, or there is no record  -> forwarded
+#     anything else, SPF failures included            -> forwarded
+#
+# Defer only where a definite answer could have refused. A resolver that is
+# not answering therefore holds up mail from p=reject domains and nothing
+# else — and a 451 is retried, so nothing is lost either way. Nothing here is
+# silent: every refusal names the domain and the policy, in a sentence the
+# sending server reads.
+#
+# This matters more for a forwarder than for an ordinary MX. After SRS every
+# message mxhop forwards passes SPF at the destination, so without this check
+# a forged `From: service@paypal.com` reaches Gmail with a clean envelope and
+# this host's address on it — and Gmail's refusal is counted against this
+# host, every time.
+#
+# [auth]
+#
+# false switches the whole thing off: no lookups, no header, no refusals. Use
+# it if something in front of mxhop already does this and writes the header.
+# enabled = true
+#
+# "off" evaluates everything and writes the header, and never refuses or
+# defers. That is the setting for watching what enforcement *would* do before
+# turning it on. `mxhop check` refuses `enforce` together with
+# `enabled = false`: with no lookups there is no result to enforce, and the
+# pair reads like a setting without being one.
+# enforce = "dmarc"
