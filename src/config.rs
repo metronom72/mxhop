@@ -16,6 +16,7 @@ use serde::Deserialize;
 use serde::de::{self, Deserializer};
 use toml::Spanned;
 
+use crate::policy::Enforce;
 use crate::routing::{CATCH_ALL, Mailbox, Route, Router, is_qualified};
 
 /// Gmail's ceiling, and a sane default: a forwarder that accepts more than the
@@ -40,6 +41,35 @@ pub struct Config {
     /// sender — which is how mail arrives at Gmail with a failing SPF check,
     /// so this is a table an operator wants, not an optional nicety.
     pub srs: Option<SrsSettings>,
+    /// Whether inbound mail is authenticated, and what a failure is worth.
+    /// Not an `Option`: an absent `[auth]` table is the default, which is on.
+    pub auth: AuthSettings,
+}
+
+/// The `[auth]` table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthSettings {
+    /// `false` means no lookups, no header and no refusals at all.
+    pub enabled: bool,
+    pub enforce: Enforce,
+}
+
+impl Default for AuthSettings {
+    /// On, enforcing DMARC. The argument for that default is in
+    /// [`crate::policy::Limits::default`] and in `crate::auth`'s own
+    /// documentation: it refuses only mail whose own domain asked every
+    /// receiver to refuse it, defers only where a missing answer could have
+    /// been that refusal, and forwards everything else — including every
+    /// `p=none` and `p=quarantine` failure, which is most of what fails.
+    /// Nothing it does is silent: each refusal names the domain and the
+    /// policy, in a sentence the sending server reads while it still holds
+    /// the message.
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            enforce: Enforce::Dmarc,
+        }
+    }
 }
 
 /// The `[srs]` table as the file states it, with the secret still on disk.
@@ -287,6 +317,54 @@ pub fn load_str(src: &str) -> Result<Config, Vec<Problem>> {
         }
     });
 
+    let auth = match &raw.auth {
+        None => AuthSettings::default(),
+        Some(table) => {
+            let enforce = match &table.enforce {
+                None => Enforce::Dmarc,
+                Some(word) => match word.get_ref().as_str() {
+                    "dmarc" => Enforce::Dmarc,
+                    "off" => Enforce::Off,
+                    // Both words named, because the one an operator typed is
+                    // not one of them and guessing which they meant is how a
+                    // typo turns enforcement off without saying so.
+                    other => {
+                        problems.push(at(
+                            src,
+                            word.span(),
+                            format!(
+                                "auth.enforce must be \"dmarc\" or \"off\" — {other:?} is \
+                                 neither; \"dmarc\" refuses a DMARC failure whose domain \
+                                 publishes p=reject, and \"off\" evaluates and stamps the \
+                                 header without ever refusing or deferring"
+                            ),
+                        ));
+                        Enforce::Dmarc
+                    }
+                },
+            };
+            let enabled = table.enabled.as_ref().is_none_or(|v| *v.get_ref());
+            // The combination that reads as a setting and is not one.
+            // `enabled = false` makes no lookups at all, so there is no
+            // result for `enforce` to act on: an operator who wrote both has
+            // either switched the check off while believing they configured
+            // it, or meant `enforce = "off"` and switched off the header they
+            // wanted to read. Neither is worth guessing between.
+            if let Some(word) = table.enforce.as_ref().filter(|_| !enabled) {
+                problems.push(at(
+                    src,
+                    word.span(),
+                    "auth.enforce has no meaning with auth.enabled = false: nothing is \
+                     looked up, so there is no result to enforce. Remove one of them — \
+                     enabled = false writes no header either, and enforce = \"off\" \
+                     writes the header and never refuses"
+                        .to_string(),
+                ));
+            }
+            AuthSettings { enabled, enforce }
+        }
+    };
+
     if raw.domains.is_empty() {
         problems.push(Problem {
             line: None,
@@ -439,6 +517,7 @@ pub fn load_str(src: &str) -> Result<Config, Vec<Problem>> {
         router,
         tls,
         srs,
+        auth,
     })
 }
 
@@ -556,6 +635,7 @@ struct Raw {
     domains: BTreeMap<String, RawDomain>,
     tls: Option<RawTls>,
     srs: Option<RawSrs>,
+    auth: Option<RawAuth>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -564,6 +644,13 @@ struct RawSrs {
     domain: Spanned<String>,
     secret_file: Spanned<PathBuf>,
     max_age_days: Option<Spanned<u32>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawAuth {
+    enabled: Option<Spanned<bool>>,
+    enforce: Option<Spanned<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1248,6 +1335,86 @@ hi = \"me@gmail.com\"
         assert!(
             p.contains("secret_file"),
             "a domain with no key cannot sign anything: {p}"
+        );
+    }
+
+    // --------------------------------------------------------- the [auth] table
+
+    /// The default an operator gets by not thinking about it, which is the
+    /// one that matters most. On, enforcing DMARC — see
+    /// `AuthSettings::default` for why that is the safe default rather than
+    /// the bold one.
+    #[test]
+    fn an_absent_auth_table_means_the_check_is_on_and_enforcing() {
+        let c = load_str(MINIMAL).expect("minimal configuration should load");
+
+        assert_eq!(
+            c.auth,
+            AuthSettings {
+                enabled: true,
+                enforce: Enforce::Dmarc,
+            }
+        );
+    }
+
+    #[test]
+    fn auth_enforce_off_is_read_as_off() {
+        let src = format!("{MINIMAL}\n[auth]\nenforce = \"off\"\n");
+        let c = load_str(&src).expect("this should load");
+
+        assert_eq!(c.auth.enforce, Enforce::Off);
+        assert!(c.auth.enabled, "off is still evaluated and still stamped");
+    }
+
+    /// A word that is neither is refused with both of them named. Guessing
+    /// which one was meant is how `enforce = "none"` — a plausible thing to
+    /// type — silently becomes either the strictest or the loosest setting
+    /// without the operator being told which.
+    #[test]
+    fn an_enforce_that_is_neither_word_is_refused_naming_both() {
+        let src = format!("{MINIMAL}\n[auth]\nenforce = \"none\"\n");
+        let problem = only_problem(&src);
+
+        assert!(problem.contains("\"dmarc\""), "{problem}");
+        assert!(problem.contains("\"off\""), "{problem}");
+        assert_eq!(
+            problem.lines().next().map(|l| l.starts_with("line")),
+            Some(true),
+            "with the line the operator typed it on: {problem}"
+        );
+    }
+
+    /// `enabled = false` makes no lookups, so there is no result for
+    /// `enforce` to act on. Accepting the pair silently would leave an
+    /// operator who wrote both believing they had configured enforcement when
+    /// they had switched the whole check off — or believing they would still
+    /// get the header, when `enabled = false` writes none.
+    #[test]
+    fn enforce_together_with_enabled_false_is_refused() {
+        let src = format!("{MINIMAL}\n[auth]\nenabled = false\nenforce = \"dmarc\"\n");
+        let problem = only_problem(&src);
+
+        assert!(problem.contains("no meaning"), "{problem}");
+        assert!(problem.contains("enabled = false"), "{problem}");
+    }
+
+    #[test]
+    fn auth_enabled_false_on_its_own_loads() {
+        let src = format!("{MINIMAL}\n[auth]\nenabled = false\n");
+        let c = load_str(&src).expect("this should load");
+
+        assert!(!c.auth.enabled);
+    }
+
+    /// `deny_unknown_fields` on every table in this file is what turns a
+    /// misspelled key into a refusal instead of a setting that does nothing.
+    #[test]
+    fn a_misspelled_auth_key_is_refused_rather_than_ignored() {
+        let src = format!("{MINIMAL}\n[auth]\nenforced = \"off\"\n");
+
+        assert!(
+            !problems(&src).is_empty(),
+            "a key nobody reads is a setting that silently does not apply"
         );
     }
 }

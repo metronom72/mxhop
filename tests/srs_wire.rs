@@ -128,7 +128,7 @@ async fn serve_mxhop(srs: Srs, sink_port: u16) -> (u16, Spool) {
     // Plaintext: the sink offers no STARTTLS, and the handshake is not what
     // is under test.
     out.tls = None;
-    let relay = Arc::new(Direct::new(table, out));
+    let relay = Arc::new(Direct::new(table, out, None));
 
     let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join("srs_wire")

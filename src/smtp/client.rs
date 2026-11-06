@@ -27,6 +27,7 @@ use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 use tracing::{debug, warn};
 
+use crate::auth::{Auth, Probe, Verifier};
 use crate::dns::{Resolve, targets};
 use crate::routing::Mailbox;
 use crate::smtp::wire::{self, WireError};
@@ -1318,17 +1319,43 @@ pub trait Relay {
     /// A trace with `unknown` in it is honest; a session that waits on a
     /// broken resolver is not, so the caller puts this under a clock.
     fn ptr(&self, ip: IpAddr) -> impl std::future::Future<Output = Option<String>> + Send;
+
+    /// What the message's own domains say about it: SPF, DKIM, DMARC.
+    ///
+    /// A third method on `Relay` rather than a ninth argument to
+    /// `session::serve`, and that is a judgement call. `Relay` is already
+    /// "the outside world as the session sees it" — it owns `ptr`, which is
+    /// also a DNS lookup made on the session's behalf and decided nothing on
+    /// — the session's test double already exists and is already the one
+    /// place a test swaps the outside world out, and `serve` has eight
+    /// arguments as it is. The alternative, a separate trait threaded through
+    /// `serve`, `accept_loop` and `main`, would add a type parameter to all
+    /// three to say the same thing.
+    ///
+    /// It never fails and never returns a `Result`: a check that could not be
+    /// made is an [`Auth`] saying so, because the decision table has to be
+    /// able to tell "the domain publishes nothing" from "nobody answered",
+    /// and an error type collapses the two.
+    fn verify(&self, probe: Probe<'_>) -> impl std::future::Future<Output = Auth> + Send;
 }
 
 /// The real one: the system resolver, a TCP socket, and port 25.
 pub struct Direct<R> {
     pub resolver: R,
     pub out: Outbound,
+    /// The SPF, DKIM and DMARC verifier, or `None` when `[auth]` is disabled.
+    /// `None` means no lookups, no header and no refusals: see
+    /// [`crate::auth::Auth::not_checked`].
+    pub verifier: Option<Verifier>,
 }
 
 impl<R> Direct<R> {
-    pub fn new(resolver: R, out: Outbound) -> Self {
-        Self { resolver, out }
+    pub fn new(resolver: R, out: Outbound, verifier: Option<Verifier>) -> Self {
+        Self {
+            resolver,
+            out,
+            verifier,
+        }
     }
 }
 
@@ -1342,6 +1369,13 @@ where
 
     async fn ptr(&self, ip: IpAddr) -> Option<String> {
         self.resolver.ptr(ip).await.ok()
+    }
+
+    async fn verify(&self, probe: Probe<'_>) -> Auth {
+        match &self.verifier {
+            Some(verifier) => verifier.check(probe).await,
+            None => Auth::not_checked(),
+        }
     }
 }
 
@@ -1366,6 +1400,10 @@ impl Relay for Blackhole {
 
     async fn ptr(&self, _ip: IpAddr) -> Option<String> {
         None
+    }
+
+    async fn verify(&self, _probe: Probe<'_>) -> Auth {
+        Auth::not_checked()
     }
 }
 
@@ -1847,6 +1885,10 @@ mod tests {
 
         async fn ptr(&self, _ip: IpAddr) -> Option<String> {
             Some("sender.test".to_string())
+        }
+
+        async fn verify(&self, _probe: Probe<'_>) -> Auth {
+            Auth::not_checked()
         }
     }
 

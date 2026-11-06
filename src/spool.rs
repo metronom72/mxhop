@@ -223,6 +223,7 @@ mod tests {
             received_at_unix_ms: crate::envelope::now_unix_ms(),
             size: body_len,
             received: String::new(),
+            authentication_results: String::new(),
             last_reply: None,
         }
     }
