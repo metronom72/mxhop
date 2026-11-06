@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
+use tracing::warn;
 
 use crate::envelope::Envelope;
 
@@ -55,7 +56,18 @@ impl Spool {
         let sidecar = format!("{}.json", envelope.id);
 
         let json = serde_json::to_vec_pretty(envelope).map_err(io::Error::other)?;
-        let staged = [self.tmp.join(&message), self.tmp.join(&sidecar)];
+        // The queue-side message is in this list as well as the two staged
+        // files, and it is the one that matters most. The renames go message
+        // first, envelope second, so a failure in between leaves
+        // `queue/<id>.eml` in place — and `queued()` lists envelopes, so that
+        // file is never returned, never delivered and never seen again: a
+        // full copy of somebody's message, leaked by the one window the
+        // sweep exists for.
+        let staged = [
+            self.tmp.join(&message),
+            self.tmp.join(&sidecar),
+            self.queue.join(&message),
+        ];
 
         // Every exit between here and the last rename has to sweep `tmp/`.
         // Returning the error on its own leaves a copy of the message in a
@@ -65,20 +77,56 @@ impl Spool {
         // the disk with mail nobody can see. A failed store means the caller
         // answers 4xx and the sending server keeps the message, which is the
         // copy that matters.
-        let result = self.stage_and_rename(&message, &sidecar, body, &json).await;
-        if result.is_err() {
+        if let Err(e) = self.stage_and_rename(&message, &sidecar, body, &json).await {
             for path in &staged {
-                // Already renamed, or never created: either way there is
-                // nothing to clean up, and the store's own error is the one
-                // worth reporting.
-                let _ = fs::remove_file(path).await;
+                match fs::remove_file(path).await {
+                    Ok(()) => {}
+                    // Already renamed on, or never created: there was nothing
+                    // to clean up, and the store's own error is the one worth
+                    // reporting.
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    // Anything else is the sweep failing in the one situation
+                    // it exists for, which leaves a copy of a message on disk
+                    // that nothing will ever read. Silence here is an
+                    // operator watching the disk fill with no way to find
+                    // what is filling it, so the path goes in the log.
+                    Err(e) => warn!(
+                        path = %path.display(),
+                        "a half-stored message could not be removed; it is a copy of \
+                         somebody's mail that nothing will deliver and nothing else \
+                         will report: {e}"
+                    ),
+                }
             }
+            return Err(e);
         }
-        result
+
+        // Both renames returned, so the message *is* in the queue and will be
+        // delivered whatever happens next. A judgement call: a `sync_dir`
+        // failure is reported as success, with the risk named, rather than as
+        // an error. Returning `Err` would have the session answer the sending
+        // server 4xx and log that the message could not be held, while it is
+        // sitting in `queue/` waiting to be delivered — the sender then sends
+        // it again and the recipient gets two copies, and the log says the
+        // opposite of what is on disk. What is actually in doubt is narrower:
+        // the directory entry may not survive a power cut in the next moment,
+        // which is one message at risk in a crash rather than one message
+        // duplicated in every such failure.
+        if let Err(e) = sync_dir(&self.queue).await {
+            warn!(
+                id = %envelope.id,
+                "the message is queued, but the queue directory could not be flushed, \
+                 so it may not survive a power cut in the next moment: {e}"
+            );
+        }
+        Ok(())
     }
 
     /// The staging and the two renames, so that [`Spool::store`] has one
-    /// place to clean up from.
+    /// place to clean up from. Everything that can leave a file behind is in
+    /// here; the directory flush is not, because by then there is nothing
+    /// left to sweep and its failure means something else — see
+    /// [`Spool::store`].
     async fn stage_and_rename(
         &self,
         message: &str,
@@ -92,8 +140,7 @@ impl Spool {
         // The message first, its envelope second: delivery looks for
         // envelopes, so the message becomes visible only once both are there.
         fs::rename(self.tmp.join(message), self.queue.join(message)).await?;
-        fs::rename(self.tmp.join(sidecar), self.queue.join(sidecar)).await?;
-        sync_dir(&self.queue).await
+        fs::rename(self.tmp.join(sidecar), self.queue.join(sidecar)).await
     }
 
     /// Every complete message in the queue, in arrival order.
@@ -235,6 +282,46 @@ mod tests {
             names(spool.queue_dir()),
             BTreeSet::new(),
             "and nothing half-arrived in the queue either"
+        );
+    }
+
+    /// The sweep exists for the window between the two renames, and this is
+    /// the half of it that was missed: the message has already moved into
+    /// `queue/` and only its envelope failed. `queued()` lists envelopes, so
+    /// `queue/<id>.eml` on its own is never returned and never delivered —
+    /// a full copy of somebody's message, invisible to everything but `ls`,
+    /// which is precisely the leak the sweep was added to prevent.
+    ///
+    /// The failure is aimed at that one rename by putting a *directory*
+    /// where the envelope has to go: `rename(2)` refuses to replace a
+    /// directory with a file, so the message's own rename succeeds and the
+    /// envelope's does not.
+    #[tokio::test]
+    async fn a_store_whose_envelope_cannot_be_renamed_leaves_no_message_in_the_queue() {
+        let root = scratch("sidecar-fails");
+        let spool = Spool::open(&root).await.unwrap();
+        std::fs::create_dir(spool.queue_dir().join("blocked.json")).unwrap();
+
+        let failed = spool.store(&envelope("blocked", 5), b"hello").await;
+
+        assert!(
+            failed.is_err(),
+            "the envelope never arrived, so the message is not in the queue and \
+             the caller has to answer 4xx"
+        );
+        assert!(
+            names(spool.tmp_dir()).is_empty(),
+            "nothing staged may be left behind"
+        );
+        assert_eq!(
+            names(spool.queue_dir()),
+            BTreeSet::from(["blocked.json".to_string()]),
+            "and `blocked.eml` has to be gone too: it is the whole message, and \
+             without its envelope nothing will ever look at it again"
+        );
+        assert!(
+            spool.queued().await.unwrap().is_empty(),
+            "the queue is as it was"
         );
     }
 
