@@ -4,7 +4,14 @@
 # target, so musl-dev and build-base are not optional), and a final stage
 # that has nothing but the one static binary. CI already proves this target
 # links, so the image is not the first place it is tried.
-FROM rust:1.91-alpine AS builder
+# The version must be at least as new as the highest MSRV in the dependency
+# tree, and it has to be raised by hand when a dependency moves. It already
+# bit once: pinned at 1.91, the image build started failing the moment
+# mail-auth brought in mail-parser 1.0.1, which requires 1.98 — while CI stayed
+# green, because CI builds with `dtolnay/rust-toolchain@stable` and the release
+# binary is what it proves. So a red image job here means "raise this line",
+# not "the code is broken". Alpine kept in step with the final stage below.
+FROM rust:1.99-alpine3.22 AS builder
 
 RUN apk add --no-cache musl-dev build-base
 
@@ -18,10 +25,10 @@ COPY . .
 # With it present cargo resolves `stable`, which is not what this image
 # installs, so rustup would download the day's stable plus rustfmt and clippy
 # on every build — making the image depend on the network and on whatever
-# `stable` means today, and the 1.91 tag above purely cosmetic. Excluded, the
+# `stable` means today, and the tag above purely cosmetic. Excluded, the
 # build uses the toolchain the base image pins. It is not set as
 # RUSTUP_TOOLCHAIN here because that would have to name an exact patch
-# version, which the 1.91 tag bumps underneath us.
+# version, which the minor tag bumps underneath us.
 #
 # --locked: build the dependency versions Cargo.lock records, so the released
 # image contains what CI tested rather than whatever resolved today.
