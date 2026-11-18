@@ -235,12 +235,16 @@ mxhop reads `queue/` every `sweep_seconds` and tries whatever is due:
 
 | attempt | wait before it |
 |---|---|
-| 2nd | 5 minutes |
-| 3rd | 10 minutes |
-| 4th | 20 minutes |
-| 5th | 40 minutes |
-| 6th | 80 minutes |
-| 7th and after | 2 hours |
+| 2nd | 1 minute |
+| 3rd | 5 minutes |
+| 4th | 15 minutes |
+| 5th | 1 hour |
+| 6th and after | 4 hours |
+
+One minute first, because what is usually being waited out is a greylist and
+a greylist clears in a minute; then longer, because what is left after the
+first few attempts is a destination with something properly wrong with it.
+The last interval repeats for as long as the message is queued.
 
 Only the recipients still deferring are retried — one that has its copy comes
 off the envelope, so nobody gets the message twice — and `last_reply` in the
@@ -251,10 +255,11 @@ reading:
 cat /var/lib/mxhop/spool/queue/*.json | grep last_reply
 ```
 
-After **four days** mxhop stops trying and moves both files to
-`frozen/`. Four rather than Postfix's five because of SRS: the rewritten
-sender a destination bounces to is only valid for `srs.max_age_days` (seven
-by default), so giving up on day four leaves three for that report to arrive.
+After **48 hours** mxhop stops trying and moves both files to `frozen/`.
+It has to fit inside the SRS window: the rewritten sender a destination
+bounces to is only valid for `srs.max_age_days` (seven by default), so a last
+attempt made after that provokes a report that comes back to an address mxhop
+no longer recognises — `mxhop check` refuses a lifetime that does not fit.
 
 Nothing is deleted. A frozen message is still somebody's mail, and mxhop
 **cannot yet tell its sender it was not delivered** — there is no DSN
@@ -302,17 +307,16 @@ The `[queue]` table, with these defaults:
 
 ```toml
 [queue]
-first_backoff_minutes = 5
-max_backoff_minutes = 120
-lifetime_days = 4
+retry_minutes = [1, 5, 15, 60, 240]   # the last one repeats
+lifetime_hours = 48
 sweep_seconds = 60
 ```
 
-`mxhop check` refuses a `lifetime_days` longer than `srs.max_age_days`, a
-`max_backoff_minutes` below `first_backoff_minutes`, and a zero anywhere —
-zero means something different for each of them and all four meanings are a
-queue that has quietly stopped being one. It also prints the schedule it
-would run with, so the file does not have to be read back to see it.
+`mxhop check` refuses a `lifetime_hours` longer than `srs.max_age_days`, an
+empty `retry_minutes`, a zero or a value over a day inside it, and a zero
+anywhere else — zero means something different for each of them and all three
+meanings are a queue that has quietly stopped being one. It also prints the
+schedule it would run with, so the file does not have to be read back.
 
 One thing is still missing: a restart does not resume anything in flight. A
 message killed mid-delivery is in `queue/` with its old schedule, so it is

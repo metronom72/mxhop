@@ -140,15 +140,23 @@ fn check(cli: &Cli) -> ExitCode {
     // of it — mxhop giving up — is the one outcome nobody is told about, so an
     // operator should at least know when that is.
     let retries = format!(
-        ", a deferred message retried from {} minutes up to every {}, and given up on \
-         after {} days",
-        config.queue.first_backoff.as_secs() / 60,
-        match config.queue.max_backoff.as_secs() / 60 {
+        ", a deferred message retried after {} minutes and then every {}, given up on \
+         after {} hours",
+        config
+            .queue
+            .retries
+            .iter()
+            .map(|w| (w.as_secs() / 60).to_string())
+            .collect::<Vec<_>>()
+            .join(", "),
+        // The last interval is the one that repeats, so it is the one this
+        // sentence ends on.
+        match config.queue.retries.last().map_or(0, |w| w.as_secs() / 60) {
             60 => "hour".to_string(),
             minutes if minutes % 60 == 0 => format!("{} hours", minutes / 60),
             minutes => format!("{minutes} minutes"),
         },
-        config.queue.lifetime.as_secs() / 86_400,
+        config.queue.lifetime.as_secs() / 3_600,
     );
     println!(
         "{}: ok — {} on {}, {} {} for {}{}{}{}{}",

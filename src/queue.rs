@@ -31,41 +31,41 @@ use crate::smtp::client::{Delivery, Relay, Reply, Verdict};
 use crate::spool::Spool;
 use crate::srs::Srs;
 
-/// The wait after the first failed attempt, and the step every later wait
-/// doubles from.
+/// The wait before each attempt after the first, in minutes: one minute,
+/// then five, fifteen, an hour, and every four hours after that.
 ///
-/// Five minutes because the thing being waited out is usually a destination
-/// under load or a greylist, and both clear in minutes; retrying sooner is
-/// how a forwarder earns a rate limit of its own.
-pub const FIRST_BACKOFF: Duration = Duration::from_secs(5 * 60);
-
-/// The longest wait between two attempts. Doubling without a ceiling means a
-/// message that has been stuck for a day waits another day, so the moment the
-/// destination comes back is the moment nothing is delivered.
-pub const MAX_BACKOFF: Duration = Duration::from_secs(2 * 60 * 60);
+/// The last entry repeats for as long as the message is in the queue, which
+/// is what makes this a complete schedule rather than a prefix of one. The
+/// first interval is deliberately short — a destination that answered "not
+/// now" is usually a greylist, and a greylist clears in a minute.
+pub const DEFAULT_RETRY_MINUTES: [u64; 5] = [1, 5, 15, 60, 240];
 
 /// How long a message may stay in the queue before mxhop stops trying.
 ///
-/// Four days rather than Postfix's five, and the reason is SRS: a forwarded
-/// message leaves with a rewritten sender whose signature is only valid for
+/// Two days. It has to fit inside the SRS window: a forwarded message leaves
+/// with a rewritten sender whose signature is only valid for
 /// `srs.max_age_days` — seven by default — so a bounce provoked by the last
-/// attempt has to arrive while that address still decodes. Four days of
-/// attempts leaves three for the report to come back.
-pub const LIFETIME: Duration = Duration::from_secs(4 * 24 * 60 * 60);
+/// attempt has to arrive while that address still decodes, and `check`
+/// refuses a lifetime that does not fit.
+pub const DEFAULT_LIFETIME_HOURS: u64 = 48;
 
 /// How often the queue is read from disk. The schedule lives in the
 /// envelopes, so this is only the resolution of the clock that reads them.
 pub const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
-/// The longest `queue.lifetime_days` mxhop will accept. A month of attempts
+/// The longest `queue.lifetime_hours` mxhop will accept. A month of attempts
 /// is a month in which nobody has been told anything, and every sender's
 /// postmaster gave up waiting long before it.
-pub const MAX_LIFETIME_DAYS: u32 = 30;
+pub const MAX_LIFETIME_HOURS: u64 = 30 * 24;
 
-/// The longest `queue.first_backoff_minutes` and `queue.max_backoff_minutes`
-/// mxhop will accept: a day between attempts inside a lifetime measured in
-/// days is a schedule that retries almost nothing.
-pub const MAX_BACKOFF_MINUTES: u64 = 24 * 60;
+/// The longest interval `queue.retry_minutes` may state: a day between
+/// attempts, inside a lifetime measured in hours, is a schedule that retries
+/// almost nothing.
+pub const MAX_RETRY_MINUTES: u64 = 24 * 60;
+
+/// The most intervals `queue.retry_minutes` may state. The last one repeats,
+/// so a list this long is already a schedule nobody is reading.
+pub const MAX_RETRY_STEPS: usize = 32;
 
 /// The longest `queue.sweep_seconds` mxhop will accept. The schedule lives in
 /// the envelopes, so this is only how often they are read; an hour between
@@ -74,17 +74,25 @@ pub const MAX_SWEEP_SECONDS: u64 = 60 * 60;
 
 /// When the runner tries things, as the configuration states it.
 ///
-/// Carried as one value rather than four arguments because the inbound
+/// Carried as one value rather than three arguments because the inbound
 /// session needs it too: the first wait is written into an envelope at the
 /// moment it is held, and it has to be the same wait the runner would
 /// compute.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Schedule {
-    /// The wait after the first failed attempt. See [`FIRST_BACKOFF`].
-    pub first_backoff: Duration,
-    /// The ceiling every later wait stops at. See [`MAX_BACKOFF`].
-    pub max_backoff: Duration,
-    /// How long a message may stay in the queue. See [`LIFETIME`].
+    /// The wait before each attempt after the first, the last entry
+    /// repeating for ever. See [`DEFAULT_RETRY_MINUTES`].
+    ///
+    /// A list rather than a first interval and a doubling rule, because the
+    /// shape that is actually wanted — short, short, longer, then settle
+    /// down — is not a geometric series, and writing it as one made the
+    /// early intervals either too long or the late ones too short.
+    ///
+    /// Never empty: [`Schedule::backoff`] falls back to the first default
+    /// interval if it somehow is, and `config` refuses an empty list.
+    pub retries: Vec<Duration>,
+    /// How long a message may stay in the queue. See
+    /// [`DEFAULT_LIFETIME_HOURS`].
     pub lifetime: Duration,
     /// How often the queue is read from disk. See [`SWEEP_INTERVAL`].
     pub sweep_interval: Duration,
@@ -93,9 +101,11 @@ pub struct Schedule {
 impl Default for Schedule {
     fn default() -> Self {
         Self {
-            first_backoff: FIRST_BACKOFF,
-            max_backoff: MAX_BACKOFF,
-            lifetime: LIFETIME,
+            retries: DEFAULT_RETRY_MINUTES
+                .iter()
+                .map(|m| Duration::from_secs(m * 60))
+                .collect(),
+            lifetime: Duration::from_secs(DEFAULT_LIFETIME_HOURS * 3_600),
             sweep_interval: SWEEP_INTERVAL,
         }
     }
@@ -105,28 +115,38 @@ impl Schedule {
     /// How long to wait before trying a message that has already been tried
     /// `attempts` times.
     ///
-    /// A function of nothing but the count and these four numbers, so that
-    /// the envelope on disk is the whole schedule: the runner can be
-    /// restarted, or the machine rebooted, without losing where a message
-    /// was in it.
+    /// A function of nothing but the count and this list, so that the
+    /// envelope on disk is the whole schedule: the runner can be restarted,
+    /// or the machine rebooted, without losing where a message was in it.
     pub fn backoff(&self, attempts: u32) -> Duration {
-        // `attempts` is what has already been spent, so the first wait
-        // follows one attempt. Zero means the same thing as one here — an
-        // envelope written before this field existed — and gets the same
-        // first interval.
-        let doublings = attempts.saturating_sub(1).min(16);
-        // In milliseconds, not seconds. The configuration states these in
-        // minutes, so whole seconds would have done — but the arithmetic
-        // then silently floors any shorter interval to zero, and the first
-        // thing that wanted one was a test, which got a schedule with no
-        // waits in it and quietly passed.
-        let millis = self
-            .first_backoff
-            .as_millis()
-            .saturating_mul(1u128 << doublings)
-            // Clamped before the cast, which is what keeps it in range.
-            .min(self.max_backoff.as_millis());
-        Duration::from_millis(millis as u64)
+        // `attempts` is what has already been spent, so one attempt earns
+        // the first interval. Zero means the same thing as one here — an
+        // envelope written before this field existed — and gets it too.
+        let step = attempts.max(1) as usize - 1;
+        self.retries
+            .get(step)
+            // Past the end of the list, the last interval repeats: that is
+            // what "and every four hours after that" means, and it is also
+            // what stops a long-stuck message from waiting for ever.
+            .or_else(|| self.retries.last())
+            .copied()
+            // Unreachable: `config` refuses an empty list and `Default`
+            // fills one in. A panic here would be a queue that stops on a
+            // configuration nothing can produce.
+            .unwrap_or(Duration::from_secs(DEFAULT_RETRY_MINUTES[0] * 60))
+    }
+
+    /// The longest interval in the schedule — the one that repeats.
+    ///
+    /// Used as "long enough that nothing is still happening": a host nothing
+    /// has retried for this long is one whose failure count has stopped
+    /// being evidence.
+    pub fn longest(&self) -> Duration {
+        self.retries
+            .iter()
+            .max()
+            .copied()
+            .unwrap_or(Duration::from_secs(DEFAULT_RETRY_MINUTES[0] * 60))
     }
 
     /// Whether a message has been in the queue longer than mxhop keeps
@@ -201,14 +221,15 @@ impl Hosts {
             .is_some()
     }
 
-    /// Forgets domains nothing has tried for a whole ceiling's worth of time.
+    /// Forgets domains nothing has tried for a whole longest-interval's worth
+    /// of time.
     ///
     /// Without this the table keeps an entry per domain that has ever failed,
     /// and the queue of a busy forwarder names a great many domains. A
-    /// failure count nothing has added to for two hours is also not evidence
+    /// failure count nothing has added to for that long is also not evidence
     /// about the host as it is now.
     fn prune(&self, now_unix_ms: u64, schedule: &Schedule) {
-        let stale = schedule.max_backoff.as_millis() as u64;
+        let stale = schedule.longest().as_millis() as u64;
         self.0
             .lock()
             .expect("the host table is never held across an await")
@@ -813,41 +834,68 @@ mod tests {
     /// and the test passed for the wrong reason.
     fn impatient() -> Schedule {
         Schedule {
-            first_backoff: Duration::from_millis(400),
-            max_backoff: Duration::from_millis(400),
+            retries: vec![Duration::from_millis(400)],
             ..Schedule::default()
         }
     }
 
+    /// One minute, five, fifteen, an hour, then every four hours — the
+    /// schedule this queue was specified with, read off the default.
     #[test]
-    fn the_wait_doubles_from_five_minutes_and_stops_at_two_hours() {
+    fn the_waits_are_one_five_fifteen_sixty_and_then_every_four_hours() {
         let schedule = Schedule::default();
+        let minutes = |n: u64| Duration::from_secs(n * 60);
 
-        assert_eq!(schedule.backoff(1), Duration::from_secs(300));
-        assert_eq!(schedule.backoff(2), Duration::from_secs(600));
-        assert_eq!(schedule.backoff(3), Duration::from_secs(1_200));
-        assert_eq!(schedule.backoff(4), Duration::from_secs(2_400));
-        assert_eq!(schedule.backoff(5), Duration::from_secs(4_800));
+        assert_eq!(schedule.backoff(1), minutes(1));
+        assert_eq!(schedule.backoff(2), minutes(5));
+        assert_eq!(schedule.backoff(3), minutes(15));
+        assert_eq!(schedule.backoff(4), minutes(60));
+        assert_eq!(schedule.backoff(5), minutes(240));
         assert_eq!(
             schedule.backoff(6),
-            MAX_BACKOFF,
-            "and never longer than that"
+            minutes(240),
+            "the last interval repeats: that is what 'and every four hours' means"
         );
         assert_eq!(
-            schedule.backoff(500),
-            MAX_BACKOFF,
-            "including when it overflows"
+            schedule.backoff(5_000),
+            minutes(240),
+            "including for a message that has been stuck as long as the lifetime allows"
         );
     }
 
-    /// The arithmetic is in milliseconds, so a schedule stated in less than
-    /// whole seconds is the schedule it says. It was not: `as_secs()` floored
-    /// a 400 ms interval to zero, which is a configuration with no waits in
-    /// it at all.
+    /// Two days of attempts on that schedule, which is what the lifetime has
+    /// to be long enough to contain and short enough to fit inside the SRS
+    /// window.
+    #[test]
+    fn the_default_lifetime_is_forty_eight_hours() {
+        assert_eq!(
+            Schedule::default().lifetime,
+            Duration::from_secs(48 * 3_600)
+        );
+    }
+
+    /// A schedule shorter than the number of attempts a message gets must
+    /// not run off the end of its own list.
+    #[test]
+    fn a_schedule_of_one_interval_repeats_it() {
+        let schedule = Schedule {
+            retries: vec![Duration::from_secs(90)],
+            ..Schedule::default()
+        };
+
+        assert_eq!(schedule.backoff(1), Duration::from_secs(90));
+        assert_eq!(schedule.backoff(99), Duration::from_secs(90));
+    }
+
+    /// Intervals are kept as `Duration`, so a schedule stated in less than
+    /// whole seconds is the schedule it says. An earlier version computed the
+    /// wait in whole seconds and floored a 400 ms interval to zero, which is
+    /// a configuration with no waits in it at all — and the first test that
+    /// wanted one passed for the wrong reason.
     #[test]
     fn an_interval_shorter_than_a_second_is_not_floored_to_nothing() {
         assert_eq!(impatient().backoff(1), Duration::from_millis(400));
-        assert_eq!(impatient().backoff(9), Duration::from_millis(400), "capped");
+        assert_eq!(impatient().backoff(9), Duration::from_millis(400));
     }
 
     /// An envelope from a build that had no schedule in it says `attempts: 0`,
@@ -1024,7 +1072,8 @@ mod tests {
     #[tokio::test]
     async fn a_message_older_than_the_lifetime_is_frozen_rather_than_retried_for_ever() {
         let envelope = Envelope {
-            received_at_unix_ms: now_unix_ms() - (LIFETIME.as_millis() as u64 + 1),
+            received_at_unix_ms: now_unix_ms()
+                - (Schedule::default().lifetime.as_millis() as u64 + 1),
             attempts: 40,
             ..held(&["hi@dest.test"])
         };
@@ -1327,13 +1376,17 @@ mod tests {
     /// failure's wait is the second interval even though each message that
     /// provoked it was on its first attempt.
     #[test]
-    fn a_hosts_wait_doubles_with_its_own_failures() {
+    fn a_hosts_wait_lengthens_with_its_own_failures() {
         let schedule = Schedule::default();
         let hosts = Hosts::default();
 
         assert_eq!(hosts.failed("dest.test", 0, &schedule), schedule.backoff(1));
         assert_eq!(hosts.failed("dest.test", 0, &schedule), schedule.backoff(2));
         assert_eq!(hosts.failed("dest.test", 0, &schedule), schedule.backoff(3));
+        assert!(
+            schedule.backoff(3) > schedule.backoff(1),
+            "a host that keeps failing has to be asked less often, not the same"
+        );
         assert_eq!(
             hosts.failed("other.test", 0, &schedule),
             schedule.backoff(1),
@@ -1356,8 +1409,7 @@ mod tests {
         let hosts = Hosts::default();
         hosts.failed("dest.test", 0, &schedule);
 
-        let later =
-            schedule.backoff(1).as_millis() as u64 + schedule.max_backoff.as_millis() as u64;
+        let later = schedule.backoff(1).as_millis() as u64 + schedule.longest().as_millis() as u64;
         hosts.prune(later + 1, &schedule);
 
         assert!(

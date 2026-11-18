@@ -325,80 +325,101 @@ pub fn load_str(src: &str) -> Result<Config, Vec<Problem>> {
 
     // The `[queue]` table. Every number has a floor of one, and the floor is
     // worth checking rather than clamping: zero means something different for
-    // each of them, and all four meanings are a queue that quietly stops
+    // each of them, and all three meanings are a queue that quietly stops
     // being one.
     let queue = match &raw.queue {
         None => Schedule::default(),
         Some(table) => {
             let default = Schedule::default();
 
-            let lifetime_days = match &table.lifetime_days {
-                None => default.lifetime.as_secs() / 86_400,
+            let retries = match &table.retry_minutes {
+                None => default.retries.clone(),
+                Some(stated) if stated.get_ref().is_empty() => {
+                    problems.push(at(
+                        src,
+                        stated.span(),
+                        "queue.retry_minutes must state at least one interval: an empty \
+                         list is a queue that accepts mail and never tries to deliver \
+                         it again"
+                            .to_string(),
+                    ));
+                    default.retries.clone()
+                }
+                Some(stated) if stated.get_ref().len() > crate::queue::MAX_RETRY_STEPS => {
+                    problems.push(at(
+                        src,
+                        stated.span(),
+                        format!(
+                            "queue.retry_minutes may state at most {} intervals: the last \
+                             one repeats for as long as the message is queued, so a list \
+                             longer than that is a schedule nobody is reading",
+                            crate::queue::MAX_RETRY_STEPS
+                        ),
+                    ));
+                    default.retries.clone()
+                }
+                Some(stated) => {
+                    let mut problem = None;
+                    for minutes in stated.get_ref() {
+                        if *minutes == 0 {
+                            problem = Some(
+                                "queue.retry_minutes must not contain 0: a destination \
+                                 that said \"try later\" and is tried again in the same \
+                                 instant is a destination that rate-limits us next"
+                                    .to_string(),
+                            );
+                        } else if *minutes > crate::queue::MAX_RETRY_MINUTES {
+                            problem = Some(format!(
+                                "queue.retry_minutes must not contain {minutes}: no \
+                                 interval may be longer than {} minutes, because a day \
+                                 between attempts inside a lifetime measured in hours is \
+                                 a schedule that retries almost nothing",
+                                crate::queue::MAX_RETRY_MINUTES
+                            ));
+                        }
+                    }
+                    match problem {
+                        Some(message) => {
+                            problems.push(at(src, stated.span(), message));
+                            default.retries.clone()
+                        }
+                        None => stated
+                            .get_ref()
+                            .iter()
+                            .map(|m| Duration::from_secs(m * 60))
+                            .collect(),
+                    }
+                }
+            };
+
+            let lifetime_hours = match &table.lifetime_hours {
+                None => default.lifetime.as_secs() / 3_600,
                 Some(v) if *v.get_ref() == 0 => {
                     problems.push(at(
                         src,
                         v.span(),
-                        "queue.lifetime_days must be at least 1: zero gives up on a \
+                        "queue.lifetime_hours must be at least 1: zero gives up on a \
                          message the first time it is looked at, and mxhop cannot yet \
                          tell its sender that it did"
                             .to_string(),
                     ));
-                    default.lifetime.as_secs() / 86_400
+                    default.lifetime.as_secs() / 3_600
                 }
-                Some(v) if *v.get_ref() > crate::queue::MAX_LIFETIME_DAYS => {
+                Some(v) if *v.get_ref() > crate::queue::MAX_LIFETIME_HOURS => {
                     problems.push(at(
                         src,
                         v.span(),
                         format!(
-                            "queue.lifetime_days must be at most {}: {} is a month of \
-                             attempts in which nobody has been told anything, and every \
+                            "queue.lifetime_hours must be at most {}: a month of attempts \
+                             is a month in which nobody has been told anything, and every \
                              sender's postmaster gave up waiting long before it",
-                            crate::queue::MAX_LIFETIME_DAYS,
-                            v.get_ref()
+                            crate::queue::MAX_LIFETIME_HOURS
                         ),
                     ));
-                    default.lifetime.as_secs() / 86_400
+                    default.lifetime.as_secs() / 3_600
                 }
-                Some(v) => u64::from(*v.get_ref()),
+                Some(v) => *v.get_ref(),
             };
-
-            let first = minutes(
-                src,
-                &mut problems,
-                table.first_backoff_minutes.as_ref(),
-                "first_backoff_minutes",
-                default.first_backoff.as_secs() / 60,
-            );
-            let max = minutes(
-                src,
-                &mut problems,
-                table.max_backoff_minutes.as_ref(),
-                "max_backoff_minutes",
-                default.max_backoff.as_secs() / 60,
-            );
-            if max < first {
-                // Reported on whichever of the two the file actually states,
-                // preferring the ceiling: that is the one an operator lowers
-                // without thinking about the other.
-                let span = table
-                    .max_backoff_minutes
-                    .as_ref()
-                    .or(table.first_backoff_minutes.as_ref())
-                    .map(|v| v.span());
-                let message = format!(
-                    "queue.max_backoff_minutes ({max}) must not be below \
-                     queue.first_backoff_minutes ({first}): the ceiling is what every \
-                     wait after the first stops at, so a lower one would make the \
-                     second attempt sooner than the first"
-                );
-                problems.push(match span {
-                    Some(span) => at(src, span, message),
-                    None => Problem {
-                        line: line_of_text(src, "[queue]"),
-                        message,
-                    },
-                });
-            }
 
             let sweep_seconds = match &table.sweep_seconds {
                 None => default.sweep_interval.as_secs(),
@@ -429,9 +450,8 @@ pub fn load_str(src: &str) -> Result<Config, Vec<Problem>> {
             };
 
             Schedule {
-                first_backoff: Duration::from_secs(first * 60),
-                max_backoff: Duration::from_secs(max * 60),
-                lifetime: Duration::from_secs(lifetime_days * 86_400),
+                retries,
+                lifetime: Duration::from_secs(lifetime_hours * 3_600),
                 sweep_interval: Duration::from_secs(sweep_seconds),
             }
         }
@@ -444,18 +464,19 @@ pub fn load_str(src: &str) -> Result<Config, Vec<Problem>> {
     // answers "not ours", so the one person who could act on it — the
     // original sender's postmaster — never hears anything at all.
     if let Some(srs) = &srs {
-        let lifetime_days = queue.lifetime.as_secs() / 86_400;
-        if lifetime_days > u64::from(srs.max_age_days) {
+        let lifetime_hours = queue.lifetime.as_secs() / 3_600;
+        let window_hours = u64::from(srs.max_age_days) * 24;
+        if lifetime_hours > window_hours {
             let message = format!(
-                "queue.lifetime_days ({lifetime_days}) must not exceed srs.max_age_days \
-                 ({}): a message still being retried on the last day leaves with a \
-                 rewritten sender that has already expired, so the destination's bounce \
-                 comes back to an address mxhop no longer recognises and the report is \
-                 lost",
+                "queue.lifetime_hours ({lifetime_hours}) must not exceed \
+                 srs.max_age_days ({} days, {window_hours} hours): a message still being \
+                 retried after that leaves with a rewritten sender that has already \
+                 expired, so the destination's bounce comes back to an address mxhop no \
+                 longer recognises and the report is lost",
                 srs.max_age_days
             );
             problems.push(
-                match raw.queue.as_ref().and_then(|q| q.lifetime_days.as_ref()) {
+                match raw.queue.as_ref().and_then(|q| q.lifetime_hours.as_ref()) {
                     Some(v) => at(src, v.span(), message),
                     // Neither number was stated, or only the srs one was: the
                     // line that can be pointed at is the table.
@@ -756,46 +777,6 @@ fn at(src: &str, span: Range<usize>, message: String) -> Problem {
     }
 }
 
-/// One of the two `[queue]` intervals stated in minutes, checked against the
-/// same floor and ceiling. Written once because the two differ only in their
-/// name, and a message naming the wrong field is worse than no message.
-fn minutes(
-    src: &str,
-    problems: &mut Vec<Problem>,
-    stated: Option<&Spanned<u64>>,
-    field: &str,
-    default: u64,
-) -> u64 {
-    match stated {
-        None => default,
-        Some(v) if *v.get_ref() == 0 => {
-            problems.push(at(
-                src,
-                v.span(),
-                format!(
-                    "queue.{field} must be at least 1: a destination that said \"try \
-                     later\" and is tried again in the same instant is a destination \
-                     that rate-limits us next"
-                ),
-            ));
-            default
-        }
-        Some(v) if *v.get_ref() > crate::queue::MAX_BACKOFF_MINUTES => {
-            problems.push(at(
-                src,
-                v.span(),
-                format!(
-                    "queue.{field} must be at most {}: a day between attempts inside a \
-                     lifetime measured in days is a schedule that retries almost nothing",
-                    crate::queue::MAX_BACKOFF_MINUTES
-                ),
-            ));
-            default
-        }
-        Some(v) => *v.get_ref(),
-    }
-}
-
 /// Best effort for things TOML table keys cannot carry a span for — a domain
 /// header. Finds the first line mentioning the name; if the file is strange
 /// enough that this misses, the problem is still reported, just without a
@@ -834,9 +815,8 @@ struct Raw {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawQueue {
-    lifetime_days: Option<Spanned<u32>>,
-    first_backoff_minutes: Option<Spanned<u64>>,
-    max_backoff_minutes: Option<Spanned<u64>>,
+    retry_minutes: Option<Spanned<Vec<u64>>>,
+    lifetime_hours: Option<Spanned<u64>>,
     sweep_seconds: Option<Spanned<u64>>,
 }
 
@@ -1642,15 +1622,21 @@ hi = \"me@gmail.com\"
     #[test]
     fn a_queue_table_is_read_in_the_units_it_is_written_in() {
         let src = format!(
-            "{MINIMAL}\n[queue]\nlifetime_days = 2\nfirst_backoff_minutes = 10\n\
-             max_backoff_minutes = 60\nsweep_seconds = 30\n"
+            "{MINIMAL}\n[queue]\nretry_minutes = [2, 7, 30]\nlifetime_hours = 12\n\
+             sweep_seconds = 30\n"
         );
 
         let c = load_str(&src).expect("a queue table should load");
 
-        assert_eq!(c.queue.lifetime, Duration::from_secs(2 * 86_400));
-        assert_eq!(c.queue.first_backoff, Duration::from_secs(600));
-        assert_eq!(c.queue.max_backoff, Duration::from_secs(3_600));
+        assert_eq!(
+            c.queue.retries,
+            vec![
+                Duration::from_secs(120),
+                Duration::from_secs(420),
+                Duration::from_secs(1_800)
+            ]
+        );
+        assert_eq!(c.queue.lifetime, Duration::from_secs(12 * 3_600));
         assert_eq!(c.queue.sweep_interval, Duration::from_secs(30));
     }
 
@@ -1662,60 +1648,67 @@ hi = \"me@gmail.com\"
 
         assert_eq!(c.queue.sweep_interval, Duration::from_secs(15));
         assert_eq!(c.queue.lifetime, Schedule::default().lifetime);
-        assert_eq!(c.queue.first_backoff, Schedule::default().first_backoff);
+        assert_eq!(c.queue.retries, Schedule::default().retries);
+    }
+
+    /// A queue that never retries is a queue that accepts mail and sits on
+    /// it until the lifetime runs out, which is the one thing this table
+    /// must not be able to configure by accident.
+    #[test]
+    fn an_empty_retry_list_is_refused() {
+        let src = format!("{MINIMAL}\n[queue]\nretry_minutes = []\n");
+
+        let problem = only_problem(&src);
+
+        assert!(
+            problem.contains("queue.retry_minutes must state at least one interval"),
+            "{problem}"
+        );
+        assert_eq!(problem_line(&problem), line_with(&src, "retry_minutes"));
+    }
+
+    #[test]
+    fn a_zero_in_the_retry_list_is_refused_and_the_message_names_it() {
+        let src = format!("{MINIMAL}\n[queue]\nretry_minutes = [1, 0, 15]\n");
+
+        let problem = only_problem(&src);
+
+        assert!(problem.contains("must not contain 0"), "{problem}");
+    }
+
+    #[test]
+    fn an_interval_longer_than_a_day_is_refused() {
+        let src = format!("{MINIMAL}\n[queue]\nretry_minutes = [1, 5000]\n");
+
+        let problem = only_problem(&src);
+
+        assert!(problem.contains("must not contain 5000"), "{problem}");
+        assert!(
+            problem.contains("1440"),
+            "the ceiling has to be in the message: {problem}"
+        );
     }
 
     #[test]
     fn a_zero_lifetime_is_refused() {
-        let src = format!("{MINIMAL}\n[queue]\nlifetime_days = 0\n");
+        let src = format!("{MINIMAL}\n[queue]\nlifetime_hours = 0\n");
 
         let problem = only_problem(&src);
 
         assert!(
-            problem.contains("queue.lifetime_days must be at least 1"),
+            problem.contains("queue.lifetime_hours must be at least 1"),
             "{problem}"
         );
-        assert_eq!(problem_line(&problem), line_with(&src, "lifetime_days"));
+        assert_eq!(problem_line(&problem), line_with(&src, "lifetime_hours"));
     }
 
     #[test]
     fn a_lifetime_of_months_is_refused() {
-        let src = format!("{MINIMAL}\n[queue]\nlifetime_days = 90\n");
+        let src = format!("{MINIMAL}\n[queue]\nlifetime_hours = 2000\n");
 
         let problem = only_problem(&src);
 
-        assert!(problem.contains("must be at most 30"), "{problem}");
-    }
-
-    #[test]
-    fn a_zero_interval_is_refused_by_the_field_an_operator_typed() {
-        let src = format!("{MINIMAL}\n[queue]\nfirst_backoff_minutes = 0\n");
-
-        let problem = only_problem(&src);
-
-        assert!(
-            problem.contains("queue.first_backoff_minutes must be at least 1"),
-            "the message has to name the field that is wrong, not the other one: \
-             {problem}"
-        );
-    }
-
-    #[test]
-    fn a_ceiling_below_the_first_interval_is_refused() {
-        let src =
-            format!("{MINIMAL}\n[queue]\nfirst_backoff_minutes = 30\nmax_backoff_minutes = 5\n");
-
-        let problem = only_problem(&src);
-
-        assert!(
-            problem.contains("must not be below"),
-            "a ceiling under the floor would make the second attempt sooner than the \
-             first: {problem}"
-        );
-        assert_eq!(
-            problem_line(&problem),
-            line_with(&src, "max_backoff_minutes")
-        );
+        assert!(problem.contains("must be at most 720"), "{problem}");
     }
 
     #[test]
@@ -1737,7 +1730,7 @@ hi = \"me@gmail.com\"
     /// nothing at all.
     #[test]
     fn a_lifetime_longer_than_the_srs_window_is_refused() {
-        let src = format!("{MINIMAL}{SRS}max_age_days = 2\n[queue]\nlifetime_days = 4\n");
+        let src = format!("{MINIMAL}{SRS}max_age_days = 1\n[queue]\nlifetime_hours = 48\n");
 
         let problem = only_problem(&src);
 
@@ -1745,16 +1738,18 @@ hi = \"me@gmail.com\"
             problem.contains("must not exceed srs.max_age_days"),
             "{problem}"
         );
-        assert_eq!(problem_line(&problem), line_with(&src, "lifetime_days"));
+        assert_eq!(problem_line(&problem), line_with(&src, "lifetime_hours"));
     }
 
+    /// The default pair has to be one of the combinations that loads: two
+    /// days of attempts inside a seven-day SRS window.
     #[test]
-    fn a_lifetime_inside_the_srs_window_loads() {
-        let src = format!("{MINIMAL}{SRS}[queue]\nlifetime_days = 4\n");
+    fn the_defaults_fit_inside_the_default_srs_window() {
+        let src = format!("{MINIMAL}{SRS}");
 
-        let c = load_str(&src).expect("four days inside the default seven should load");
+        let c = load_str(&src).expect("the two defaults have to fit inside one another");
 
-        assert_eq!(c.queue.lifetime, Duration::from_secs(4 * 86_400));
+        assert_eq!(c.queue.lifetime, Duration::from_secs(48 * 3_600));
     }
 
     #[test]

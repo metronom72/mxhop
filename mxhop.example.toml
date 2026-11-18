@@ -202,30 +202,27 @@ noreply = { reject = "550 5.1.1 this address does not accept mail" }
 #
 # [queue]
 #
-# The wait after the first failed attempt, and the step every later wait
-# doubles from: 5, 10, 20, 40, 80 minutes, then the ceiling. Shorter than this
-# is how a forwarder earns a rate limit of its own — what is usually being
-# waited out is a destination under load or a greylist, and both clear in
-# minutes.
-# first_backoff_minutes = 5
+# The wait before each attempt after the first, in minutes. The last interval
+# repeats for as long as the message is queued, so this list is a whole
+# schedule and not the start of one: one minute, five, fifteen, an hour, then
+# every four hours.
 #
-# The ceiling the doubling stops at. Without one, a message stuck for a day
-# waits another day, so the moment the destination comes back is the moment
-# nothing is delivered.
-# max_backoff_minutes = 120
+# One minute first because what is usually being waited out is a greylist,
+# and a greylist clears in a minute. Shorter than that for the later ones is
+# how a forwarder earns a rate limit of its own.
+# retry_minutes = [1, 5, 15, 60, 240]
 #
 # How long a message may stay in the queue. After this mxhop stops trying and
 # moves both files to `frozen/`, where they stay readable — nothing is
 # deleted, because an accepted message is somebody's mail and this is the only
 # copy of it, and mxhop cannot yet send a delivery report to say it gave up.
 #
-# Four days rather than Postfix's five because of SRS: the rewritten sender a
-# destination bounces to is only valid for `srs.max_age_days`, so giving up on
-# day four leaves three for that report to arrive. `mxhop check` refuses a
-# lifetime longer than that window — a last attempt made after it has expired
+# It has to fit inside the SRS window: the rewritten sender a destination
+# bounces to is only valid for `srs.max_age_days`, so `mxhop check` refuses a
+# lifetime longer than that — a last attempt made after it has expired
 # provokes a bounce that comes back to an address mxhop no longer recognises,
 # and the report is lost.
-# lifetime_days = 4
+# lifetime_hours = 48
 #
 # How often the queue is read from disk. The schedule lives in the envelopes,
 # so this is only the resolution of the clock that reads them: there is no
