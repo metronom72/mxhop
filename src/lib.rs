@@ -8,6 +8,7 @@ pub mod config;
 pub mod dns;
 pub mod envelope;
 pub mod policy;
+pub mod queue;
 pub mod routing;
 pub mod server;
 pub mod smtp;

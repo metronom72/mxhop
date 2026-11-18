@@ -44,9 +44,23 @@ pub struct Envelope {
     #[serde(default)]
     pub authentication_results: String,
     /// What the destination last said about this message, for the operator
-    /// reading `queue/`. Not acted on: there is no retry queue yet.
+    /// reading `queue/` — and the reason the next attempt is being made.
     #[serde(default)]
     pub last_reply: Option<String>,
+    /// How many delivery attempts this copy has already cost. A message
+    /// reaches the queue having been tried once already, in the session that
+    /// accepted it, so a held envelope is written with `1`: the wait before
+    /// the next attempt is a function of this number, and starting it at
+    /// zero would try the same destination twice in five minutes.
+    #[serde(default)]
+    pub attempts: u32,
+    /// The earliest moment the queue runner may try again, in unix
+    /// milliseconds. `0` — the default, and therefore what an envelope
+    /// written before this field existed says — means "now", which is the
+    /// right reading: a message that was held under an older build has been
+    /// waiting since that build stopped running.
+    #[serde(default)]
+    pub next_attempt_unix_ms: u64,
 }
 
 impl Envelope {
@@ -78,6 +92,8 @@ mod tests {
             received: "Received: from mail.elsewhere.test\r\n".into(),
             authentication_results: "Authentication-Results: mx.example.com; dkim=none\r\n".into(),
             last_reply: None,
+            attempts: 0,
+            next_attempt_unix_ms: 0,
         }
     }
 
@@ -97,6 +113,33 @@ mod tests {
 
         assert!(json.contains("\"from\":null"), "{json}");
         assert!(serde_json::from_str::<Envelope>(&json).unwrap().is_bounce());
+    }
+
+    /// An envelope written by a build that had no retry queue still has to
+    /// be readable, and it has to come back as a message that is *due*: the
+    /// fields it lacks mean "try it now". Refusing to read it, or reading it
+    /// as scheduled for the epoch plus a backoff, would leave a message in
+    /// `queue/` that nothing ever delivers — which is the state this whole
+    /// milestone exists to end.
+    #[test]
+    fn an_envelope_from_before_the_retry_queue_is_due_immediately() {
+        let json = r#"{
+            "id": "0000001762400000-000001-1a2b",
+            "from": "sender@elsewhere.test",
+            "to": ["hi@example.com"],
+            "helo": "mail.elsewhere.test",
+            "peer": "198.51.100.7:40000",
+            "received_at_unix_ms": 1762400000000,
+            "size": 42
+        }"#;
+
+        let envelope: Envelope = serde_json::from_str(json).expect("an older envelope still reads");
+
+        assert_eq!(envelope.attempts, 0);
+        assert_eq!(
+            envelope.next_attempt_unix_ms, 0,
+            "zero is in the past, so the first sweep after an upgrade picks it up"
+        );
     }
 
     #[test]

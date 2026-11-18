@@ -318,11 +318,25 @@ pub fn decide(
         });
     }
 
-    // Grouped by domain, in the order the domains were first seen, so one
-    // connection serves every recipient at that destination and the order is
-    // reproducible for a test to assert on.
+    Decision::Deliver(Plan {
+        groups: group_by_domain(flat),
+        // As it arrived. The session rewrites it into the SRS domain on the
+        // way out, where the clock is; the null sender stays null either way
+        // — a bounce that acquired a sender could be bounced again.
+        sender: envelope.from.clone(),
+    })
+}
+
+/// Recipients grouped by domain, in the order the domains were first seen.
+///
+/// One connection serves one domain, so this is the shape delivery wants; the
+/// order is the order they arrived in, which keeps it reproducible for a test
+/// to assert on. Shared with the queue runner, which groups the recipients
+/// that are still deferred — the rule that one connection serves one domain
+/// is not the inbound session's rule, it is SMTP's.
+pub fn group_by_domain(recipients: Vec<Mailbox>) -> Vec<Group> {
     let mut groups: Vec<Group> = Vec::new();
-    for mailbox in flat {
+    for mailbox in recipients {
         match groups.iter_mut().find(|g| g.domain == mailbox.domain()) {
             Some(group) => group.recipients.push(mailbox),
             None => groups.push(Group {
@@ -331,14 +345,7 @@ pub fn decide(
             }),
         }
     }
-
-    Decision::Deliver(Plan {
-        groups,
-        // As it arrived. The session rewrites it into the SRS domain on the
-        // way out, where the clock is; the null sender stays null either way
-        // — a bounce that acquired a sender could be bounced again.
-        sender: envelope.from.clone(),
-    })
+    groups
 }
 
 /// The loop rules, on the trace alone, or `None` if this message is not in
@@ -906,6 +913,8 @@ mod tests {
             received: String::new(),
             authentication_results: String::new(),
             last_reply: None,
+            attempts: 0,
+            next_attempt_unix_ms: 0,
         }
     }
 

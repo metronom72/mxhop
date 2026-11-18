@@ -371,6 +371,14 @@ async fn run(cli: &Cli) -> ExitCode {
         spawn_reload_on_hangup_without_tls();
     }
 
+    // The queue runner, beside the accept loop rather than inside it: a
+    // message is retried because it is on disk, not because another one
+    // arrives, and a host whose mail has stopped coming in is exactly when
+    // the queue has to keep draining.
+    tokio::spawn(
+        mxhop::queue::Runner::new(Arc::clone(&spool), Arc::clone(&relay), srs.clone()).run(),
+    );
+
     accept_loop(listener, session_config, router, srs, spool, relay, tls).await;
     ExitCode::SUCCESS
 }
