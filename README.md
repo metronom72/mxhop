@@ -29,7 +29,7 @@ been proved end to end. Do not point an MX record at it.
 | Synchronous relay, hop limit — **0.1** | done |
 | SRS and bounce decoding | done |
 | SPF/DKIM/DMARC and `Authentication-Results` | done |
-| Queue, retries — per-host backoff still to come | done |
+| Queue, retries, per-host backoff | done |
 | DSNs for queued failures | planned |
 | Metrics, health, graceful shutdown — **0.2** | planned |
 | ARC sealing | planned |
@@ -231,7 +231,7 @@ What lands in `queue/` is what mxhop could not hand back: a message one of
 whose destinations took it while another deferred. The sender has been told
 `250` and will never send it again, so that copy is now the only one.
 
-mxhop reads `queue/` once a minute and tries whatever is due:
+mxhop reads `queue/` every `sweep_seconds` and tries whatever is due:
 
 | attempt | wait before it |
 |---|---|
@@ -270,12 +270,56 @@ The next sweep picks them up. The same goes for editing a recipient in an
 envelope by hand: the schedule lives in the file, nothing is cached, and
 `queue/` is the whole administration interface.
 
-Two things are not in this yet. There is no **per-host backoff**: a hundred
-messages queued for one dead destination are a hundred connection attempts
-per sweep rather than one, which is the next change to this file. And a
-restart does not resume anything in flight — a message whose delivery was
-interrupted is in `queue/` with its old schedule, so it is tried again at
-once.
+### One failure stands in for the destination
+
+A destination that defers everything it is handed is not connected to again
+until its own wait is over, and every other message queued for it is skipped
+in the meantime — without costing those messages an attempt, and without
+touching their schedule. The wait doubles the same way a message's does, on
+the destination's own count of consecutive failures, and is forgotten the
+moment it answers for itself by taking a message or refusing one.
+
+Without that, a hundred messages queued for one dead host were a hundred
+connection attempts per sweep, every one of them waiting out the connect
+timeout, and mail for the destinations that *were* up waited behind them.
+With it, one connection per interval finds out whether the host is back, and
+the backlog goes out in the sweep that finds it.
+
+The count is in memory and lost on restart, which costs one connection per
+destination after one and is the right trade: it is a fact about a host right
+now, not about any message, and writing it into an envelope would put one
+message in charge of a decision it shares with others.
+
+A message whose recipients span two domains is skipped whole if either is
+backed off. That costs the healthy domain a wait of at most one ceiling and
+buys a rule with one clock in it; it is also nearly free in practice, since
+the recipients that were delivered came off the envelope when the message was
+first held.
+
+### Changing any of it
+
+The `[queue]` table, with these defaults:
+
+```toml
+[queue]
+first_backoff_minutes = 5
+max_backoff_minutes = 120
+lifetime_days = 4
+sweep_seconds = 60
+```
+
+`mxhop check` refuses a `lifetime_days` longer than `srs.max_age_days`, a
+`max_backoff_minutes` below `first_backoff_minutes`, and a zero anywhere —
+zero means something different for each of them and all four meanings are a
+queue that has quietly stopped being one. It also prints the schedule it
+would run with, so the file does not have to be read back to see it.
+
+One thing is still missing: a restart does not resume anything in flight. A
+message killed mid-delivery is in `queue/` with its old schedule, so it is
+tried again at once — and if the destination had already accepted it, that is
+a second copy. The window is one message wide, and closing it means recording
+an attempt before it is made rather than after, which is a change to what the
+envelope holds and not to the runner.
 
 ## What arriving mail is checked for
 

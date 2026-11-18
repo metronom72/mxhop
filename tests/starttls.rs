@@ -212,6 +212,7 @@ async fn a_reload_is_seen_by_the_next_connection_and_not_the_current_one() {
         handshake_timeout: std::time::Duration::from_secs(10),
         ptr_timeout: std::time::Duration::from_secs(10),
         relay_budget: mxhop::smtp::session::RELAY_BUDGET,
+        queue: mxhop::queue::Schedule::default(),
         limits: mxhop::policy::Limits::default(),
         auth_enabled: true,
     });

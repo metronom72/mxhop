@@ -87,6 +87,11 @@ pub struct SessionConfig {
     /// strip runs in this file and would otherwise keep running. See where it
     /// is read for why that matters.
     pub auth_enabled: bool,
+    /// When the queue runner will try a held message again. The session
+    /// writes the first interval into the envelope it holds, so it has to be
+    /// the one the runner would have computed: two copies of that number
+    /// would mean a message scheduled by one and read by the other.
+    pub queue: crate::queue::Schedule,
 }
 
 impl SessionConfig {
@@ -106,6 +111,7 @@ impl SessionConfig {
                 ..Limits::default()
             },
             auth_enabled: config.auth.enabled,
+            queue: config.queue.clone(),
         }
     }
 }
@@ -970,7 +976,7 @@ where
                 .join("; "),
         ),
         attempts,
-        next_attempt_unix_ms: now_unix_ms() + crate::queue::backoff(attempts).as_millis() as u64,
+        next_attempt_unix_ms: now_unix_ms() + config.queue.backoff(attempts).as_millis() as u64,
         ..envelope.clone()
     };
     match spool.store(&held, &body).await {
@@ -981,7 +987,7 @@ where
             %peer,
             id = %held.id,
             held = held.to.join(", "),
-            minutes = crate::queue::backoff(attempts).as_secs() / 60,
+            minutes = config.queue.backoff(attempts).as_secs() / 60,
             "part of the message was not delivered and is held in the queue for the \
              runner to retry: {}",
             held.last_reply.as_deref().unwrap_or("no reason recorded")
@@ -1358,6 +1364,7 @@ mod tests {
             handshake_timeout: Duration::from_secs(10),
             ptr_timeout: Duration::from_secs(10),
             relay_budget: RELAY_BUDGET,
+            queue: crate::queue::Schedule::default(),
             auth_enabled,
             limits: Limits::default(),
         };
@@ -2399,6 +2406,7 @@ mod tests {
             handshake_timeout: Duration::from_millis(50),
             ptr_timeout: Duration::from_secs(10),
             relay_budget: RELAY_BUDGET,
+            queue: crate::queue::Schedule::default(),
             auth_enabled: true,
             limits: Limits::default(),
         };
@@ -2636,6 +2644,7 @@ mod tests {
             handshake_timeout: Duration::from_millis(200),
             ptr_timeout: Duration::from_secs(10),
             relay_budget: RELAY_BUDGET,
+            queue: crate::queue::Schedule::default(),
             auth_enabled: true,
             limits: Limits::default(),
         };

@@ -136,8 +136,22 @@ fn check(cli: &Cli) -> ExitCode {
     }
 
     let domains: Vec<&str> = config.router.domains().collect();
+    // What happens to a message a destination defers. Printed because the end
+    // of it — mxhop giving up — is the one outcome nobody is told about, so an
+    // operator should at least know when that is.
+    let retries = format!(
+        ", a deferred message retried from {} minutes up to every {}, and given up on \
+         after {} days",
+        config.queue.first_backoff.as_secs() / 60,
+        match config.queue.max_backoff.as_secs() / 60 {
+            60 => "hour".to_string(),
+            minutes if minutes % 60 == 0 => format!("{} hours", minutes / 60),
+            minutes => format!("{minutes} minutes"),
+        },
+        config.queue.lifetime.as_secs() / 86_400,
+    );
     println!(
-        "{}: ok — {} on {}, {} {} for {}{}{}{}",
+        "{}: ok — {} on {}, {} {} for {}{}{}{}{}",
         cli.config.display(),
         config.hostname,
         config.listen,
@@ -183,6 +197,7 @@ fn check(cli: &Cli) -> ExitCode {
             (true, mxhop::policy::Enforce::Off) =>
                 ", SPF/DKIM/DMARC checked and stamped, never refused".to_string(),
         },
+        retries,
     );
     ExitCode::SUCCESS
 }
@@ -376,7 +391,13 @@ async fn run(cli: &Cli) -> ExitCode {
     // arrives, and a host whose mail has stopped coming in is exactly when
     // the queue has to keep draining.
     tokio::spawn(
-        mxhop::queue::Runner::new(Arc::clone(&spool), Arc::clone(&relay), srs.clone()).run(),
+        mxhop::queue::Runner::new(
+            Arc::clone(&spool),
+            Arc::clone(&relay),
+            srs.clone(),
+            config.queue.clone(),
+        )
+        .run(),
     );
 
     accept_loop(listener, session_config, router, srs, spool, relay, tls).await;

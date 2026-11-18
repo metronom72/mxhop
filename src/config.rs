@@ -11,12 +11,14 @@ use std::fs;
 use std::net::SocketAddr;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::Deserialize;
 use serde::de::{self, Deserializer};
 use toml::Spanned;
 
 use crate::policy::Enforce;
+use crate::queue::Schedule;
 use crate::routing::{CATCH_ALL, Mailbox, Route, Router, is_qualified};
 
 /// Gmail's ceiling, and a sane default: a forwarder that accepts more than the
@@ -41,6 +43,10 @@ pub struct Config {
     /// sender — which is how mail arrives at Gmail with a failing SPF check,
     /// so this is a table an operator wants, not an optional nicety.
     pub srs: Option<SrsSettings>,
+    /// When the queue runner tries a held message again, and how long it
+    /// keeps trying. The `[queue]` table, or [`Schedule::default`] when the
+    /// file leaves it out.
+    pub queue: Schedule,
     /// Whether inbound mail is authenticated, and what a failure is worth.
     /// Not an `Option`: an absent `[auth]` table is the default, which is on.
     pub auth: AuthSettings,
@@ -317,6 +323,151 @@ pub fn load_str(src: &str) -> Result<Config, Vec<Problem>> {
         }
     });
 
+    // The `[queue]` table. Every number has a floor of one, and the floor is
+    // worth checking rather than clamping: zero means something different for
+    // each of them, and all four meanings are a queue that quietly stops
+    // being one.
+    let queue = match &raw.queue {
+        None => Schedule::default(),
+        Some(table) => {
+            let default = Schedule::default();
+
+            let lifetime_days = match &table.lifetime_days {
+                None => default.lifetime.as_secs() / 86_400,
+                Some(v) if *v.get_ref() == 0 => {
+                    problems.push(at(
+                        src,
+                        v.span(),
+                        "queue.lifetime_days must be at least 1: zero gives up on a \
+                         message the first time it is looked at, and mxhop cannot yet \
+                         tell its sender that it did"
+                            .to_string(),
+                    ));
+                    default.lifetime.as_secs() / 86_400
+                }
+                Some(v) if *v.get_ref() > crate::queue::MAX_LIFETIME_DAYS => {
+                    problems.push(at(
+                        src,
+                        v.span(),
+                        format!(
+                            "queue.lifetime_days must be at most {}: {} is a month of \
+                             attempts in which nobody has been told anything, and every \
+                             sender's postmaster gave up waiting long before it",
+                            crate::queue::MAX_LIFETIME_DAYS,
+                            v.get_ref()
+                        ),
+                    ));
+                    default.lifetime.as_secs() / 86_400
+                }
+                Some(v) => u64::from(*v.get_ref()),
+            };
+
+            let first = minutes(
+                src,
+                &mut problems,
+                table.first_backoff_minutes.as_ref(),
+                "first_backoff_minutes",
+                default.first_backoff.as_secs() / 60,
+            );
+            let max = minutes(
+                src,
+                &mut problems,
+                table.max_backoff_minutes.as_ref(),
+                "max_backoff_minutes",
+                default.max_backoff.as_secs() / 60,
+            );
+            if max < first {
+                // Reported on whichever of the two the file actually states,
+                // preferring the ceiling: that is the one an operator lowers
+                // without thinking about the other.
+                let span = table
+                    .max_backoff_minutes
+                    .as_ref()
+                    .or(table.first_backoff_minutes.as_ref())
+                    .map(|v| v.span());
+                let message = format!(
+                    "queue.max_backoff_minutes ({max}) must not be below \
+                     queue.first_backoff_minutes ({first}): the ceiling is what every \
+                     wait after the first stops at, so a lower one would make the \
+                     second attempt sooner than the first"
+                );
+                problems.push(match span {
+                    Some(span) => at(src, span, message),
+                    None => Problem {
+                        line: line_of_text(src, "[queue]"),
+                        message,
+                    },
+                });
+            }
+
+            let sweep_seconds = match &table.sweep_seconds {
+                None => default.sweep_interval.as_secs(),
+                Some(v) if *v.get_ref() == 0 => {
+                    problems.push(at(
+                        src,
+                        v.span(),
+                        "queue.sweep_seconds must be at least 1: a queue read in a tight \
+                         loop is a destination connected to in a tight loop"
+                            .to_string(),
+                    ));
+                    default.sweep_interval.as_secs()
+                }
+                Some(v) if *v.get_ref() > crate::queue::MAX_SWEEP_SECONDS => {
+                    problems.push(at(
+                        src,
+                        v.span(),
+                        format!(
+                            "queue.sweep_seconds must be at most {}: the schedule lives in \
+                             the envelopes, and reading them less often than that makes \
+                             every interval in it longer than it says",
+                            crate::queue::MAX_SWEEP_SECONDS
+                        ),
+                    ));
+                    default.sweep_interval.as_secs()
+                }
+                Some(v) => *v.get_ref(),
+            };
+
+            Schedule {
+                first_backoff: Duration::from_secs(first * 60),
+                max_backoff: Duration::from_secs(max * 60),
+                lifetime: Duration::from_secs(lifetime_days * 86_400),
+                sweep_interval: Duration::from_secs(sweep_seconds),
+            }
+        }
+    };
+
+    // The two windows have to fit inside one another. A destination that
+    // refuses a forwarded message bounces to the rewritten sender, and that
+    // address only decodes for `srs.max_age_days`: a last attempt made after
+    // it has expired provokes a report that comes back to an address mxhop
+    // answers "not ours", so the one person who could act on it — the
+    // original sender's postmaster — never hears anything at all.
+    if let Some(srs) = &srs {
+        let lifetime_days = queue.lifetime.as_secs() / 86_400;
+        if lifetime_days > u64::from(srs.max_age_days) {
+            let message = format!(
+                "queue.lifetime_days ({lifetime_days}) must not exceed srs.max_age_days \
+                 ({}): a message still being retried on the last day leaves with a \
+                 rewritten sender that has already expired, so the destination's bounce \
+                 comes back to an address mxhop no longer recognises and the report is \
+                 lost",
+                srs.max_age_days
+            );
+            problems.push(
+                match raw.queue.as_ref().and_then(|q| q.lifetime_days.as_ref()) {
+                    Some(v) => at(src, v.span(), message),
+                    // Neither number was stated, or only the srs one was: the
+                    // line that can be pointed at is the table.
+                    None => Problem {
+                        line: line_of_text(src, "[srs]"),
+                        message,
+                    },
+                },
+            );
+        }
+    }
+
     let auth = match &raw.auth {
         None => AuthSettings::default(),
         Some(table) => {
@@ -517,6 +668,7 @@ pub fn load_str(src: &str) -> Result<Config, Vec<Problem>> {
         router,
         tls,
         srs,
+        queue,
         auth,
     })
 }
@@ -604,6 +756,46 @@ fn at(src: &str, span: Range<usize>, message: String) -> Problem {
     }
 }
 
+/// One of the two `[queue]` intervals stated in minutes, checked against the
+/// same floor and ceiling. Written once because the two differ only in their
+/// name, and a message naming the wrong field is worse than no message.
+fn minutes(
+    src: &str,
+    problems: &mut Vec<Problem>,
+    stated: Option<&Spanned<u64>>,
+    field: &str,
+    default: u64,
+) -> u64 {
+    match stated {
+        None => default,
+        Some(v) if *v.get_ref() == 0 => {
+            problems.push(at(
+                src,
+                v.span(),
+                format!(
+                    "queue.{field} must be at least 1: a destination that said \"try \
+                     later\" and is tried again in the same instant is a destination \
+                     that rate-limits us next"
+                ),
+            ));
+            default
+        }
+        Some(v) if *v.get_ref() > crate::queue::MAX_BACKOFF_MINUTES => {
+            problems.push(at(
+                src,
+                v.span(),
+                format!(
+                    "queue.{field} must be at most {}: a day between attempts inside a \
+                     lifetime measured in days is a schedule that retries almost nothing",
+                    crate::queue::MAX_BACKOFF_MINUTES
+                ),
+            ));
+            default
+        }
+        Some(v) => *v.get_ref(),
+    }
+}
+
 /// Best effort for things TOML table keys cannot carry a span for — a domain
 /// header. Finds the first line mentioning the name; if the file is strange
 /// enough that this misses, the problem is still reported, just without a
@@ -636,6 +828,16 @@ struct Raw {
     tls: Option<RawTls>,
     srs: Option<RawSrs>,
     auth: Option<RawAuth>,
+    queue: Option<RawQueue>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawQueue {
+    lifetime_days: Option<Spanned<u32>>,
+    first_backoff_minutes: Option<Spanned<u64>>,
+    max_backoff_minutes: Option<Spanned<u64>>,
+    sweep_seconds: Option<Spanned<u64>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -733,6 +935,16 @@ hi = "me@gmail.com"
             .iter()
             .map(ToString::to_string)
             .collect()
+    }
+
+    /// The line a problem is reported on, read back off its own message, so
+    /// a test can say "on the line the operator typed" without hand-counting.
+    fn problem_line(problem: &str) -> usize {
+        problem
+            .strip_prefix("line ")
+            .and_then(|rest| rest.split_once(':'))
+            .and_then(|(n, _)| n.parse().ok())
+            .unwrap_or_else(|| panic!("this problem names no line: {problem}"))
     }
 
     fn only_problem(src: &str) -> String {
@@ -1416,5 +1628,141 @@ hi = \"me@gmail.com\"
             !problems(&src).is_empty(),
             "a key nobody reads is a setting that silently does not apply"
         );
+    }
+
+    // ------------------------------------------------------------ [queue]
+
+    #[test]
+    fn a_file_without_a_queue_table_gets_the_default_schedule() {
+        let c = load_str(MINIMAL).expect("minimal configuration should load");
+
+        assert_eq!(c.queue, Schedule::default());
+    }
+
+    #[test]
+    fn a_queue_table_is_read_in_the_units_it_is_written_in() {
+        let src = format!(
+            "{MINIMAL}\n[queue]\nlifetime_days = 2\nfirst_backoff_minutes = 10\n\
+             max_backoff_minutes = 60\nsweep_seconds = 30\n"
+        );
+
+        let c = load_str(&src).expect("a queue table should load");
+
+        assert_eq!(c.queue.lifetime, Duration::from_secs(2 * 86_400));
+        assert_eq!(c.queue.first_backoff, Duration::from_secs(600));
+        assert_eq!(c.queue.max_backoff, Duration::from_secs(3_600));
+        assert_eq!(c.queue.sweep_interval, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn a_partly_stated_queue_table_keeps_the_defaults_for_the_rest() {
+        let src = format!("{MINIMAL}\n[queue]\nsweep_seconds = 15\n");
+
+        let c = load_str(&src).expect("a partial queue table should load");
+
+        assert_eq!(c.queue.sweep_interval, Duration::from_secs(15));
+        assert_eq!(c.queue.lifetime, Schedule::default().lifetime);
+        assert_eq!(c.queue.first_backoff, Schedule::default().first_backoff);
+    }
+
+    #[test]
+    fn a_zero_lifetime_is_refused() {
+        let src = format!("{MINIMAL}\n[queue]\nlifetime_days = 0\n");
+
+        let problem = only_problem(&src);
+
+        assert!(
+            problem.contains("queue.lifetime_days must be at least 1"),
+            "{problem}"
+        );
+        assert_eq!(problem_line(&problem), line_with(&src, "lifetime_days"));
+    }
+
+    #[test]
+    fn a_lifetime_of_months_is_refused() {
+        let src = format!("{MINIMAL}\n[queue]\nlifetime_days = 90\n");
+
+        let problem = only_problem(&src);
+
+        assert!(problem.contains("must be at most 30"), "{problem}");
+    }
+
+    #[test]
+    fn a_zero_interval_is_refused_by_the_field_an_operator_typed() {
+        let src = format!("{MINIMAL}\n[queue]\nfirst_backoff_minutes = 0\n");
+
+        let problem = only_problem(&src);
+
+        assert!(
+            problem.contains("queue.first_backoff_minutes must be at least 1"),
+            "the message has to name the field that is wrong, not the other one: \
+             {problem}"
+        );
+    }
+
+    #[test]
+    fn a_ceiling_below_the_first_interval_is_refused() {
+        let src =
+            format!("{MINIMAL}\n[queue]\nfirst_backoff_minutes = 30\nmax_backoff_minutes = 5\n");
+
+        let problem = only_problem(&src);
+
+        assert!(
+            problem.contains("must not be below"),
+            "a ceiling under the floor would make the second attempt sooner than the \
+             first: {problem}"
+        );
+        assert_eq!(
+            problem_line(&problem),
+            line_with(&src, "max_backoff_minutes")
+        );
+    }
+
+    #[test]
+    fn a_sweep_slower_than_an_hour_is_refused() {
+        let src = format!("{MINIMAL}\n[queue]\nsweep_seconds = 7200\n");
+
+        let problem = only_problem(&src);
+
+        assert!(
+            problem.contains("queue.sweep_seconds must be at most 3600"),
+            "{problem}"
+        );
+    }
+
+    /// The two windows have to nest. A message still being retried after the
+    /// SRS address it leaves with has expired provokes a bounce that comes
+    /// back to an address mxhop no longer recognises, so the report is lost —
+    /// and the sender's postmaster, the one person who could act, hears
+    /// nothing at all.
+    #[test]
+    fn a_lifetime_longer_than_the_srs_window_is_refused() {
+        let src = format!("{MINIMAL}{SRS}max_age_days = 2\n[queue]\nlifetime_days = 4\n");
+
+        let problem = only_problem(&src);
+
+        assert!(
+            problem.contains("must not exceed srs.max_age_days"),
+            "{problem}"
+        );
+        assert_eq!(problem_line(&problem), line_with(&src, "lifetime_days"));
+    }
+
+    #[test]
+    fn a_lifetime_inside_the_srs_window_loads() {
+        let src = format!("{MINIMAL}{SRS}[queue]\nlifetime_days = 4\n");
+
+        let c = load_str(&src).expect("four days inside the default seven should load");
+
+        assert_eq!(c.queue.lifetime, Duration::from_secs(4 * 86_400));
+    }
+
+    #[test]
+    fn an_unknown_key_in_the_queue_table_is_refused() {
+        let src = format!("{MINIMAL}\n[queue]\nretry_forever = true\n");
+
+        let problem = only_problem(&src);
+
+        assert!(problem.contains("retry_forever"), "{problem}");
     }
 }

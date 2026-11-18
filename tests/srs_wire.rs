@@ -148,6 +148,7 @@ async fn serve_mxhop(srs: Srs, sink_port: u16) -> (u16, Spool) {
         handshake_timeout: Duration::from_secs(10),
         ptr_timeout: Duration::from_secs(1),
         relay_budget: RELAY_BUDGET,
+        queue: mxhop::queue::Schedule::default(),
         limits: Default::default(),
         auth_enabled: true,
     };
