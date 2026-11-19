@@ -433,9 +433,32 @@ fn check_authentication(auth: &Auth, enforce: Enforce) -> Option<Reply> {
 /// `enforce = "off"` can log the very same sentence it is declining to send:
 /// a second copy of this table, written for the log, is a second table to get
 /// wrong.
-fn authentication_reply(auth: &Auth) -> Option<Reply> {
+pub(crate) fn authentication_reply(auth: &Auth) -> Option<Reply> {
     let domain = &auth.dmarc.from_domain;
     match (auth.dmarc.result, auth.dmarc.policy) {
+        // A failure under `p=reject` that *might* have been a pass if the
+        // DKIM stage had finished. Deferring rather than refusing, because a
+        // `550` is permanent and the evidence that would have cleared this
+        // message — an aligned signature — was never fetched: a key lookup
+        // that hung is our problem to retry, not the sender's to be bounced
+        // over. See `crate::auth::Auth::dkim_timed_out`.
+        //
+        // This is not a way through. The message is still refused; only the
+        // code changes, and the attacker who hangs his own key lookup to earn
+        // it has bought a deferral rather than the delivery he wanted. What
+        // it buys the honest sender is the retry during which his nameserver
+        // comes back.
+        (DmarcVerdict::Fail, Some(AuthPolicy::Reject)) if auth.dkim_timed_out => Some(Reply {
+            code: 451,
+            enhanced: Some("4.7.1".into()),
+            text: format!(
+                "could not finish checking the signatures on this message from \
+                 {domain}, which asks for failures to be rejected (p=reject); \
+                 try again"
+            ),
+            lines: Vec::new(),
+        }),
+
         // The central rule. The domain published `p=reject`, the message
         // failed, and the refusal happens while the sending server still holds
         // the message — the one moment it costs nobody anything. See
@@ -1741,6 +1764,7 @@ mod tests {
                 policy,
             },
             checked: true,
+            dkim_timed_out: false,
         }
     }
 
@@ -1971,6 +1995,41 @@ mod tests {
             "{}",
             auth.header("mx.tooling.ninja")
         );
+    }
+
+    /// The two messages that reach this table looking identical, and must
+    /// not leave it that way.
+    ///
+    /// Both fail DMARC under `p=reject` with an empty list of signatures.
+    /// One was never signed, and the owner of the forged domain asked for
+    /// exactly that to be rejected. The other was signed, and the only
+    /// reason its signature is not here is that mxhop's own lookup of the
+    /// key did not come back inside the DKIM stage's budget — so a `550`
+    /// would be a permanent refusal issued over a question nobody finished
+    /// asking. `Auth::dkim_timed_out` is the only thing that tells them
+    /// apart by the time the decision is made, which is why it is carried on
+    /// the verdict rather than inferred here.
+    #[test]
+    fn an_unchecked_signature_is_deferred_where_a_missing_one_is_refused() {
+        let unsigned = verdict("paypal.test", DmarcVerdict::Fail, Some(Policy::Reject));
+        let stalled = Auth {
+            dkim_timed_out: true,
+            ..verdict("paypal.test", DmarcVerdict::Fail, Some(Policy::Reject))
+        };
+
+        assert_eq!(
+            authentication_reply(&unsigned).map(|reply| reply.code),
+            Some(550)
+        );
+        assert_eq!(
+            authentication_reply(&stalled).map(|reply| reply.code),
+            Some(451),
+            "a retry can fetch the key; a bounce cannot be taken back"
+        );
+
+        // Still a refusal, though. The attacker who hangs his own key lookup
+        // to earn the softer code has bought a deferral, not delivery.
+        assert!(matches!(decided(&stalled), Decision::Refuse(_)));
     }
 
     /// A temporary error where the policy is known not to be `reject` could

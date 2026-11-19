@@ -1336,7 +1336,15 @@ pub trait Relay {
     /// made is an [`Auth`] saying so, because the decision table has to be
     /// able to tell "the domain publishes nothing" from "nobody answered",
     /// and an error type collapses the two.
-    fn verify(&self, probe: Probe<'_>) -> impl std::future::Future<Output = Auth> + Send;
+    ///
+    /// The budget is the caller's, already divided per stage before it gets
+    /// here: one clock over the whole check let a sender spend it all on the
+    /// two stages whose names he chooses. See [`crate::auth::Budget`].
+    fn verify(
+        &self,
+        probe: Probe<'_>,
+        budget: crate::auth::Budget,
+    ) -> impl std::future::Future<Output = Auth> + Send;
 }
 
 /// The real one: the system resolver, a TCP socket, and port 25.
@@ -1371,9 +1379,9 @@ where
         self.resolver.ptr(ip).await.ok()
     }
 
-    async fn verify(&self, probe: Probe<'_>) -> Auth {
+    async fn verify(&self, probe: Probe<'_>, budget: crate::auth::Budget) -> Auth {
         match &self.verifier {
-            Some(verifier) => verifier.check(probe).await,
+            Some(verifier) => verifier.check(probe, budget).await,
             None => Auth::not_checked(),
         }
     }
@@ -1402,7 +1410,7 @@ impl Relay for Blackhole {
         None
     }
 
-    async fn verify(&self, _probe: Probe<'_>) -> Auth {
+    async fn verify(&self, _probe: Probe<'_>, _budget: crate::auth::Budget) -> Auth {
         Auth::not_checked()
     }
 }
@@ -1887,7 +1895,7 @@ mod tests {
             Some("sender.test".to_string())
         }
 
-        async fn verify(&self, _probe: Probe<'_>) -> Auth {
+        async fn verify(&self, _probe: Probe<'_>, _budget: crate::auth::Budget) -> Auth {
             Auth::not_checked()
         }
     }

@@ -339,6 +339,7 @@ Only one thing is ever refused:
 |---|---|
 | fails, and the domain publishes `p=reject` | `550 5.7.1`, naming the domain and the policy |
 | `p=reject` is in hand but the check could not be finished | `451 4.7.1` — try again |
+| fails under `p=reject`, but a signature on it was never checked | `451 4.7.1` — try again |
 | could not be checked at all, so no policy is known | forwarded, with `dmarc=temperror` in the header |
 | fails under `p=quarantine` | forwarded, with `policy.dmarc=quarantine` in the header |
 | fails under `p=none`, or there is no record | forwarded |
@@ -353,16 +354,44 @@ The third row is the one worth arguing. An unreadable policy *could* have been
 sender's `_dmarc` record alone that produces it. `mail-auth` abandons the whole
 DMARC tree walk on the first non-NXDOMAIN failure at any level, so a REFUSED
 answer, a flaky authoritative server or a DNSSEC-bogus zone anywhere in a
-domain's `_dmarc` ancestry arrives here as "no policy" — and so does mxhop's
-own expired DNS budget, which one dead `include:` in an ordinary sender's SPF
-record can spend. A retry gets the same answer, so a 451 there is a bounce
-after the sender's retry window, over DNS that never affected delivery before.
-What it buys is small and not an attacker's to arrange: a forgery of a
-`p=reject` domain gets through only while *that domain's own* `_dmarc` is
-unanswerable, and the destination re-evaluates DMARC with its own resolver
-regardless. Accepting and stamping on `temperror` is what OpenDMARC, rspamd and
-Gmail all do. There is no setting for this; a third knob nobody sets correctly
-is worse than one well-argued default.
+domain's `_dmarc` ancestry arrives here as "no policy". A retry gets the same
+answer, so a 451 there is a bounce after the sender's retry window, over DNS
+that never affected delivery before. What it buys is small and not an
+attacker's to arrange: a forgery of a `p=reject` domain gets through only while
+*that domain's own* `_dmarc` is unanswerable, and the destination re-evaluates
+DMARC with its own resolver regardless. Accepting and stamping on `temperror`
+is what OpenDMARC, rspamd and Gmail all do. There is no setting for this; a
+third knob nobody sets correctly is worse than one well-argued default.
+
+That row is only safe because of how the twenty seconds all these lookups
+share are divided. **The sender chooses two of the three names being looked
+up** — the HELO name, the envelope sender and the `d=` of every signature are
+all his, and `_dmarc.<the From domain>` is not. Under a single clock, a
+handful of `include:`s in his own SPF record pointing at hosts that swallow
+queries rather than refusing them spends the whole budget *before* the
+victim's policy has been asked for. The verdict is then "policy unknown",
+which the row above forwards — and the forged `From: service@paypal.com`
+leaves here with mxhop's envelope on it, which is the one outcome this check
+exists to prevent.
+
+So each stage gets its own clock: **8 seconds for both SPF evaluations, 6 for
+DKIM, and whatever is left — never less than 6 — for DMARC.** The sender may
+spend both of his own stages down to the last millisecond and the policy is
+still fetched, still in hand, and still enforced. An expired SPF stage only
+reaches DMARC as a temporary error when the SPF identity is *aligned* with the
+`From` domain, and forging somebody else's `From` is precisely what being
+unaligned means — so the attacker's dead SPF earns a `550` while an honest
+sender's dead SPF earns the `451` the deferral rule was written for. A session
+with less than twenty seconds to spare shortens all three stages rather than
+dropping the last one.
+
+The new row in the table is the other half of that. An expired DKIM stage
+hands DMARC an empty list of signatures, which is exactly what an unsigned
+message hands it — and an unsigned message failing `p=reject` is refused. A
+`550` is permanent, and the signature that would have cleared this message was
+never fetched, so the two are told apart and that one is deferred instead. It
+is still a refusal: a sender who hangs his own key lookup to earn the softer
+code has bought a retry, not a delivery.
 
 Why the one refusal matters here specifically: after SRS *every* message mxhop
 forwards passes SPF at the destination, because the envelope sender is at a
