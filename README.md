@@ -220,6 +220,51 @@ verifies, so bounces already in flight — carrying addresses signed with the
 retired key — still come home. Dropping the old key immediately destroys
 every delivery report that has not arrived yet.
 
+## Delivering to a named server instead of looking up MX
+
+An alias normally sends mail to wherever the destination domain's MX says.
+That breaks for one shape of forwarding: a domain whose MX is mxhop, with a
+real mailbox *inside that same domain* as the destination.
+
+```toml
+[domains."example.com".aliases]
+me = { to = "me@example.com", via = "aspmx.l.google.com" }
+"*" = "me@example.com"
+```
+
+Mail for `example.com` arrives here. `me@` is handed straight to the named
+server. Everything else is caught by the catch-all, lands on `me@`, and goes
+to the same place. Each address gets exactly one copy: a `via` target is a
+leaf, so the alias table is not consulted again for it, which is also why
+this is not the loop that `check` would otherwise refuse.
+
+Without `via` the same pair is a loop and `check` says so: the destination is
+inside a domain mxhop serves, so the MX lookup finds mxhop, and the message
+comes back to the alias it just left.
+
+What this gives up is the one thing DNS was doing for you. A named server is
+a fact nothing checks after you write it — if the name is wrong or the
+provider changes it, mail piles up or bounces, and the MX record will not
+say a word about it. So:
+
+- `check` refuses a `via` that is not a fully qualified host name.
+- `check` refuses a `via` that names this host: that is a loop made by hand.
+- `check` resolves every `via` name and fails if it has no address. This is
+  the one DNS lookup `mxhop check` makes.
+
+A loop is still possible after all that. If the mailbox at the named server
+forwards anything back to a domain mxhop serves, the circle closes outside
+this configuration and nothing here can see it — only the hop counter in the
+headers catches it. Test it with a real message before switching the MX
+record over, not after.
+
+One connection serves one destination server, so two addresses routed `via`
+different hosts are two connections even when they share a domain.
+
+Honestly: if your provider can do catch-all itself, it can do this without
+mxhop and without moving the MX record. This exists for when you want the
+mail to come through mxhop anyway.
+
 ## The queue, and what happens to mail that cannot be delivered
 
 A message is forwarded inside the session that brought it: the sending server

@@ -503,6 +503,40 @@ pub fn load_str(src: &str) -> Result<Config, Vec<Problem>> {
                     }
                     router.insert(&name, alias, Route::Reject(reject.clone()));
                 }
+                RawTarget::Via { to, via } => {
+                    let host = via.to_ascii_lowercase();
+                    let mailbox = match Mailbox::parse(to) {
+                        Ok(mailbox) => mailbox,
+                        Err(e) => {
+                            problems.push(Problem {
+                                line: Some(line),
+                                message: format!("{to:?} {e}"),
+                            });
+                            continue;
+                        }
+                    };
+                    if !is_qualified(&host) {
+                        problems.push(Problem {
+                            line: Some(line),
+                            message: format!(
+                                "via = {via:?} is not a fully qualified host name, so \
+                                 mail for {mailbox} would have nowhere to go"
+                            ),
+                        });
+                        continue;
+                    }
+                    if host == hostname.to_ascii_lowercase() {
+                        problems.push(Problem {
+                            line: Some(line),
+                            message: format!(
+                                "via = {via:?} is this host, so mail for {mailbox} would \
+                                 be delivered to mxhop itself for ever"
+                            ),
+                        });
+                        continue;
+                    }
+                    router.insert(&name, alias, Route::Via { to: mailbox, host });
+                }
                 RawTarget::One(one) => match Mailbox::parse(one) {
                     Ok(mailbox) => {
                         destinations.push((line, mailbox.clone()));
@@ -747,6 +781,7 @@ struct RawDomain {
 enum RawTarget {
     One(String),
     Many(Vec<String>),
+    Via { to: String, via: String },
     Reject { reject: String },
 }
 
@@ -757,15 +792,18 @@ impl<'de> Deserialize<'de> for RawTarget {
         enum Shape {
             One(String),
             Many(Vec<String>),
+            Via { to: String, via: String },
             Reject { reject: String },
         }
 
         match Shape::deserialize(d) {
             Ok(Shape::One(one)) => Ok(RawTarget::One(one)),
             Ok(Shape::Many(many)) => Ok(RawTarget::Many(many)),
+            Ok(Shape::Via { to, via }) => Ok(RawTarget::Via { to, via }),
             Ok(Shape::Reject { reject }) => Ok(RawTarget::Reject { reject }),
             Err(_) => Err(de::Error::custom(
                 "an alias must be an address (\"me@example.com\"), a list of addresses, \
+                 { to = \"me@example.com\", via = \"mx.example.net\" }, \
                  or { reject = \"550 5.1.1 no mail here\" }",
             )),
         }
@@ -1017,6 +1055,109 @@ spooldir = "/var/lib/mxhop/spool"
         let p = only_problem(&src);
 
         assert!(p.contains("never"), "{p}");
+    }
+
+    #[test]
+    fn an_alias_can_name_the_server_to_deliver_to() {
+        let src = r#"
+hostname = "mx.dorokhovich.com"
+listen = "0.0.0.0:25"
+spool_dir = "/var/lib/mxhop/spool"
+
+[domains."dorokhovich.com".aliases]
+mikhail = { to = "mikhail@dorokhovich.com", via = "ASPMX.L.GOOGLE.COM" }
+"*" = "mikhail@dorokhovich.com"
+"#;
+        let c = load_str(src).expect("a via target is a leaf, not a loop");
+        let Some(Route::Via { to, host }) = c.router.route("dorokhovich.com", "mikhail") else {
+            panic!("expected a via route");
+        };
+        assert_eq!(to.to_string(), "mikhail@dorokhovich.com");
+        assert_eq!(host, "aspmx.l.google.com");
+    }
+
+    #[test]
+    fn a_via_that_is_not_a_host_name_is_reported_with_its_line() {
+        let src = r#"
+hostname = "mx.dorokhovich.com"
+listen = "0.0.0.0:25"
+spool_dir = "/var/lib/mxhop/spool"
+
+[domains."dorokhovich.com".aliases]
+mikhail = { to = "mikhail@dorokhovich.com", via = "aspmx" }
+"#;
+        let found = problems(src);
+        assert!(
+            found.iter().any(|p| p.contains("not a fully qualified")),
+            "{found:#?}"
+        );
+        assert_eq!(problem_line(&found[0]), line_with(src, "aspmx"));
+    }
+
+    #[test]
+    fn a_via_pointing_at_this_host_is_reported() {
+        let src = r#"
+hostname = "mx.dorokhovich.com"
+listen = "0.0.0.0:25"
+spool_dir = "/var/lib/mxhop/spool"
+
+[domains."dorokhovich.com".aliases]
+mikhail = { to = "mikhail@dorokhovich.com", via = "MX.dorokhovich.com" }
+"#;
+        let found = problems(src);
+        assert!(
+            found.iter().any(|p| p.contains("is this host")),
+            "{found:#?}"
+        );
+    }
+
+    #[test]
+    fn without_a_via_the_same_pair_is_still_refused_as_a_loop() {
+        let src = r#"
+hostname = "mx.dorokhovich.com"
+listen = "0.0.0.0:25"
+spool_dir = "/var/lib/mxhop/spool"
+
+[domains."dorokhovich.com".aliases]
+mikhail = "mikhail@dorokhovich.com"
+"#;
+        let found = problems(src);
+        assert!(found.iter().any(|p| p.contains("loop")), "{found:#?}");
+    }
+
+    #[test]
+    fn a_via_whose_address_is_not_an_address_is_reported() {
+        let src = r#"
+hostname = "mx.dorokhovich.com"
+listen = "0.0.0.0:25"
+spool_dir = "/var/lib/mxhop/spool"
+
+[domains."dorokhovich.com".aliases]
+mikhail = { to = "not-an-address", via = "aspmx.l.google.com" }
+"#;
+        let found = problems(src);
+        assert!(found.iter().any(|p| p.contains("no @")), "{found:#?}");
+    }
+
+    #[test]
+    fn via_hosts_names_every_alias_that_uses_one() {
+        let src = r#"
+hostname = "mx.dorokhovich.com"
+listen = "0.0.0.0:25"
+spool_dir = "/var/lib/mxhop/spool"
+
+[domains."dorokhovich.com".aliases]
+mikhail = { to = "mikhail@dorokhovich.com", via = "aspmx.l.google.com" }
+other = { to = "other@dorokhovich.ru", via = "aspmx.l.google.com" }
+"*" = "mikhail@dorokhovich.com"
+"#;
+        let c = load_str(src).expect("loads");
+        let hosts = c.router.via_hosts();
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(
+            hosts["aspmx.l.google.com"],
+            vec!["mikhail@dorokhovich.com", "other@dorokhovich.com"]
+        );
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -21,6 +22,8 @@ pub struct Envelope {
     pub attempts: u32,
     #[serde(default)]
     pub next_attempt_unix_ms: u64,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub via: BTreeMap<String, String>,
 }
 
 impl Envelope {
@@ -54,6 +57,7 @@ mod tests {
             last_reply: None,
             attempts: 0,
             next_attempt_unix_ms: 0,
+            via: BTreeMap::new(),
         }
     }
 

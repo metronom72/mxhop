@@ -231,6 +231,7 @@ mod tests {
             last_reply: None,
             attempts: 0,
             next_attempt_unix_ms: 0,
+            via: Default::default(),
         }
     }
 

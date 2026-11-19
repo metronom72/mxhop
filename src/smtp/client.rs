@@ -31,6 +31,7 @@ pub struct Delivery {
     pub body: Arc<[u8]>,
     pub eight_bit: bool,
     pub deadline: Option<Instant>,
+    pub via: Option<String>,
 }
 
 impl Delivery {
@@ -43,12 +44,19 @@ impl Delivery {
             body,
             eight_bit,
             deadline: None,
+            via: None,
         }
     }
 
     #[must_use]
     pub fn due_by(mut self, deadline: Instant) -> Self {
         self.deadline = Some(deadline);
+        self
+    }
+
+    #[must_use]
+    pub fn via(mut self, host: Option<&str>) -> Self {
+        self.via = host.map(str::to_string);
         self
     }
 
@@ -326,32 +334,38 @@ where
         };
     };
 
-    let hosts = match clocked(out.budget.command, deadline, targets(resolver, domain)).await {
-        Err(_) => {
-            return Outcome {
-                host: None,
-                results: Outcome::all(
-                    &delivery.to,
-                    Verdict::Deferred(Reply::ours(
-                        451,
-                        "4.4.3",
-                        format_args!("the MX lookup for {domain} did not finish in time"),
-                    )),
-                ),
-            };
-        }
-        Ok(Ok(hosts)) => hosts,
-        Ok(Err(e)) => {
-            let verdict = if e.is_permanent() {
-                Verdict::Refused(Reply::ours(550, "5.1.2", &e))
-            } else {
-                Verdict::Deferred(Reply::ours(451, "4.4.3", &e))
-            };
-            return Outcome {
-                host: None,
-                results: Outcome::all(&delivery.to, verdict),
-            };
-        }
+    let hosts = match &delivery.via {
+        Some(host) => vec![crate::dns::Target {
+            host: host.clone(),
+            pref: 0,
+        }],
+        None => match clocked(out.budget.command, deadline, targets(resolver, domain)).await {
+            Err(_) => {
+                return Outcome {
+                    host: None,
+                    results: Outcome::all(
+                        &delivery.to,
+                        Verdict::Deferred(Reply::ours(
+                            451,
+                            "4.4.3",
+                            format_args!("the MX lookup for {domain} did not finish in time"),
+                        )),
+                    ),
+                };
+            }
+            Ok(Ok(hosts)) => hosts,
+            Ok(Err(e)) => {
+                let verdict = if e.is_permanent() {
+                    Verdict::Refused(Reply::ours(550, "5.1.2", &e))
+                } else {
+                    Verdict::Deferred(Reply::ours(451, "4.4.3", &e))
+                };
+                return Outcome {
+                    host: None,
+                    results: Outcome::all(&delivery.to, verdict),
+                };
+            }
+        },
     };
 
     let mut last: Option<Last> = None;
@@ -1538,6 +1552,64 @@ mod tests {
         let table = Table::default();
 
         let outcome = deliver(&table, &Pipes::new(&[]), &outbound(), &message(b"hi\r\n")).await;
+
+        assert!(
+            matches!(outcome.results[0].verdict, Verdict::Refused(_)),
+            "{:?}",
+            verdicts(&outcome)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_via_delivery_asks_for_no_mx_at_all() {
+        let table = Table::default()
+            .mx_error("example.com", DnsError::Failed("never ask me".into()))
+            .addr("aspmx.l.google.test", "203.0.113.9".parse().unwrap());
+        let pipes = Pipes::new(&[("203.0.113.9", Script::Serve(Mta::default()))]);
+
+        let outcome = deliver(
+            &table,
+            &pipes,
+            &outbound(),
+            &message(b"hi\r\n").via(Some("aspmx.l.google.test")),
+        )
+        .await;
+
+        assert_eq!(outcome.host.as_deref(), Some("aspmx.l.google.test"));
+        assert!(
+            matches!(outcome.results[0].verdict, Verdict::Accepted),
+            "{:?}",
+            verdicts(&outcome)
+        );
+    }
+
+    #[tokio::test]
+    async fn the_same_delivery_without_a_via_defers_on_the_mx_lookup() {
+        let table = Table::default()
+            .mx_error("example.com", DnsError::Failed("never ask me".into()))
+            .addr("aspmx.l.google.test", "203.0.113.9".parse().unwrap());
+        let pipes = Pipes::new(&[("203.0.113.9", Script::Serve(Mta::default()))]);
+
+        let outcome = deliver(&table, &pipes, &outbound(), &message(b"hi\r\n")).await;
+
+        assert!(
+            matches!(outcome.results[0].verdict, Verdict::Deferred(_)),
+            "{:?}",
+            verdicts(&outcome)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_via_host_with_no_address_is_refused_and_names_the_domain() {
+        let table = Table::default().addr_error("typo.l.google.test", DnsError::NotFound);
+
+        let outcome = deliver(
+            &table,
+            &Pipes::new(&[]),
+            &outbound(),
+            &message(b"hi\r\n").via(Some("typo.l.google.test")),
+        )
+        .await;
 
         assert!(
             matches!(outcome.results[0].verdict, Verdict::Refused(_)),

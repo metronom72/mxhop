@@ -82,9 +82,42 @@ pub fn is_qualified(name: &str) -> bool {
         })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Target {
+    pub mailbox: Mailbox,
+    pub via: Option<String>,
+}
+
+impl Target {
+    pub fn new(mailbox: Mailbox) -> Self {
+        Self { mailbox, via: None }
+    }
+
+    pub fn via(mailbox: Mailbox, host: &str) -> Self {
+        Self {
+            mailbox,
+            via: Some(host.to_ascii_lowercase()),
+        }
+    }
+
+    pub fn domain(&self) -> &str {
+        self.mailbox.domain()
+    }
+}
+
+impl fmt::Display for Target {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.via {
+            Some(host) => write!(f, "{} via {host}", self.mailbox),
+            None => write!(f, "{}", self.mailbox),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Route {
     Forward(Vec<Mailbox>),
+    Via { to: Mailbox, host: String },
     Reject(String),
 }
 
@@ -129,6 +162,26 @@ impl Router {
 
     pub fn domains(&self) -> impl Iterator<Item = &str> {
         self.domains.keys().map(String::as_str)
+    }
+
+    pub fn via_hosts(&self) -> BTreeMap<String, Vec<String>> {
+        let mut hosts: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (domain, routes) in &self.domains {
+            let all = routes
+                .exact
+                .iter()
+                .map(|(local, route)| (local.as_str(), route))
+                .chain(routes.catch_all.iter().map(|r| (CATCH_ALL, r)));
+            for (local, route) in all {
+                if let Route::Via { host, .. } = route {
+                    hosts
+                        .entry(host.clone())
+                        .or_default()
+                        .push(format!("{local}@{domain}"));
+                }
+            }
+        }
+        hosts
     }
 
     pub fn alias_count(&self) -> usize {

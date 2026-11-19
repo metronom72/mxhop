@@ -35,6 +35,7 @@ fn held(id_hint: &str) -> Envelope {
         last_reply: Some("hi@dest.test: 451 4.3.0 try later".into()),
         attempts: 1,
         next_attempt_unix_ms: 0,
+        via: Default::default(),
     }
 }
 

@@ -6,7 +6,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::envelope::{Envelope, now_unix_ms};
 use crate::policy;
-use crate::routing::Mailbox;
+use crate::routing::{Mailbox, Target};
 use crate::smtp::client::{Delivery, Relay, Reply, Verdict};
 use crate::spool::Spool;
 use crate::srs::Srs;
@@ -264,7 +264,10 @@ where
         let mut recipients = Vec::with_capacity(envelope.to.len());
         for address in &envelope.to {
             match Mailbox::parse(address) {
-                Ok(mailbox) => recipients.push(mailbox),
+                Ok(mailbox) => recipients.push(match envelope.via.get(address) {
+                    Some(host) => Target::via(mailbox, host),
+                    None => Target::new(mailbox),
+                }),
                 Err(e) => error!(
                     id = %envelope.id,
                     recipient = %address,
@@ -328,12 +331,15 @@ where
         for group in groups {
             let outcome = self
                 .relay
-                .deliver(Delivery::new(
-                    sender.clone(),
-                    group.recipients,
-                    head.clone().into_bytes(),
-                    Arc::clone(&body),
-                ))
+                .deliver(
+                    Delivery::new(
+                        sender.clone(),
+                        group.recipients,
+                        head.clone().into_bytes(),
+                        Arc::clone(&body),
+                    )
+                    .via(group.via.as_deref()),
+                )
                 .await;
 
             if outcome
@@ -408,6 +414,16 @@ where
         let attempts = envelope.attempts + 1;
         let wait = self.schedule.backoff(attempts);
         let rescheduled = Envelope {
+            via: still_deferred
+                .iter()
+                .filter_map(|(mailbox, _)| {
+                    let address = mailbox.to_string();
+                    envelope
+                        .via
+                        .get(&address)
+                        .map(|host| (address, host.clone()))
+                })
+                .collect(),
             to: still_deferred
                 .iter()
                 .map(|(mailbox, _)| mailbox.to_string())
@@ -567,6 +583,7 @@ mod tests {
             last_reply: Some("hi@dest.test: 451 4.3.0 try later".into()),
             attempts: 1,
             next_attempt_unix_ms: 0,
+            via: Default::default(),
         }
     }
 
@@ -765,6 +782,78 @@ mod tests {
             vec!["two@dest.test".to_string()],
             "one@ has its copy; leaving it on the envelope would send it a second one"
         );
+    }
+
+    #[tokio::test]
+    async fn a_held_message_keeps_the_server_it_was_routed_to() {
+        let mut envelope = held(&["mikhail@dorokhovich.com"]);
+        envelope.via.insert(
+            "mikhail@dorokhovich.com".into(),
+            "aspmx.l.google.com".into(),
+        );
+        let (runner, _spool, relay) = with(&envelope, Fake::accepting()).await;
+
+        runner.sweep().await;
+
+        assert_eq!(
+            relay.deliveries()[0].via.as_deref(),
+            Some("aspmx.l.google.com"),
+            "without this the retry looks up the MX of dorokhovich.com, which is us"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_message_still_deferred_keeps_its_server_for_the_next_attempt() {
+        let mut envelope = held(&["mikhail@dorokhovich.com"]);
+        envelope.via.insert(
+            "mikhail@dorokhovich.com".into(),
+            "aspmx.l.google.com".into(),
+        );
+        let (runner, spool, _relay) = with(
+            &envelope,
+            Fake::answering(
+                "dorokhovich.com",
+                Verdict::Deferred(theirs(451, "4.3.0", "try later")),
+            ),
+        )
+        .await;
+
+        runner.sweep().await;
+
+        let queued = spool.queued().await.unwrap();
+        assert_eq!(
+            queued[0]
+                .via
+                .get("mikhail@dorokhovich.com")
+                .map(String::as_str),
+            Some("aspmx.l.google.com")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_recipient_that_has_its_copy_takes_its_route_off_the_envelope_too() {
+        let mut envelope = held(&["one@dorokhovich.com", "two@dorokhovich.com"]);
+        envelope
+            .via
+            .insert("one@dorokhovich.com".into(), "aspmx.l.google.com".into());
+        envelope
+            .via
+            .insert("two@dorokhovich.com".into(), "aspmx.l.google.com".into());
+        let (runner, spool, _relay) = with(
+            &envelope,
+            Fake::accepting().for_recipient(
+                "two@dorokhovich.com",
+                Verdict::Deferred(theirs(452, "4.2.2", "over quota")),
+            ),
+        )
+        .await;
+
+        runner.sweep().await;
+
+        let queued = spool.queued().await.unwrap();
+        assert_eq!(queued[0].to, vec!["two@dorokhovich.com".to_string()]);
+        assert_eq!(queued[0].via.len(), 1);
+        assert!(queued[0].via.contains_key("two@dorokhovich.com"));
     }
 
     #[tokio::test]

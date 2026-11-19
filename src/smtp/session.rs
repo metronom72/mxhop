@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::io;
 use std::time::Duration;
 
@@ -498,6 +499,7 @@ where
         last_reply: None,
         attempts: 0,
         next_attempt_unix_ms: 0,
+        via: BTreeMap::new(),
     };
 
     let head = policy::Head::scan(&body, &config.hostname);
@@ -625,6 +627,7 @@ where
                         prepended.clone().into_bytes(),
                         std::sync::Arc::clone(&body),
                     )
+                    .via(group.via.as_deref())
                     .due_by(deadline),
                 )
                 .await,
@@ -658,7 +661,26 @@ where
     }
 
     let attempts = 1;
+    let routed: BTreeMap<String, String> = plan
+        .groups
+        .iter()
+        .filter_map(|group| group.via.as_ref().map(|host| (group, host)))
+        .flat_map(|(group, host)| {
+            group
+                .recipients
+                .iter()
+                .map(move |mailbox| (mailbox.to_string(), host.clone()))
+        })
+        .collect();
     let held = Envelope {
+        via: verdict
+            .hold
+            .iter()
+            .filter_map(|(mailbox, _)| {
+                let address = mailbox.to_string();
+                routed.get(&address).map(|host| (address, host.clone()))
+            })
+            .collect(),
         to: verdict
             .hold
             .iter()
@@ -756,7 +778,7 @@ fn decide_recipient(
 
     match router.resolve(domain, local) {
         Some((_, Route::Reject(reply))) => reply.clone(),
-        Some((_, Route::Forward(_))) => {
+        Some((_, Route::Forward(_) | Route::Via { .. })) => {
             recipients.push(address.to_string());
             "250 2.1.5 recipient accepted".to_string()
         }
@@ -823,6 +845,14 @@ mod tests {
             "example.com",
             "noreply",
             Route::Reject("550 5.1.1 this address does not accept mail".into()),
+        );
+        r.insert(
+            "example.com",
+            "direct",
+            Route::Via {
+                to: Mailbox::parse("direct@example.com").unwrap(),
+                host: "aspmx.l.google.test".into(),
+            },
         );
         r
     }
@@ -1693,6 +1723,63 @@ mod tests {
             "body\r\n",
             "the stored file is the message as it arrived, with no header of ours in it"
         );
+    }
+
+    #[tokio::test]
+    async fn an_address_routed_to_a_named_server_is_delivered_there() {
+        let script = "EHLO x.test\r\nMAIL FROM:<a@b.test>\r\nRCPT TO:<direct@example.com>\r\n\
+                      DATA\r\nbody\r\n.\r\nQUIT\r\n";
+        let t = talk_with(Fake::accepting(), 26_214_400, script).await;
+
+        assert!(t.out.contains("250 2.0.0 delivered as "), "{}", t.out);
+        let sent = t.relay.deliveries();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].via.as_deref(), Some("aspmx.l.google.test"));
+        assert_eq!(sent[0].to[0].to_string(), "direct@example.com");
+    }
+
+    #[tokio::test]
+    async fn a_held_copy_remembers_the_server_it_was_routed_to() {
+        let script = "EHLO x.test\r\nMAIL FROM:<a@b.test>\r\n\
+                      RCPT TO:<hi@example.com>\r\nRCPT TO:<direct@example.com>\r\n\
+                      DATA\r\nbody\r\n.\r\nQUIT\r\n";
+        let t = talk_with(
+            Fake::answering(
+                "example.com",
+                client::Verdict::Deferred(theirs(451, "4.3.2", "Try again later")),
+            ),
+            26_214_400,
+            script,
+        )
+        .await;
+
+        assert!(t.out.contains("250 2.0.0 delivered as "), "{}", t.out);
+        let queued = t.spool.queued().await.unwrap();
+        assert_eq!(queued[0].to, vec!["direct@example.com".to_string()]);
+        assert_eq!(
+            queued[0].via.get("direct@example.com").map(String::as_str),
+            Some("aspmx.l.google.test"),
+            "a retry that forgot this would look up the MX of example.com, which is us"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_held_copy_records_no_server() {
+        let script = "EHLO x.test\r\nMAIL FROM:<a@b.test>\r\nRCPT TO:<team@example.com>\r\n\
+                      DATA\r\nbody\r\n.\r\nQUIT\r\n";
+        let t = talk_with(
+            Fake::answering(
+                "fastmail.test",
+                client::Verdict::Deferred(theirs(451, "4.3.2", "Try again later")),
+            ),
+            26_214_400,
+            script,
+        )
+        .await;
+
+        let queued = t.spool.queued().await.unwrap();
+        assert_eq!(queued[0].to, vec!["b@fastmail.test".to_string()]);
+        assert!(queued[0].via.is_empty(), "{:?}", queued[0].via);
     }
 
     #[tokio::test]
