@@ -7,7 +7,7 @@ use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
 use mxhop::config::{self, Config, Problem};
-use mxhop::dns::Hickory;
+use mxhop::dns::{Hickory, Resolve};
 use mxhop::routing::Mailbox;
 use mxhop::server::accept_loop;
 use mxhop::smtp::client::{self, Delivery, Direct, Outbound, Tcp, Verdict};
@@ -53,7 +53,7 @@ async fn main() -> ExitCode {
     let cli = Cli::parse();
 
     match &cli.command {
-        Command::Check => check(&cli),
+        Command::Check => check(&cli).await,
         Command::Run => run(&cli).await,
         Command::SendTest { to, body, from } => send_test(&cli, to, body, from.as_deref()).await,
     }
@@ -75,7 +75,7 @@ fn load(cli: &Cli) -> Option<Config> {
     }
 }
 
-fn check(cli: &Cli) -> ExitCode {
+async fn check(cli: &Cli) -> ExitCode {
     let Some(config) = load(cli) else {
         return ExitCode::FAILURE;
     };
@@ -98,6 +98,52 @@ fn check(cli: &Cli) -> ExitCode {
 
     if let Some(settings) = config.srs.as_ref() {
         warn_about_secret_mode(&settings.secret_file);
+    }
+
+    let via = config.router.via_hosts();
+    if !via.is_empty() {
+        let resolver = match Hickory::from_system() {
+            Ok(resolver) => resolver,
+            Err(e) => {
+                report(
+                    cli,
+                    &[Problem {
+                        line: None,
+                        message: format!(
+                            "an alias delivers via a named host, and the system resolver \
+                             could not be opened to check that the name exists: {e}"
+                        ),
+                    }],
+                );
+                return ExitCode::FAILURE;
+            }
+        };
+        let mut unresolved = Vec::new();
+        for (host, aliases) in &via {
+            match resolver.addrs(host).await {
+                Ok(addrs) if !addrs.is_empty() => {}
+                Ok(_) | Err(mxhop::dns::DnsError::NotFound) => unresolved.push(Problem {
+                    line: None,
+                    message: format!(
+                        "via = {host:?} has no address, so mail for {} would have \
+                         nowhere to go and nothing in DNS would say so",
+                        aliases.join(", ")
+                    ),
+                }),
+                Err(e) => unresolved.push(Problem {
+                    line: None,
+                    message: format!(
+                        "via = {host:?} could not be resolved, so whether mail for {} \
+                         can be delivered is unknown: {e}",
+                        aliases.join(", ")
+                    ),
+                }),
+            }
+        }
+        if !unresolved.is_empty() {
+            report(cli, &unresolved);
+            return ExitCode::FAILURE;
+        }
     }
 
     let domains: Vec<&str> = config.router.domains().collect();

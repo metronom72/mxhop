@@ -4,7 +4,7 @@ use tracing::{info, warn};
 
 use crate::auth::{Auth, DmarcVerdict, Policy as AuthPolicy};
 use crate::envelope::Envelope;
-use crate::routing::{Mailbox, Route, Router, is_qualified};
+use crate::routing::{Mailbox, Route, Router, Target, is_qualified};
 use crate::smtp::client::{self, Outcome, Reply};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -134,6 +134,7 @@ impl Iterator for HeaderLines<'_> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Group {
     pub domain: String,
+    pub via: Option<String>,
     pub recipients: Vec<Mailbox>,
 }
 
@@ -187,7 +188,7 @@ pub fn decide(
     }
 
     let mut seen = BTreeSet::new();
-    flat.retain(|mailbox| seen.insert(mailbox.clone()));
+    flat.retain(|target| seen.insert(target.clone()));
 
     if flat.is_empty() {
         return Decision::Refuse(Reply {
@@ -204,14 +205,18 @@ pub fn decide(
     })
 }
 
-pub fn group_by_domain(recipients: Vec<Mailbox>) -> Vec<Group> {
+pub fn group_by_domain(recipients: Vec<Target>) -> Vec<Group> {
     let mut groups: Vec<Group> = Vec::new();
-    for mailbox in recipients {
-        match groups.iter_mut().find(|g| g.domain == mailbox.domain()) {
-            Some(group) => group.recipients.push(mailbox),
+    for target in recipients {
+        match groups
+            .iter_mut()
+            .find(|g| g.domain == target.domain() && g.via == target.via)
+        {
+            Some(group) => group.recipients.push(target.mailbox),
             None => groups.push(Group {
-                domain: mailbox.domain().to_string(),
-                recipients: vec![mailbox],
+                domain: target.domain().to_string(),
+                via: target.via,
+                recipients: vec![target.mailbox],
             }),
         }
     }
@@ -309,16 +314,20 @@ fn expand(
     mailbox: Mailbox,
     depth: usize,
     limits: &Limits,
-    out: &mut Vec<Mailbox>,
+    out: &mut Vec<Target>,
 ) -> Result<(), TooDeep> {
     if !router.handles_domain(mailbox.domain()) {
-        out.push(mailbox);
+        out.push(Target::new(mailbox));
         return Ok(());
     }
     if depth >= limits.max_internal_depth {
         return Err(TooDeep);
     }
     match router.resolve(mailbox.domain(), mailbox.local()) {
+        Some((_, Route::Via { to, host })) => {
+            out.push(Target::via(to.clone(), host));
+            Ok(())
+        }
         Some((_, Route::Forward(targets))) => {
             for target in targets.clone() {
                 expand(router, target, depth + 1, limits, out)?;
@@ -526,6 +535,7 @@ pub fn email_date(unix_ms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::routing::CATCH_ALL;
 
     fn router() -> Router {
         let mut r = Router::default();
@@ -567,6 +577,7 @@ mod tests {
             last_reply: None,
             attempts: 0,
             next_attempt_unix_ms: 0,
+            via: Default::default(),
         }
     }
 
@@ -583,6 +594,145 @@ mod tests {
             .flat_map(|g| g.recipients.iter())
             .map(ToString::to_string)
             .collect()
+    }
+
+    fn google() -> Router {
+        let mut r = Router::default();
+        r.insert(
+            "dorokhovich.com",
+            "mikhail",
+            Route::Via {
+                to: Mailbox::parse("mikhail@dorokhovich.com").unwrap(),
+                host: "aspmx.l.google.com".into(),
+            },
+        );
+        r.insert(
+            "dorokhovich.com",
+            CATCH_ALL,
+            forward(&["mikhail@dorokhovich.com"]),
+        );
+        r
+    }
+
+    fn routed(plan: &Plan) -> Vec<(String, Option<String>)> {
+        plan.groups
+            .iter()
+            .flat_map(|g| {
+                g.recipients
+                    .iter()
+                    .map(move |m| (m.to_string(), g.via.clone()))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_address_in_our_own_domain_with_a_via_is_delivered_rather_than_expanded() {
+        let plan = plan(decide(
+            &envelope(&["mikhail@dorokhovich.com"]),
+            &google(),
+            &Head::default(),
+            &Limits::default(),
+            &Auth::not_checked(),
+        ));
+
+        assert_eq!(
+            routed(&plan),
+            vec![(
+                "mikhail@dorokhovich.com".to_string(),
+                Some("aspmx.l.google.com".to_string())
+            )]
+        );
+    }
+
+    #[test]
+    fn the_catch_all_reaches_the_same_mailbox_and_it_is_still_one_copy() {
+        let plan = plan(decide(
+            &envelope(&["anything@dorokhovich.com", "mikhail@dorokhovich.com"]),
+            &google(),
+            &Head::default(),
+            &Limits::default(),
+            &Auth::not_checked(),
+        ));
+
+        assert_eq!(
+            routed(&plan),
+            vec![(
+                "mikhail@dorokhovich.com".to_string(),
+                Some("aspmx.l.google.com".to_string())
+            )]
+        );
+    }
+
+    #[test]
+    fn a_via_target_does_not_count_against_the_expansion_depth() {
+        let plan = plan(decide(
+            &envelope(&["mikhail@dorokhovich.com"]),
+            &google(),
+            &Head::default(),
+            &Limits {
+                max_internal_depth: 1,
+                ..Limits::default()
+            },
+            &Auth::not_checked(),
+        ));
+
+        assert_eq!(plan.groups.len(), 1);
+    }
+
+    #[test]
+    fn one_domain_reached_two_ways_is_two_groups_because_one_connection_serves_one_host() {
+        let mut r = google();
+        r.insert("dorokhovich.com", "plain", forward(&["other@gmail.test"]));
+        r.insert("example.com", "x", forward(&["someone@gmail.test"]));
+
+        let plan = plan(decide(
+            &envelope(&["mikhail@dorokhovich.com", "x@example.com"]),
+            &r,
+            &Head::default(),
+            &Limits::default(),
+            &Auth::not_checked(),
+        ));
+
+        assert_eq!(
+            routed(&plan),
+            vec![
+                (
+                    "mikhail@dorokhovich.com".to_string(),
+                    Some("aspmx.l.google.com".to_string())
+                ),
+                ("someone@gmail.test".to_string(), None),
+            ]
+        );
+        assert_eq!(plan.groups.len(), 2);
+    }
+
+    #[test]
+    fn two_mailboxes_at_one_host_share_a_group_and_two_hosts_do_not() {
+        let mut r = Router::default();
+        for (alias, host) in [("a", "mx1.test"), ("b", "mx1.test"), ("c", "mx2.test")] {
+            r.insert(
+                "example.com",
+                alias,
+                Route::Via {
+                    to: Mailbox::parse(&format!("{alias}@far.test")).unwrap(),
+                    host: host.into(),
+                },
+            );
+        }
+
+        let plan = plan(decide(
+            &envelope(&["a@example.com", "b@example.com", "c@example.com"]),
+            &r,
+            &Head::default(),
+            &Limits::default(),
+            &Auth::not_checked(),
+        ));
+
+        assert_eq!(plan.groups.len(), 2);
+        assert_eq!(plan.groups[0].via.as_deref(), Some("mx1.test"));
+        assert_eq!(plan.groups[0].recipients.len(), 2);
+        assert_eq!(plan.groups[1].via.as_deref(), Some("mx2.test"));
+        assert_eq!(plan.groups[1].recipients.len(), 1);
     }
 
     #[test]
