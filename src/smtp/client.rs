@@ -2174,6 +2174,7 @@ mod tests {
                     &spool,
                     &relay,
                     None,
+                    &mut crate::shutdown::Shutdown::never(),
                 )
                 .await
             })

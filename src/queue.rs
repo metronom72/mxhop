@@ -185,6 +185,7 @@ where
         .await
         {
             Ok(id) => {
+                crate::metrics::REPORTS_SENT.hit();
                 info!(
                     id = %envelope.id,
                     report = %id,
@@ -194,6 +195,7 @@ where
                 true
             }
             Err(why) => {
+                crate::metrics::REPORTS_SUPPRESSED.hit();
                 warn!(
                     id = %envelope.id,
                     from = envelope.from.as_deref().unwrap_or("<>"),
@@ -268,7 +270,10 @@ where
                     swept.unreported += 1;
                 }
                 match self.spool.freeze(&envelope.id).await {
-                    Ok(()) => swept.frozen += 1,
+                    Ok(()) => {
+                        crate::metrics::QUEUE_FROZEN.hit();
+                        swept.frozen += 1;
+                    }
                     Err(e) => warn!(
                         id = %envelope.id,
                         "this message could not be moved to frozen/, so it will be \
@@ -291,6 +296,9 @@ where
             }
         }
 
+        crate::metrics::QUEUE_SWEEPS.hit();
+        crate::metrics::QUEUE_RETRIES.add(swept.attempted as u64);
+        crate::metrics::QUEUE_DEPTH.set(swept.waiting as u64);
         self.hosts.prune(now_unix_ms(), &self.schedule);
 
         if swept != Swept::default() {
@@ -432,6 +440,7 @@ where
             for result in outcome.results {
                 match result.verdict {
                     Verdict::Accepted => {
+                        crate::metrics::RECIPIENTS_DELIVERED.hit();
                         delivered += 1;
                         info!(
                             id = %envelope.id,
@@ -442,6 +451,7 @@ where
                         );
                     }
                     Verdict::Refused(reply) => {
+                        crate::metrics::RECIPIENTS_REFUSED.hit();
                         refused += 1;
                         error!(
                             id = %envelope.id,
@@ -451,7 +461,10 @@ where
                         );
                         permanent.push((result.mailbox, reply));
                     }
-                    Verdict::Deferred(reply) => still_deferred.push((result.mailbox, reply)),
+                    Verdict::Deferred(reply) => {
+                        crate::metrics::RECIPIENTS_DEFERRED.hit();
+                        still_deferred.push((result.mailbox, reply));
+                    }
                 }
             }
         }

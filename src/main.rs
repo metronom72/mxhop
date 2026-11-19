@@ -164,8 +164,12 @@ async fn check(cli: &Cli) -> ExitCode {
         },
         config.queue.lifetime.as_secs() / 3_600,
     );
+    let observe = match config.observe {
+        Some(address) => format!(", /metrics and /healthz on {address}"),
+        None => ", no metrics or health endpoint".to_string(),
+    };
     println!(
-        "{}: ok — {} on {}, {} {} for {}{}{}{}{}",
+        "{}: ok — {} on {}, {} {} for {}{}{}{}{}{}",
         cli.config.display(),
         config.hostname,
         config.listen,
@@ -200,6 +204,7 @@ async fn check(cli: &Cli) -> ExitCode {
                 ", SPF/DKIM/DMARC checked and stamped, never refused".to_string(),
         },
         retries,
+        observe,
     );
     ExitCode::SUCCESS
 }
@@ -365,8 +370,111 @@ async fn run(cli: &Cli) -> ExitCode {
         .run(),
     );
 
-    accept_loop(listener, session_config, router, srs, spool, relay, tls).await;
+    let (trigger, shutdown) = mxhop::shutdown::channel();
+    let (tracker, idle) = mxhop::shutdown::tracker();
+    spawn_stop_on_signal(trigger);
+
+    let health = mxhop::observe::Health::new(QUEUE_LIMIT);
+    health.listening(true);
+    health.queue_depth(queued as u64);
+    if let Some(address) = config.observe {
+        match TcpListener::bind(address).await {
+            Ok(listener) => {
+                let shown = listener
+                    .local_addr()
+                    .map_or_else(|_| address.to_string(), |a| a.to_string());
+                info!(address = %shown, "serving /metrics and /healthz");
+                tokio::spawn(mxhop::observe::serve(
+                    listener,
+                    Arc::clone(&health),
+                    shutdown.clone(),
+                ));
+            }
+            Err(e) => {
+                error!(%address, "cannot listen for metrics and health: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    spawn_watch_spool(Arc::clone(&health), Arc::clone(&spool));
+
+    accept_loop(
+        listener,
+        session_config,
+        router,
+        srs,
+        spool,
+        relay,
+        tls,
+        shutdown,
+        tracker,
+    )
+    .await;
+    health.listening(false);
+
+    if idle.wait(GRACE).await {
+        info!("every open session finished; exiting");
+    } else {
+        warn!(
+            seconds = GRACE.as_secs(),
+            "some sessions were still open when the grace period ran out; exiting              anyway"
+        );
+    }
     ExitCode::SUCCESS
+}
+
+const GRACE: std::time::Duration = std::time::Duration::from_secs(25);
+
+const QUEUE_LIMIT: u64 = 100_000;
+
+fn spawn_watch_spool(health: Arc<mxhop::observe::Health>, spool: Arc<Spool>) {
+    tokio::spawn(async move {
+        loop {
+            match spool.queued().await {
+                Ok(queued) => {
+                    health.queue_writable(true);
+                    health.queue_depth(queued.len() as u64);
+                }
+                Err(e) => {
+                    warn!("the spool could not be read, so health is reporting it: {e}");
+                    health.queue_writable(false);
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        }
+    });
+}
+
+fn spawn_stop_on_signal(trigger: mxhop::shutdown::Trigger) {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut terminate = match signal(SignalKind::terminate()) {
+        Ok(signal) => signal,
+        Err(e) => {
+            warn!("cannot listen for SIGTERM, so a stop will not be graceful: {e}");
+            return;
+        }
+    };
+    let mut interrupt = match signal(SignalKind::interrupt()) {
+        Ok(signal) => signal,
+        Err(e) => {
+            warn!("cannot listen for SIGINT: {e}");
+            return;
+        }
+    };
+
+    tokio::spawn(async move {
+        let name = tokio::select! {
+            _ = terminate.recv() => "SIGTERM",
+            _ = interrupt.recv() => "SIGINT",
+        };
+        info!(
+            signal = name,
+            seconds = GRACE.as_secs(),
+            "stopping: no new connections, open sessions have until the grace              period to finish, and anyone waiting for a command gets 421"
+        );
+        trigger.fire();
+    });
 }
 
 fn spawn_reload_on_hangup(holder: Arc<Holder>) {
