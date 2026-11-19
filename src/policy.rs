@@ -37,7 +37,10 @@ impl Default for Limits {
 pub struct Head {
     pub received_count: usize,
     pub by_us_count: usize,
+    pub message_id: Option<String>,
 }
+
+pub const MAX_MESSAGE_ID: usize = 200;
 
 impl Head {
     pub fn scan(message: &[u8], hostname: &str) -> Head {
@@ -45,17 +48,35 @@ impl Head {
         let hostname = hostname.to_ascii_lowercase();
 
         for line in HeaderLines::new(message) {
-            let line = line.to_ascii_lowercase();
-            if !line.starts_with("received:") {
+            let lower = line.to_ascii_lowercase();
+            if lower.starts_with("message-id:") && head.message_id.is_none() {
+                head.message_id = message_id(&line["message-id:".len()..]);
+                continue;
+            }
+            if !lower.starts_with("received:") {
                 continue;
             }
             head.received_count += 1;
-            if names_host(&line, &hostname) {
+            if names_host(&lower, &hostname) {
                 head.by_us_count += 1;
             }
         }
         head
     }
+}
+
+fn message_id(value: &str) -> Option<String> {
+    let value = value.trim();
+    let inside = value
+        .strip_prefix('<')
+        .and_then(|rest| rest.split_once('>').map(|(id, _)| id))?;
+    if inside.is_empty() || inside.len() > MAX_MESSAGE_ID {
+        return None;
+    }
+    inside
+        .chars()
+        .all(|c| c.is_ascii_graphic() && c != '<' && c != '>' && c != '"' && c != '\\' && c != ',')
+        .then(|| inside.to_string())
 }
 
 fn names_host(line: &str, hostname: &str) -> bool {
@@ -740,6 +761,72 @@ mod tests {
         assert_eq!(plan.groups[1].recipients.len(), 1);
     }
 
+    fn scanned(message: &str) -> Head {
+        Head::scan(message.as_bytes(), "mx.tooling.ninja")
+    }
+
+    #[test]
+    fn the_message_id_is_read_without_its_angle_brackets() {
+        let head = scanned("Message-ID: <abc123@sender.test>\r\nSubject: hi\r\n\r\nbody\r\n");
+
+        assert_eq!(head.message_id.as_deref(), Some("abc123@sender.test"));
+    }
+
+    #[test]
+    fn the_first_message_id_wins_and_the_header_name_is_case_insensitive() {
+        let head = scanned(
+            "message-id:   <first@sender.test>  \r\n\
+             Message-Id: <second@sender.test>\r\n\r\nbody\r\n",
+        );
+
+        assert_eq!(head.message_id.as_deref(), Some("first@sender.test"));
+    }
+
+    #[test]
+    fn a_message_with_no_message_id_has_none_rather_than_an_empty_string() {
+        assert_eq!(scanned("Subject: hi\r\n\r\nbody\r\n").message_id, None);
+        assert_eq!(scanned("Message-ID: <>\r\n\r\nbody\r\n").message_id, None);
+        assert_eq!(
+            scanned("Message-ID: not-in-brackets\r\n\r\nbody\r\n").message_id,
+            None
+        );
+    }
+
+    #[test]
+    fn a_message_id_that_could_forge_a_log_line_is_dropped() {
+        for crafted in [
+            "Message-ID: <a b@sender.test>\r\n\r\nbody\r\n",
+            "Message-ID: <a\"b@sender.test>\r\n\r\nbody\r\n",
+            "Message-ID: <a,b@sender.test>\r\n\r\nbody\r\n",
+        ] {
+            assert_eq!(
+                scanned(crafted).message_id,
+                None,
+                "the sender writes this header, and it is printed into a log line \
+                 and into JSON: {crafted:?}"
+            );
+        }
+
+        let long = format!(
+            "Message-ID: <{}@sender.test>\r\n\r\nbody\r\n",
+            "a".repeat(300)
+        );
+        assert_eq!(scanned(&long).message_id, None);
+    }
+
+    #[test]
+    fn reading_the_message_id_does_not_disturb_the_hop_count() {
+        let head = scanned(
+            "Received: from a by mx.tooling.ninja\r\n\
+             Message-ID: <x@sender.test>\r\n\
+             Received: from b by elsewhere.test\r\n\r\nbody\r\n",
+        );
+
+        assert_eq!(head.received_count, 2);
+        assert_eq!(head.by_us_count, 1);
+        assert_eq!(head.message_id.as_deref(), Some("x@sender.test"));
+    }
+
     #[test]
     fn one_recipient_two_aliases_gets_one_copy() {
         let plan = plan(decide(
@@ -825,6 +912,7 @@ mod tests {
         let head = Head {
             received_count: 25,
             by_us_count: 0,
+            message_id: None,
         };
         let decision = decide(
             &envelope(&["hi@example.com"]),
@@ -849,6 +937,7 @@ mod tests {
         let head = Head {
             received_count: 4,
             by_us_count: 3,
+            message_id: None,
         };
         let decision = decide(
             &envelope(&["hi@example.com"]),
@@ -929,6 +1018,7 @@ mod tests {
             Head {
                 received_count: 4,
                 by_us_count: 2,
+                message_id: None,
             }
         );
     }
@@ -950,6 +1040,7 @@ mod tests {
             Head {
                 received_count: 1,
                 by_us_count: 0,
+                message_id: None,
             },
             "the blank line ends the header block even when the header before it \
              was folded, or quoting a trace is enough to get a message refused"
