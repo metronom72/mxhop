@@ -2,7 +2,7 @@ version: "3.8"
 
 services:
   mxhop:
-    image: ghcr.io/metronom72/mxhop:0.1.0
+    image: ghcr.io/metronom72/mxhop:0.3.0
 
     ports:
       - target: 2525
