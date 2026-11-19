@@ -1,6 +1,6 @@
 services:
   mxhop:
-    image: ghcr.io/metronom72/mxhop:0.1.0
+    image: ghcr.io/metronom72/mxhop:0.3.0
     init: true
     restart: unless-stopped
     stop_grace_period: 30s
