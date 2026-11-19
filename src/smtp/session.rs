@@ -717,12 +717,24 @@ where
     // end-of-DATA is the first moment any of it can be decided — and it is
     // still early enough that the sending server holds the message.
     //
-    // `mail-auth` has no clock of its own, so this `timeout` is the only one.
-    // An expired budget becomes a verdict of `temperror` throughout rather
-    // than a verdict of `none`: see `Auth::timed_out`.
+    // `mail-auth` has no clock of its own, so every clock is one of ours.
+    // There are four: one per stage inside `Verifier::check`, and this one
+    // around the whole call as a backstop.
+    //
+    // The three inside are what matter, and `auth::Budget` says why: with a
+    // single clock the sender chooses the names for the first two stages and
+    // can therefore spend the whole budget before the third stage — the one
+    // that fetches the policy a refusal rests on — has asked anything.
+    //
+    // This one is a second longer than the three together, so that an
+    // expired stage always wins the race and this fires only for something
+    // the stages cannot cover: a future that blocks without reaching an
+    // await point. When it does fire the verdict is `temperror` throughout
+    // rather than `none`: see `Auth::timed_out`.
     let auth = {
-        let budget = crate::auth::AUTH_BUDGET
-            .min(deadline.saturating_duration_since(std::time::Instant::now()));
+        let budget =
+            crate::auth::Budget::of(deadline.saturating_duration_since(std::time::Instant::now()));
+        let backstop = budget.total() + std::time::Duration::from_secs(1);
         let probe = crate::auth::Probe {
             // A peer that is not an address at all happens only in a test;
             // the unspecified address matches no SPF mechanism, which makes
@@ -738,13 +750,13 @@ where
             mail_from: envelope.from.as_deref(),
             body: &body,
         };
-        match timeout(budget, relay.verify(probe)).await {
+        match timeout(backstop, relay.verify(probe, budget)).await {
             Ok(auth) => auth,
             Err(_) => {
                 warn!(
                     %peer,
                     id = %envelope.id,
-                    seconds = budget.as_secs(),
+                    seconds = backstop.as_secs(),
                     "SPF, DKIM and DMARC could not be checked inside their budget; \
                      every result is reported as temporary and the message is \
                      forwarded with that in its header, because an expired clock \
@@ -1270,7 +1282,11 @@ mod tests {
             self.ptr.clone()
         }
 
-        async fn verify(&self, probe: crate::auth::Probe<'_>) -> crate::auth::Auth {
+        async fn verify(
+            &self,
+            probe: crate::auth::Probe<'_>,
+            _budget: crate::auth::Budget,
+        ) -> crate::auth::Auth {
             self.probed.lock().unwrap().push((
                 probe.helo.to_string(),
                 probe.mail_from.map(ToString::to_string),
@@ -2966,6 +2982,7 @@ mod tests {
                 policy,
             },
             checked: true,
+            dkim_timed_out: false,
         }
     }
 

@@ -136,7 +136,7 @@ impl Relay for Fake {
         None
     }
 
-    async fn verify(&self, _probe: Probe<'_>) -> Auth {
+    async fn verify(&self, _probe: Probe<'_>, _budget: mxhop::auth::Budget) -> Auth {
         Auth::not_checked()
     }
 }
