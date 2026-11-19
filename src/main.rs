@@ -39,6 +39,7 @@ struct Cli {
 enum Command {
     Check,
     Run,
+    Health,
     #[command(hide = true)]
     SendTest {
         to: String,
@@ -55,6 +56,7 @@ async fn main() -> ExitCode {
     match &cli.command {
         Command::Check => check(&cli).await,
         Command::Run => run(&cli).await,
+        Command::Health => health(&cli).await,
         Command::SendTest { to, body, from } => send_test(&cli, to, body, from.as_deref()).await,
     }
 }
@@ -289,7 +291,7 @@ async fn run(cli: &Cli) -> ExitCode {
         }
     };
 
-    let listener = match TcpListener::bind(config.listen).await {
+    let listener = match inherited_or_bound(config.listen).await {
         Ok(listener) => listener,
         Err(e) => {
             error!(address = %config.listen, "cannot listen: {e}");
@@ -426,6 +428,94 @@ async fn run(cli: &Cli) -> ExitCode {
 const GRACE: std::time::Duration = std::time::Duration::from_secs(25);
 
 const QUEUE_LIMIT: u64 = 100_000;
+
+async fn inherited_or_bound(address: std::net::SocketAddr) -> std::io::Result<TcpListener> {
+    use mxhop::activation::{Offer, offer, take_first};
+
+    let listen_fds = std::env::var("LISTEN_FDS").ok();
+    let listen_pid = std::env::var("LISTEN_PID").ok();
+
+    match offer(
+        listen_fds.as_deref(),
+        listen_pid.as_deref(),
+        std::process::id(),
+    ) {
+        Offer::Sockets(count) => {
+            if count > 1 {
+                warn!(
+                    count,
+                    "more than one socket was handed over; using the first"
+                );
+            }
+            let inherited = take_first()?;
+            let shown = inherited
+                .local_addr()
+                .map_or_else(|_| "an inherited socket".to_string(), |a| a.to_string());
+            info!(address = %shown, "listening on the socket systemd handed over");
+            unsafe { std::env::remove_var("LISTEN_FDS") };
+            unsafe { std::env::remove_var("LISTEN_PID") };
+            TcpListener::from_std(inherited)
+        }
+        Offer::NotForUs { pid } => {
+            warn!(
+                pid,
+                "LISTEN_FDS names another process, so the socket in the environment \
+                 is not ours; binding the configured address instead"
+            );
+            TcpListener::bind(address).await
+        }
+        Offer::Malformed => {
+            warn!(
+                "LISTEN_FDS or LISTEN_PID could not be read; binding the configured \
+                 address instead"
+            );
+            TcpListener::bind(address).await
+        }
+        Offer::None => TcpListener::bind(address).await,
+    }
+}
+
+async fn health(cli: &Cli) -> ExitCode {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let Some(config) = load(cli) else {
+        return ExitCode::FAILURE;
+    };
+    let Some(address) = config.observe else {
+        eprintln!("there is no [observe] block, so there is no endpoint to ask");
+        return ExitCode::FAILURE;
+    };
+
+    let answered = async {
+        let mut stream = tokio::net::TcpStream::connect(address).await?;
+        stream
+            .write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await?;
+        let mut whole = String::new();
+        stream.read_to_string(&mut whole).await?;
+        Ok::<String, std::io::Error>(whole)
+    };
+
+    match tokio::time::timeout(std::time::Duration::from_secs(5), answered).await {
+        Ok(Ok(whole)) => {
+            let ok = whole.starts_with("HTTP/1.1 200");
+            print!("{}", whole.split_once("\r\n\r\n").map_or("", |(_, b)| b));
+            if ok {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+        Ok(Err(e)) => {
+            eprintln!("{address}: {e}");
+            ExitCode::FAILURE
+        }
+        Err(_) => {
+            eprintln!("{address}: no answer in five seconds");
+            ExitCode::FAILURE
+        }
+    }
+}
 
 fn spawn_watch_spool(health: Arc<mxhop::observe::Health>, spool: Arc<Spool>) {
     tokio::spawn(async move {

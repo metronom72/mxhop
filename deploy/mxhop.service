@@ -1,0 +1,51 @@
+[Unit]
+Description=mxhop SMTP forwarder
+Documentation=https://github.com/metronom72/mxhop
+After=network-online.target nss-lookup.target
+Wants=network-online.target
+Requires=mxhop.socket
+
+[Service]
+Type=exec
+ExecStartPre=/usr/local/bin/mxhop check --config /etc/mxhop/mxhop.toml
+ExecStart=/usr/local/bin/mxhop run --config /etc/mxhop/mxhop.toml
+ExecReload=/bin/kill -HUP $MAINPID
+
+User=mxhop
+Group=mxhop
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+StateDirectory=mxhop
+ConfigurationDirectory=mxhop
+ReadWritePaths=/var/lib/mxhop
+
+KillSignal=SIGTERM
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=5s
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @obsolete
+
+[Install]
+WantedBy=multi-user.target

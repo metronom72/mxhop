@@ -72,12 +72,34 @@ mxhop check            # reads /etc/mxhop/mxhop.toml; exits non-zero if wrong
 mxhop run
 ```
 
-Port 25 is privileged, so `run` as an unprivileged user needs
-`CAP_NET_BIND_SERVICE` (`AmbientCapabilities=CAP_NET_BIND_SERVICE` in a
-systemd unit) or a socket handed to it. There is no systemd unit in this
-repository yet. After a certificate renewal, `kill -HUP` makes mxhop reread
-the certificate files; `systemctl reload` only works if the unit has
-`ExecReload=/bin/kill -HUP $MAINPID`.
+Port 25 is privileged. There are two ways to have it without running as
+root, and [`deploy/`](deploy/) has a unit for each:
+
+```sh
+install -D -m 0644 deploy/mxhop.service /etc/systemd/system/mxhop.service
+install -D -m 0644 deploy/mxhop.socket  /etc/systemd/system/mxhop.socket
+systemctl daemon-reload
+systemctl enable --now mxhop.socket mxhop.service
+```
+
+**Socket activation** is the better one: `mxhop.socket` binds 25 as root
+before the service starts and hands the listening socket over, so mxhop
+never holds the capability at all. mxhop reads `LISTEN_FDS` and `LISTEN_PID`
+and takes the socket if it is addressed to this process — a socket meant for
+somebody else is left alone, which is what `LISTEN_PID` is for and what
+`a_socket_meant_for_another_process_is_left_alone` pins.
+
+**`AmbientCapabilities=CAP_NET_BIND_SERVICE`** is the fallback, and the unit
+sets it too, so the service also starts without the socket unit. With no
+socket handed over, mxhop binds `listen` from the config itself.
+
+`ExecStartPre` runs `mxhop check`, so a bad config fails the start rather
+than producing a mail server that refuses every recipient.
+
+After a certificate renewal, `systemctl reload mxhop` rereads the
+certificate files — the unit has the `ExecReload=/bin/kill -HUP $MAINPID`
+that makes that work. A reload that fails keeps the pair already loaded and
+does **not** make the service unhealthy.
 
 ### As a container
 
@@ -86,17 +108,40 @@ docker build -t mxhop .
 docker run --rm mxhop --version
 ```
 
-The image listens on **2525**, not 25: the privileged port is published on
-the host side, so the process needs no capability and the deployment can
-drop all of them. Your config file must therefore say
-`listen = "0.0.0.0:2525"`. For the `run` command — and only for it — the
-entrypoint runs `mxhop check` first, so a bad config fails the deploy
-instead of starting a mail server that refuses every recipient; other
-commands (`--version`, `send-test`) run without needing a config at all.
+The image is **`scratch`** — the static binary, `/etc/passwd`, `/etc/group`
+and an empty spool directory, and nothing else. No shell, no package
+manager, no busybox, around 8 MB. The build asserts the binary has no
+`NEEDED` entry before it is copied in, because a dynamically linked binary
+on `scratch` fails at the first execve rather than at build time.
 
-The image's healthcheck opens an SMTP connection on the loopback and looks
-for a `220` banner. That proves the listener is still answering; it does not
-prove TLS, the spool or delivery work.
+There is no entrypoint script, since there is nothing to run one with:
+`ENTRYPOINT` is the binary. A bad config still fails the deploy — `run`
+loads and validates the config, the certificate and the SRS secret before
+it binds anything.
+
+It listens on **2525**, not 25: the privileged port is published on the host
+side, so the process needs no capability and the deployment can drop all of
+them. Your config file must therefore say `listen = "0.0.0.0:2525"`.
+
+The healthcheck is `mxhop health`, which asks the container's own
+`/healthz` and exits non-zero on anything but `200`. That covers the
+listener, the spool, the queue depth and the resolver — rather than only a
+`220` banner, which is all the old `nc`-based check could prove and which a
+shell-less image cannot run anyway. It needs an `[observe]` block in the
+config; `127.0.0.1:9090` is enough, and keeps the endpoint inside the
+container where nothing else can reach it.
+
+[`deploy/compose.yml`](deploy/compose.yml) is a ready one-node file:
+read-only root, all capabilities dropped, `no-new-privileges`, the spool and
+the config bind-mounted. [`deploy/mxhop.stack.yml`](deploy/mxhop.stack.yml)
+is the Swarm equivalent, with the port published in **`host` mode** — the
+ingress mesh would NAT every connection through an overlay address, so
+`Received` would name the wrong peer, the logs would be useless and SPF
+would be evaluated against 10.0.x.x instead of the sender.
+
+Neither publishes the metrics port. It is unauthenticated, and publishing it
+from a host-mode service opens it to the internet; scrape it by adding the
+mapping deliberately.
 
 The spool must be a mount point — a bind mount from a host path, not a named
 volume and never a layer in the image. It holds mail that has been accepted

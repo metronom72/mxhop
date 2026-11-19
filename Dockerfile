@@ -5,16 +5,20 @@ RUN apk add --no-cache musl-dev build-base
 WORKDIR /src
 COPY . .
 
-RUN rustup target add x86_64-unknown-linux-musl \
-    && cargo build --locked --release --target x86_64-unknown-linux-musl \
-    && strip target/x86_64-unknown-linux-musl/release/mxhop
+RUN cargo build --locked --release \
+    && strip target/release/mxhop \
+    && cp target/release/mxhop /mxhop \
+    && ! readelf -d /mxhop | grep -q NEEDED \
+    && printf 'mxhop:x:10001:10001::/nonexistent:/sbin/nologin\n' > /passwd.mxhop \
+    && printf 'mxhop:x:10001:\n' > /group.mxhop \
+    && mkdir -p /spool
 
-FROM alpine:3.22
+FROM scratch
 
-RUN addgroup -g 10001 -S mxhop && adduser -u 10001 -S -G mxhop mxhop
-
-COPY --from=builder /src/target/x86_64-unknown-linux-musl/release/mxhop /usr/local/bin/mxhop
-COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+COPY --from=builder /passwd.mxhop /etc/passwd
+COPY --from=builder /group.mxhop /etc/group
+COPY --from=builder --chown=10001:10001 /spool /var/lib/mxhop/spool
+COPY --from=builder /mxhop /mxhop
 
 EXPOSE 2525
 
@@ -25,7 +29,7 @@ USER 10001:10001
 ENV MXHOP_CONFIG=/etc/mxhop/mxhop.toml
 
 HEALTHCHECK --interval=60s --timeout=10s --start-period=10s --retries=3 \
-    CMD printf 'QUIT\r\n' | nc -w 5 127.0.0.1 2525 | grep -q '^220 '
+    CMD ["/mxhop", "health"]
 
-ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+ENTRYPOINT ["/mxhop"]
 CMD ["run"]
