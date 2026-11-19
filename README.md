@@ -38,7 +38,7 @@ you are the first.
 | Metrics, health, graceful stop — **0.2** | `SIGTERM` in the middle of `DATA` finishes the message |
 | `scratch` image, systemd units, compose | the image, end to end, in CI: no shell, uid 10001, a full SMTP conversation |
 | Docs and release — **1.0** | you are reading it |
-| ARC sealing | not written |
+| ARC sealing | the seal verifies in a test; a receiver's `arc=pass` is a separate claim |
 | Connection blocklists, rate limiting | not written |
 
 What works today: it accepts mail, forwards it inside the session that
@@ -484,6 +484,67 @@ orchestrator to kill it would turn a typo in a renewal hook into an outage.
 Twenty-five rather than thirty so that the whole thing finishes inside a
 default `stop_grace_period: 30s` with room to spare — a deploy that reaches
 the `SIGKILL` is a deploy that cuts a session in half.
+
+## ARC: sealing what this hop found out
+
+Forwarding breaks SPF for the original sender — the message now arrives from
+this host, not from theirs. DMARC then rests entirely on the original DKIM
+signature surviving the hop. mxhop does not touch a message's bytes, so it
+usually does. When it does not, the receiver has nothing left to check.
+
+ARC (RFC 8617) is what the large receivers offer to fix that: this host
+records what *it* found out, signs that record, and signs the chain. A
+receiver that trusts the sealer can use it when its own checks fail.
+
+```toml
+[arc]
+domain = "mx.example.com"
+selector = "arc1"
+key_file = "/etc/mxhop/arc.key"
+```
+
+No block, no seal — and no half-written header either. An RSA key:
+
+```sh
+openssl genrsa -out /etc/mxhop/arc.key 2048
+chmod 600 /etc/mxhop/arc.key
+```
+
+**RSA, not Ed25519.** Ed25519 is in the specification; it is not validated by
+every large receiver, and a seal nobody checks is worse than no seal, because
+it looks like one. `check` refuses anything else and says so.
+
+`mxhop check` prints the record to publish, and the public half comes from
+the key:
+
+```sh
+openssl rsa -in /etc/mxhop/arc.key -pubout -outform DER 2>/dev/null | base64 -w0
+```
+
+as a TXT record at `arc1._domainkey.mx.example.com`:
+
+```
+v=DKIM1; k=rsa; p=<that base64>
+```
+
+Three headers go in front of the message, above mxhop's own `Received`:
+`ARC-Seal`, `ARC-Message-Signature` and `ARC-Authentication-Results`. They
+are kept on the envelope like the trace is, for the same reason — a seal
+covers bytes, and a retry that sealed again would write a second seal for one
+hop, which is exactly what a chain must not contain.
+
+An arriving chain is verified first. A valid one is extended with `cv=pass`,
+an empty one starts at `i=1` with `cv=none`, and a **broken one is left
+alone**: mxhop adds nothing rather than sealing over a chain that already
+failed.
+
+**Honestly about what this buys.** A seal is worth exactly what the receiver
+decides to give it. Google and Microsoft document that they consider ARC;
+neither promises anything, and a new sealing domain carries no reputation at
+all. ARC does not rescue a message that fails DMARC outright — it gives a
+receiver a reason to believe the hop before this one, nothing more. The
+honest reason to publish it is that without it a forwarder has nothing to say
+for itself when DKIM breaks upstream.
 
 ## When mail cannot be delivered: who is told
 

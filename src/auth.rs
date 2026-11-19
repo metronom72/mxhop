@@ -1,7 +1,7 @@
 use std::fmt::Write as _;
 use std::net::IpAddr;
 
-use tracing::warn;
+use tracing::{error, warn};
 
 use crate::policy::{is_safe_address, name_or_unknown};
 use crate::routing::is_qualified;
@@ -147,6 +147,15 @@ pub struct Auth {
     pub dmarc: Dmarc,
     pub checked: bool,
     pub dkim_timed_out: bool,
+    /// The ARC set this host sealed, three headers ready to go in front of
+    /// the message, or empty when no key is configured, when the arriving
+    /// chain is broken, or when the check is off.
+    ///
+    /// Carried on the verdict rather than rebuilt at delivery for the same
+    /// reason `received` is carried on the envelope: the seal covers bytes,
+    /// so a retry that re-sealed would produce a different one, and a second
+    /// seal for the same hop is not something a receiver should ever see.
+    pub arc: String,
 }
 
 impl Auth {
@@ -184,6 +193,7 @@ impl Auth {
             },
             checked: true,
             dkim_timed_out: false,
+            arc: String::new(),
         }
     }
 
@@ -383,6 +393,7 @@ pub struct Probe<'a> {
 pub struct Verifier {
     inner: mail_auth::MessageAuthenticator,
     hostname: String,
+    sealer: Option<std::sync::Arc<crate::arc::Sealer>>,
 }
 
 impl std::fmt::Debug for Verifier {
@@ -399,8 +410,15 @@ impl Verifier {
             .map(|inner| Self {
                 inner,
                 hostname: hostname.to_string(),
+                sealer: None,
             })
             .map_err(|e| e.to_string())
+    }
+
+    #[must_use]
+    pub fn sealing_with(mut self, sealer: Option<std::sync::Arc<crate::arc::Sealer>>) -> Self {
+        self.sealer = sealer;
+        self
     }
 
     #[cfg(test)]
@@ -429,11 +447,18 @@ impl Verifier {
         Self {
             inner: mail_auth::MessageAuthenticator::new(config, options).expect("a resolver"),
             hostname: hostname.to_string(),
+            sealer: None,
         }
     }
 
     pub fn hostname(&self) -> &str {
         &self.hostname
+    }
+
+    #[cfg(test)]
+    async fn verify_chain(&self, message: &[u8]) -> mail_auth::DkimResult {
+        let parsed = mail_auth::AuthenticatedMessage::parse(message).expect("a message");
+        self.inner.verify_arc(&parsed).await.result().clone()
     }
 
     pub async fn check(&self, probe: Probe<'_>, budget: Budget) -> Auth {
@@ -491,6 +516,7 @@ impl Verifier {
             dmarc: Dmarc::default(),
             checked: true,
             dkim_timed_out: false,
+            arc: String::new(),
         };
 
         let Some(message) = mail_auth::AuthenticatedMessage::parse(probe.body) else {
@@ -576,7 +602,65 @@ impl Verifier {
             result: dmarc_verdict(&dmarc.result()),
             policy: dmarc.record().map(|_| policy(dmarc.policy())),
         };
+
+        auth.arc = self
+            .seal(&message, &probe, &spf_mail, &dkim, &dmarc, mail_from_domain)
+            .await;
         auth
+    }
+
+    async fn seal(
+        &self,
+        message: &mail_auth::AuthenticatedMessage<'_>,
+        probe: &Probe<'_>,
+        spf_mail: &mail_auth::SpfOutput,
+        dkim: &[mail_auth::DkimOutput<'_>],
+        dmarc: &mail_auth::DmarcOutput,
+        mail_from_domain: &str,
+    ) -> String {
+        use mail_auth::headers::HeaderWriter;
+        use mail_auth::spf::verify::SpfParameters;
+
+        let Some(sealer) = &self.sealer else {
+            return String::new();
+        };
+
+        let chain = self.inner.verify_arc(message).await;
+        if !chain.can_be_sealed() {
+            warn!(
+                helo = %probe.helo,
+                "this message carries an ARC chain that cannot be extended, so no \
+                 seal of ours is added; the chain stays as it arrived"
+            );
+            return String::new();
+        }
+
+        let results = mail_auth::AuthenticationResults::new(&self.hostname)
+            .with_spf_result(
+                spf_mail,
+                &SpfParameters::mail_from(
+                    probe.ip,
+                    probe.helo,
+                    &self.hostname,
+                    probe.mail_from.unwrap_or(""),
+                ),
+            )
+            .with_dkim_results(dkim, mail_from_domain)
+            .with_dmarc_result(dmarc)
+            .with_arc_result(&chain, probe.ip);
+
+        match sealer.inner().seal(message, &results, &chain) {
+            Ok(set) => set.to_header(),
+            Err(e) => {
+                error!(
+                    helo = %probe.helo,
+                    domain = sealer.domain(),
+                    "the ARC seal could not be written, so this message is \
+                     forwarded without one: {e}"
+                );
+                String::new()
+            }
+        }
     }
 }
 
@@ -660,6 +744,7 @@ mod tests {
             },
             checked: true,
             dkim_timed_out: false,
+            arc: String::new(),
         }
     }
 
@@ -1528,6 +1613,133 @@ mod tests {
         assert!(!auth.dkim_timed_out, "{auth:?}");
         assert_eq!(auth.dmarc.result, DmarcVerdict::Pass, "{auth:?}");
         assert_eq!(crate::policy::authentication_reply(&auth), None, "{auth:?}");
+    }
+
+    // --------------------------------------- the ARC seal, through a verifier
+
+    fn rsa_key_and_record() -> (std::path::PathBuf, String) {
+        let pair = mail_auth::dkim::generate::DkimKeyPair::generate_rsa(2048).expect("a key pair");
+        let dir = std::env::temp_dir()
+            .join("mxhop-arc-seal")
+            .join(crate::spool::new_id());
+        std::fs::create_dir_all(&dir).expect("a directory");
+        let path = dir.join("arc.key");
+
+        const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut body = String::new();
+        for chunk in pair.private_key().chunks(3) {
+            let b = [
+                chunk[0],
+                chunk.get(1).copied().unwrap_or(0),
+                chunk.get(2).copied().unwrap_or(0),
+            ];
+            let word = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+            for (i, shift) in [18, 12, 6, 0].into_iter().enumerate() {
+                if i <= chunk.len() {
+                    body.push(A[((word >> shift) & 0x3f) as usize] as char);
+                } else {
+                    body.push('=');
+                }
+            }
+        }
+        std::fs::write(
+            &path,
+            format!("-----BEGIN RSA PRIVATE KEY-----\n{body}\n-----END RSA PRIVATE KEY-----\n"),
+        )
+        .expect("write the key");
+
+        (
+            path,
+            format!("v=DKIM1; k=rsa; p={}", pair.encoded_public_key()),
+        )
+    }
+
+    const KEY_NAME: &str = "arc1._domainkey.mx.tooling.ninja";
+
+    async fn sealed(body: &[u8]) -> (String, String) {
+        let (key_path, record) = rsa_key_and_record();
+        let sealer = std::sync::Arc::new(
+            crate::arc::Sealer::open("mx.tooling.ninja", "arc1", &key_path).expect("an rsa key"),
+        );
+        let server = nameserver(vec![
+            (KEY_NAME, 16, Rr::Txt(record.clone())),
+            ("_dmarc.sender.test", 16, Rr::Txt("v=DMARC1; p=none".into())),
+        ])
+        .await;
+
+        let auth = Verifier::against(server, "mx.tooling.ninja")
+            .sealing_with(Some(sealer))
+            .check(probe(body, "sender@sender.test"), Budget::of(AUTH_BUDGET))
+            .await;
+
+        (auth.arc, record)
+    }
+
+    /// The half of the acceptance criterion a test can carry: the set this
+    /// host writes is one a real ARC verifier accepts. Gmail printing
+    /// `arc=pass` is the other half, and only a live message shows that.
+    #[tokio::test]
+    async fn the_seal_this_host_writes_is_accepted_by_an_arc_verifier() {
+        let body = message("sender.test");
+        let (set, record) = sealed(&body).await;
+
+        assert!(set.contains("ARC-Seal:"), "{set}");
+        assert!(set.contains("ARC-Message-Signature:"), "{set}");
+        assert!(set.contains("ARC-Authentication-Results:"), "{set}");
+        assert!(set.contains("i=1"), "a first hop is i=1: {set}");
+        assert!(set.contains("cv=none"), "an empty chain is cv=none: {set}");
+
+        let wire = [set.as_bytes(), &body].concat();
+        let server = nameserver(vec![(KEY_NAME, 16, Rr::Txt(record))]).await;
+        let result = Verifier::against(server, "receiver.test")
+            .verify_chain(&wire)
+            .await;
+
+        assert!(
+            matches!(result, mail_auth::DkimResult::Pass),
+            "a receiver has to be able to validate the chain: {result:?}"
+        );
+    }
+
+    /// A seal is only worth something if changing the message breaks it.
+    #[tokio::test]
+    async fn a_body_changed_after_sealing_does_not_verify() {
+        let body = message("sender.test");
+        let (set, record) = sealed(&body).await;
+
+        let mut tampered = [set.as_bytes(), &body].concat();
+        let at = tampered.len() - 3;
+        tampered[at] = b'X';
+
+        let server = nameserver(vec![(KEY_NAME, 16, Rr::Txt(record))]).await;
+        let result = Verifier::against(server, "receiver.test")
+            .verify_chain(&tampered)
+            .await;
+
+        assert!(
+            !matches!(result, mail_auth::DkimResult::Pass),
+            "one changed byte must break the seal, or it proves nothing: {result:?}"
+        );
+    }
+
+    /// Without a key there is no seal, and nothing is put in front of the
+    /// message. A forwarder that wrote a half-formed ARC header would be
+    /// worse than one that writes none.
+    #[tokio::test]
+    async fn no_key_means_no_header_at_all() {
+        let body = message("sender.test");
+        let server = nameserver(vec![(
+            "_dmarc.sender.test",
+            16,
+            Rr::Txt("v=DMARC1; p=none".into()),
+        )])
+        .await;
+
+        let auth = Verifier::against(server, "mx.tooling.ninja")
+            .check(probe(&body, "sender@sender.test"), Budget::of(AUTH_BUDGET))
+            .await;
+
+        assert_eq!(auth.arc, "");
     }
 
     #[tokio::test]

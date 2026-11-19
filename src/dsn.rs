@@ -245,6 +245,7 @@ pub async fn send(
         next_attempt_unix_ms: 0,
         via: Default::default(),
         sender_authenticated: false,
+        arc: String::new(),
     };
 
     spool
@@ -275,6 +276,7 @@ mod tests {
             next_attempt_unix_ms: 0,
             via: Default::default(),
             sender_authenticated: true,
+            arc: String::new(),
         }
     }
 
@@ -309,6 +311,7 @@ mod tests {
     fn a_forged_envelope_gets_no_report() {
         let forged = Envelope {
             sender_authenticated: false,
+            arc: String::new(),
             ..original(Some("victim@paypal.test"))
         };
 

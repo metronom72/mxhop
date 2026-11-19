@@ -233,6 +233,7 @@ mod tests {
             next_attempt_unix_ms: 0,
             via: Default::default(),
             sender_authenticated: true,
+            arc: String::new(),
         }
     }
 

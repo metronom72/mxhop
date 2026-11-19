@@ -391,7 +391,8 @@ where
             ),
         };
 
-        let mut head = envelope.received.clone();
+        let mut head = envelope.arc.clone();
+        head.push_str(&envelope.received);
         head.push_str(&envelope.authentication_results);
         let body: Arc<[u8]> = body.into();
 
@@ -667,6 +668,7 @@ mod tests {
             next_attempt_unix_ms: 0,
             via: Default::default(),
             sender_authenticated: true,
+            arc: String::new(),
         }
     }
 
@@ -840,6 +842,7 @@ mod tests {
                 - (Schedule::default().lifetime.as_millis() as u64 + 1),
             attempts: 40,
             sender_authenticated: false,
+            arc: String::new(),
             from: Some("victim@paypal.test".into()),
             ..held(&["hi@dest.test"])
         };

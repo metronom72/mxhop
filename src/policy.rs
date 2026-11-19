@@ -604,6 +604,7 @@ mod tests {
             next_attempt_unix_ms: 0,
             via: Default::default(),
             sender_authenticated: true,
+            arc: String::new(),
         }
     }
 
@@ -1535,6 +1536,7 @@ mod tests {
             },
             checked: true,
             dkim_timed_out: false,
+            arc: String::new(),
         }
     }
 
@@ -1708,6 +1710,7 @@ mod tests {
         let unsigned = verdict("paypal.test", DmarcVerdict::Fail, Some(Policy::Reject));
         let stalled = Auth {
             dkim_timed_out: true,
+            arc: String::new(),
             ..verdict("paypal.test", DmarcVerdict::Fail, Some(Policy::Reject))
         };
 
