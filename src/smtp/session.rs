@@ -464,10 +464,11 @@ where
         .flatten()
     {
         Some(stripped) => {
+            let removed = body.len() - stripped.len();
             warn!(
                 %peer,
                 id = %id,
-                removed = body.len() - stripped.len(),
+                removed,
                 "this message arrived carrying an Authentication-Results header under \
                  this host's own name, which only this host may write; it has been \
                  removed before the message was checked"
@@ -718,6 +719,7 @@ where
         info!(
             %peer,
             id = %envelope.id,
+            message_id = head.message_id.as_deref().unwrap_or("none"),
             domains = plan.groups.len(),
             lost = verdict.lost.len(),
             "relayed: {}",
@@ -768,6 +770,7 @@ where
         Ok(()) => warn!(
             %peer,
             id = %held.id,
+            message_id = head.message_id.as_deref().unwrap_or("none"),
             held = held.to.join(", "),
             minutes = config.queue.backoff(attempts).as_secs() / 60,
             "part of the message was not delivered and is held in the queue for the \

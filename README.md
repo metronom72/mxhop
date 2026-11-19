@@ -16,36 +16,42 @@ a good one.
 
 ## Status
 
-**Not usable yet.** This repository is being built in the open, task by task;
-the list below is the order of work, and nothing above the current line has
-been proved end to end. Do not point an MX record at it.
+**Every feature below is written and tested. None of it has yet carried a
+real stranger's mail.** That is the honest line: the test suite covers each
+piece end to end, including against the built container image, but this
+project has not been an MX for a live domain. If you point a record at it,
+you are the first.
 
-| | |
+| | what the tests prove |
 |---|---|
-| Config file, validation, `mxhop check` | done |
-| Inbound SMTP session, spool to disk | done |
-| STARTTLS and certificate reload | done |
-| Outbound SMTP client | done |
-| Synchronous relay, hop limit — **0.1** | done |
-| SRS and bounce decoding | done |
-| SPF/DKIM/DMARC and `Authentication-Results` | done |
-| Queue, retries, per-host backoff | done |
-| Delivery reports (DSN) | done |
-| Metrics, health, graceful stop | done |
-| DSNs for queued failures | planned |
-| Metrics, health, graceful shutdown — **0.2** | planned |
-| ARC sealing | planned |
-| Image and example Swarm stack | in progress |
-| systemd unit, compose | planned |
-| Docs and release — **1.0** | planned |
+| Config, validation, `mxhop check` | every problem reported with its line, as many at once as possible |
+| Inbound session, spool to disk | body and envelope written to `tmp/`, fsynced, renamed into `queue/` |
+| STARTTLS and certificate reload | a reload is seen by the next connection and not the current one |
+| Outbound client | MX order, null MX, a dead exchanger deferred rather than bounced |
+| Synchronous relay, hop limit — **0.1** | a loop is refused by the trace before any DNS is spent |
+| SRS and bounce decoding | what a destination reads on the `MAIL FROM` line; a forged bounce refused |
+| SPF/DKIM/DMARC, `Authentication-Results` | a real nameserver, a real RSA and Ed25519 signature, one changed byte breaking it |
+| Queue, retries, per-host backoff | greylisting and `kill -9` mid-delivery, across two runners over one directory |
+| Per-stage verification budgets | a forgery whose own SPF never answers still gets `550` |
+| Delivery to a named server (`via`) | the MX lookup is skipped, and skipping it is what the test measures |
+| Delivery reports (DSN) | a forged envelope gets none, and a bounce is never bounced |
+| Metrics, health, graceful stop — **0.2** | `SIGTERM` in the middle of `DATA` finishes the message |
+| `scratch` image, systemd units, compose | the image, end to end, in CI: no shell, uid 10001, a full SMTP conversation |
+| Docs and release — **1.0** | you are reading it |
+| ARC sealing | not written |
+| Connection blocklists, rate limiting | not written |
 
 What works today: it accepts mail, forwards it inside the session that
-brought it, and keeps whatever a destination deferred in a queue it retries.
-The queue is two files per message — `queue/<id>.eml` is exactly what
-arrived, `queue/<id>.json` is its envelope — so you can read what is stuck
-and why with `cat`. What is still missing before an MX record can point here
-is a delivery report: a copy mxhop finally gives up on is a copy whose sender
-is never told, and that is the next task.
+brought it, keeps whatever a destination deferred in a queue it retries, and
+tells a sender whose identity it could prove when a copy finally failed. The
+queue is two files per message — `queue/<id>.eml` is exactly what arrived,
+`queue/<id>.json` is its envelope — so you can read what is stuck and why
+with `cat`.
+
+[ARCHITECTURE.md](ARCHITECTURE.md) is where the code is and why.
+[SECURITY.md](SECURITY.md) is how to report something privately and what
+counts. [CONTRIBUTING.md](CONTRIBUTING.md) is the DCO and what a change
+needs.
 
 ```sh
 mxhop check --config mxhop.example.toml   # before anything else
@@ -59,6 +65,9 @@ waiting, and queues what a destination deferred. What follows is how to
 deploy it.
 
 ### As a binary
+
+Every tag publishes a static binary for `x86_64` and `aarch64` with a
+checksum beside it, and a multi-architecture image to `ghcr.io`. Or build it:
 
 ```sh
 cargo build --release --target x86_64-unknown-linux-musl   # one static binary
@@ -630,6 +639,58 @@ sender writes the header itself, under your name, and nothing downstream can
 tell the claim from the finding.
 
 [rfc8601]: https://www.rfc-editor.org/rfc/rfc8601#section-5
+
+## What mxhop writes down about your mail
+
+A forwarder sees every message you receive. What it records is a decision, not
+an implementation detail, so here it is in full.
+
+### In the log
+
+| | |
+|---|---|
+| the queue id | the one thread through every line about a message |
+| the peer address and the `HELO` name | the connection's facts |
+| `MAIL FROM` and the resolved recipients | the envelope |
+| the `Message-ID` | so a line here can be matched to a line in the destination's log |
+| the size in bytes, and the hop count from `Received` | counts, not content |
+| the SPF, DKIM and DMARC verdicts | and the policy that was in hand |
+| the destination's own reply, word for word | its text, not yours |
+
+### Never, in any line
+
+**The subject. The body. Any header the sender wrote**, apart from the
+`Message-ID`, which is an identifier and is dropped if it contains anything
+that could forge a log line.
+
+This is not a promise in prose only. `tests/no_content_in_logs.rs` reads every
+`tracing` call in the tree and fails the build if one of them would print a
+message's content — a length or a count has to be bound to a name first, so
+that what reaches the record is visible in the call itself.
+
+The same rule holds for `/metrics`: counters and histograms, never a label
+carrying an address. A test asserts the whole rendered output contains no `@`.
+
+### On disk
+
+`queue/<id>.eml` **is** the message, byte for byte as it arrived. That is the
+point — an operator has to be able to read what is stuck. Its protection is
+the directory's permissions and nothing else: `0750`, owned by the service
+user.
+
+| | |
+|---|---|
+| a message being delivered now | seconds |
+| a message a destination deferred | up to `queue.lifetime_hours`, 48 by default |
+| a message mxhop gave up on | **in `frozen/` until somebody removes it** |
+
+mxhop never deletes a message it accepted. A frozen one is somebody's mail
+and the only copy of it, so it stays readable and the disk it sits on is the
+operator's to watch — `/metrics` reports the queue depth, and `/healthz`
+turns `503` at the configured limit.
+
+A delivered message is removed from `queue/` immediately. Nothing is archived,
+nothing is copied anywhere, and there is no index of what passed through.
 
 ## Why this exists
 
