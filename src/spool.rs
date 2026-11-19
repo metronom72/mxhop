@@ -1,24 +1,3 @@
-//! The queue on disk: one message, two files.
-//!
-//! `queue/<id>.eml` is the message exactly as it arrived; `queue/<id>.json` is
-//! its envelope. Two files rather than a database because `ls` and `cat` are
-//! then the whole administration interface, and a message stuck in a queue is
-//! something an operator should be able to read without a tool.
-//!
-//! The order of operations is the part that matters. Both files are written
-//! into `tmp/`, flushed to the platter, and only then renamed into `queue/` —
-//! the envelope last. A message becomes visible to delivery when, and only
-//! when, its envelope is there, so `kill -9` at any point leaves either
-//! nothing or a complete message, never half of one. mxhop answers `250` only
-//! after that rename has returned: before it, the sending server still owns
-//! the message, which is exactly where responsibility belongs.
-//!
-//! There is a third directory, `frozen/`, and it is where a message goes when
-//! mxhop has stopped trying to deliver it — see [`Spool::freeze`]. Nothing in
-//! this file ever deletes a message that has not been delivered or refused
-//! for good: an accepted message is the only copy there is, and deleting it
-//! to say "we gave up" would say so to nobody.
-
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -29,7 +8,6 @@ use tracing::warn;
 
 use crate::envelope::Envelope;
 
-/// A fresh queue id. Sorts by time, so `ls` shows the queue in arrival order.
 pub fn new_id() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let ms = crate::envelope::now_unix_ms();
@@ -45,7 +23,6 @@ pub struct Spool {
 }
 
 impl Spool {
-    /// Opens (and creates) the spool directories.
     pub async fn open(root: impl AsRef<Path>) -> io::Result<Self> {
         let root = root.as_ref();
         let spool = Self {
@@ -55,53 +32,26 @@ impl Spool {
         };
         fs::create_dir_all(&spool.tmp).await?;
         fs::create_dir_all(&spool.queue).await?;
-        // Created empty rather than on first use, so that an operator who
-        // has never had a message given up on still sees the directory and
-        // knows where to look when one is.
         fs::create_dir_all(&spool.frozen).await?;
         Ok(spool)
     }
 
-    /// Stores one message. Returns when it is durably in the queue.
     pub async fn store(&self, envelope: &Envelope, body: &[u8]) -> io::Result<()> {
         let message = format!("{}.eml", envelope.id);
         let sidecar = format!("{}.json", envelope.id);
 
         let json = serde_json::to_vec_pretty(envelope).map_err(io::Error::other)?;
-        // The queue-side message is in this list as well as the two staged
-        // files, and it is the one that matters most. The renames go message
-        // first, envelope second, so a failure in between leaves
-        // `queue/<id>.eml` in place — and `queued()` lists envelopes, so that
-        // file is never returned, never delivered and never seen again: a
-        // full copy of somebody's message, leaked by the one window the
-        // sweep exists for.
         let staged = [
             self.tmp.join(&message),
             self.tmp.join(&sidecar),
             self.queue.join(&message),
         ];
 
-        // Every exit between here and the last rename has to sweep `tmp/`.
-        // Returning the error on its own leaves a copy of the message in a
-        // directory nothing ever reads again: delivery looks in `queue/`, so
-        // a leaked `tmp/<id>.eml` is undeliverable and invisible at once, and
-        // it is the full message, so a spool that fails intermittently fills
-        // the disk with mail nobody can see. A failed store means the caller
-        // answers 4xx and the sending server keeps the message, which is the
-        // copy that matters.
         if let Err(e) = self.stage_and_rename(&message, &sidecar, body, &json).await {
             for path in &staged {
                 match fs::remove_file(path).await {
                     Ok(()) => {}
-                    // Already renamed on, or never created: there was nothing
-                    // to clean up, and the store's own error is the one worth
-                    // reporting.
                     Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                    // Anything else is the sweep failing in the one situation
-                    // it exists for, which leaves a copy of a message on disk
-                    // that nothing will ever read. Silence here is an
-                    // operator watching the disk fill with no way to find
-                    // what is filling it, so the path goes in the log.
                     Err(e) => warn!(
                         path = %path.display(),
                         "a half-stored message could not be removed; it is a copy of \
@@ -113,17 +63,6 @@ impl Spool {
             return Err(e);
         }
 
-        // Both renames returned, so the message *is* in the queue and will be
-        // delivered whatever happens next. A judgement call: a `sync_dir`
-        // failure is reported as success, with the risk named, rather than as
-        // an error. Returning `Err` would have the session answer the sending
-        // server 4xx and log that the message could not be held, while it is
-        // sitting in `queue/` waiting to be delivered — the sender then sends
-        // it again and the recipient gets two copies, and the log says the
-        // opposite of what is on disk. What is actually in doubt is narrower:
-        // the directory entry may not survive a power cut in the next moment,
-        // which is one message at risk in a crash rather than one message
-        // duplicated in every such failure.
         if let Err(e) = sync_dir(&self.queue).await {
             warn!(
                 id = %envelope.id,
@@ -134,11 +73,6 @@ impl Spool {
         Ok(())
     }
 
-    /// The staging and the two renames, so that [`Spool::store`] has one
-    /// place to clean up from. Everything that can leave a file behind is in
-    /// here; the directory flush is not, because by then there is nothing
-    /// left to sweep and its failure means something else — see
-    /// [`Spool::store`].
     async fn stage_and_rename(
         &self,
         message: &str,
@@ -149,13 +83,10 @@ impl Spool {
         durable_write(&self.tmp.join(message), body).await?;
         durable_write(&self.tmp.join(sidecar), json).await?;
 
-        // The message first, its envelope second: delivery looks for
-        // envelopes, so the message becomes visible only once both are there.
         fs::rename(self.tmp.join(message), self.queue.join(message)).await?;
         fs::rename(self.tmp.join(sidecar), self.queue.join(sidecar)).await
     }
 
-    /// Every complete message in the queue, in arrival order.
     pub async fn queued(&self) -> io::Result<Vec<Envelope>> {
         let mut entries = fs::read_dir(&self.queue).await?;
         let mut found = Vec::new();
@@ -165,8 +96,6 @@ impl Spool {
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            // One unreadable envelope is one stuck message, not a stuck
-            // queue: the rest still have to be delivered.
             match fs::read(&path).await {
                 Ok(bytes) => match serde_json::from_slice::<Envelope>(&bytes) {
                     Ok(envelope) => found.push(envelope),
@@ -180,20 +109,10 @@ impl Spool {
         Ok(found)
     }
 
-    /// The stored message belonging to an envelope.
     pub async fn body(&self, id: &str) -> io::Result<Vec<u8>> {
         fs::read(self.queue.join(format!("{id}.eml"))).await
     }
 
-    /// Replaces an envelope already in the queue — a new attempt count, a
-    /// new time to try again, the destination's latest words.
-    ///
-    /// Staged in `tmp/` and renamed over the old one, for the same reason
-    /// [`Spool::store`] does it that way: a reader of `queue/<id>.json` sees
-    /// either the envelope before this call or the one after it, never a
-    /// half-written file. The message itself is never touched — a retry has
-    /// to go out as the identical bytes, or the sender's DKIM signature
-    /// stops verifying on the second attempt.
     pub async fn update(&self, envelope: &Envelope) -> io::Result<()> {
         let sidecar = format!("{}.json", envelope.id);
         let json = serde_json::to_vec_pretty(envelope).map_err(io::Error::other)?;
@@ -208,11 +127,6 @@ impl Spool {
             return Err(e);
         }
 
-        // Same judgement as in `store`: the envelope *is* replaced, and
-        // saying otherwise would have the caller retry a message it has
-        // already rescheduled. What is in doubt is narrower — the old
-        // envelope may come back after a power cut in the next moment, which
-        // costs one duplicate attempt against a destination that deferred.
         if let Err(e) = sync_dir(&self.queue).await {
             warn!(
                 id = %envelope.id,
@@ -224,23 +138,11 @@ impl Spool {
         Ok(())
     }
 
-    /// Forgets a message: it has been delivered, or there is nothing left
-    /// that could deliver it.
-    ///
-    /// The message goes first and the envelope second — the opposite of the
-    /// order a reader might expect, and the same order [`Spool::store`]
-    /// uses. If this fails half way, what is left is `queue/<id>.json`
-    /// without its message: visible to `queued()`, read by the next sweep,
-    /// and removed there. The other order leaves `queue/<id>.eml` alone,
-    /// which `queued()` never returns — a full copy of somebody's mail that
-    /// nothing will ever deliver, read or report.
     pub async fn forget(&self, id: &str) -> io::Result<()> {
         let mut failure = None;
         for name in [format!("{id}.eml"), format!("{id}.json")] {
             match fs::remove_file(self.queue.join(&name)).await {
                 Ok(()) => {}
-                // Already gone: `forget` says what the queue should not
-                // contain, so something else having removed it is success.
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(e) => failure = Some(e),
             }
@@ -251,24 +153,10 @@ impl Spool {
         }
     }
 
-    /// Stops retrying a message without destroying it: both files move to
-    /// `frozen/`.
-    ///
-    /// This is what "we have given up" means on disk until mxhop can send a
-    /// delivery report of its own. Deleting the message would be the only
-    /// other way to stop an endless retry, and it would delete somebody's
-    /// mail to say so; `frozen/` keeps it where `ls` and `cat` find it, and
-    /// an operator who fixes whatever was wrong can move it back into
-    /// `queue/` by hand.
     pub async fn freeze(&self, id: &str) -> io::Result<()> {
         let message = format!("{id}.eml");
         let sidecar = format!("{id}.json");
 
-        // The message first, so that the envelope — the thing delivery looks
-        // for — is the last to leave `queue/`: a failure in between is a
-        // message whose body the next sweep cannot read, which it reports and
-        // removes, rather than a copy of mail left in a directory nothing
-        // reads.
         match fs::rename(self.queue.join(&message), self.frozen.join(&message)).await {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -277,10 +165,6 @@ impl Spool {
         fs::rename(self.queue.join(&sidecar), self.frozen.join(&sidecar)).await
     }
 
-    /// Removes one file left in `tmp/`, naming it in the log if it cannot be
-    /// removed: everything in there is a staged copy nothing will ever read
-    /// again, so a spool that fails intermittently would otherwise fill the
-    /// disk with files an operator has no way to find.
     async fn sweep(&self, path: &Path) {
         match fs::remove_file(path).await {
             Ok(()) => {}
@@ -306,16 +190,12 @@ impl Spool {
     }
 }
 
-/// Writes a file and waits for the platter, not the page cache.
 async fn durable_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let mut file = fs::File::create(path).await?;
     file.write_all(bytes).await?;
     file.sync_all().await
 }
 
-/// Flushes a directory entry, which is what makes a rename survive a power
-/// cut. Not every filesystem allows it; where it is refused, the rename is
-/// already durable.
 async fn sync_dir(path: &Path) -> io::Result<()> {
     let dir = fs::File::open(path).await?;
     match dir.sync_all().await {
@@ -361,17 +241,6 @@ mod tests {
             .collect()
     }
 
-    /// `tmp/` is a staging area, and anything left in it is a message
-    /// nobody will ever look at again: delivery reads `queue/`, so a leaked
-    /// `tmp/<id>.eml` is a copy of somebody's mail that is both undeliverable
-    /// and invisible.
-    ///
-    /// The failure is forced by taking the write bit off `queue/`, which is
-    /// how this happens in production — a full disk or a mode somebody fixed
-    /// by hand — so the two files are written and flushed and then the rename
-    /// into `queue/` is refused. The session-level version of this test
-    /// asserted `tmp/` was empty after a *successful* store, which was true
-    /// before any of this existed and exercised no failure at all.
     #[tokio::test]
     async fn a_store_that_fails_part_way_leaves_nothing_behind_in_tmp() {
         let root = scratch("store-fails");
@@ -383,8 +252,6 @@ mod tests {
 
         let failed = spool.store(&envelope("stuck", 5), b"hello").await;
 
-        // Put the directory back first, so a failing assertion below does not
-        // leave an unreadable scratch directory behind.
         let mut mode = std::fs::metadata(spool.queue_dir()).unwrap().permissions();
         #[cfg(unix)]
         {
@@ -412,17 +279,6 @@ mod tests {
         );
     }
 
-    /// The sweep exists for the window between the two renames, and this is
-    /// the half of it that was missed: the message has already moved into
-    /// `queue/` and only its envelope failed. `queued()` lists envelopes, so
-    /// `queue/<id>.eml` on its own is never returned and never delivered —
-    /// a full copy of somebody's message, invisible to everything but `ls`,
-    /// which is precisely the leak the sweep was added to prevent.
-    ///
-    /// The failure is aimed at that one rename by putting a *directory*
-    /// where the envelope has to go: `rename(2)` refuses to replace a
-    /// directory with a file, so the message's own rename succeeds and the
-    /// envelope's does not.
     #[tokio::test]
     async fn a_store_whose_envelope_cannot_be_renamed_leaves_no_message_in_the_queue() {
         let root = scratch("sidecar-fails");
@@ -548,9 +404,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_message_without_its_envelope_is_not_in_the_queue() {
-        // This is what `kill -9` between the two renames leaves behind. It has
-        // to be invisible to delivery: half a message delivered is worse than
-        // none.
         let root = scratch("orphan");
         let spool = Spool::open(&root).await.unwrap();
         std::fs::write(spool.queue_dir().join("orphan.eml"), b"body\r\n").unwrap();
@@ -618,9 +471,6 @@ mod tests {
 
     #[tokio::test]
     async fn forgetting_a_message_that_is_already_gone_is_not_a_failure() {
-        // The sweep after a half-finished `forget` calls this on a message
-        // whose files are partly removed. Reporting an error there would have
-        // the runner log a failure for work that is done.
         let root = scratch("forget-twice");
         let spool = Spool::open(&root).await.unwrap();
         spool.store(&envelope("twice", 2), b"x\r\n").await.unwrap();

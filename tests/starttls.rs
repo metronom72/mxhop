@@ -1,7 +1,3 @@
-//! STARTTLS over real TCP, because the thing under test is the accept loop:
-//! a reloaded certificate has to reach the next connection and leave the ones
-//! already talking alone.
-
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -17,11 +13,6 @@ use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName, UnixTime, pem::PemObject};
 use tokio_rustls::rustls::{self, ClientConfig};
 
-// ------------------------------------------------------------- test fixtures
-
-/// A directory of its own per run. `CARGO_TARGET_TMPDIR` survives between
-/// runs, and a spool left behind by the last one would make the count at the
-/// end of this test grow every time it is run.
 fn dir(name: &str) -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("{name}-{}", mxhop::spool::new_id()));
@@ -29,8 +20,6 @@ fn dir(name: &str) -> PathBuf {
     dir
 }
 
-/// Generated rather than committed: a fixture expires, and two distinct
-/// subjects are one call each.
 fn write_pair(dir: &Path, name: &str, common_name: &str) -> (PathBuf, PathBuf) {
     let generated = rcgen::generate_simple_self_signed([common_name.to_string()])
         .expect("generate a certificate");
@@ -48,7 +37,6 @@ fn leaf_of(path: &Path) -> Vec<u8> {
         .to_vec()
 }
 
-/// The test is about which certificate arrives, not about PKI.
 #[derive(Debug)]
 struct AcceptAnything(Arc<rustls::crypto::CryptoProvider>);
 
@@ -152,7 +140,6 @@ fn router() -> Router {
     router
 }
 
-/// Connects, says EHLO, upgrades, and reports the leaf the server served.
 async fn upgraded(
     address: std::net::SocketAddr,
 ) -> (Peer<impl AsyncRead + AsyncWrite + Unpin>, Vec<u8>) {
@@ -180,10 +167,6 @@ async fn upgraded(
     (Peer::new(stream), leaf)
 }
 
-/// The whole point of the snapshot per accept. A certbot renewal replaces the
-/// files while sessions are in flight; those sessions must finish on the
-/// certificate they negotiated, and the next connection must get the new one
-/// without a restart.
 #[tokio::test]
 async fn a_reload_is_seen_by_the_next_connection_and_not_the_current_one() {
     let root = dir("starttls");
@@ -231,14 +214,12 @@ async fn a_reload_is_seen_by_the_next_connection_and_not_the_current_one() {
         Some(Arc::clone(&holder)),
     ));
 
-    // Client one is inside the tunnel on certificate A, and stays there.
     let (mut first, first_leaf) = upgraded(address).await;
     assert_eq!(
         first_leaf, a,
         "the first session gets the first certificate"
     );
 
-    // Somebody renews.
     let (other_crt, other_key) = write_pair(&root, "two", "two.test");
     let b = leaf_of(&other_crt);
     std::fs::copy(&other_crt, &live_crt).unwrap();
@@ -246,11 +227,9 @@ async fn a_reload_is_seen_by_the_next_connection_and_not_the_current_one() {
     assert_ne!(a, b);
     holder.reload().expect("the replacement loads");
 
-    // Client two sees B.
     let (mut second, second_leaf) = upgraded(address).await;
     assert_eq!(second_leaf, b, "the next connection gets the new one");
 
-    // And client one, still on A, still delivers.
     first.send("EHLO client.test\r\n").await;
     first.reply().await;
     first.send("MAIL FROM:<sender@elsewhere.test>\r\n").await;

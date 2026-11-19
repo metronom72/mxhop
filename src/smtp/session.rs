@@ -1,16 +1,3 @@
-//! One inbound SMTP session, from `220` to `221`.
-//!
-//! The session is written over any stream rather than a socket, so the tests
-//! drive the real state machine through a pipe. What it does *not* do is
-//! decide policy: whether a recipient is ours comes from the [`Router`], and
-//! nothing here looks inside the message.
-//!
-//! STARTTLS makes the stream type change in the middle of the conversation,
-//! which is why the loop lives in [`talk`] and [`serve`] is an orchestrator:
-//! `talk` runs over the plaintext stream, hands back [`Step::StartTls`], and
-//! `serve` runs it again over the TLS stream. Two monomorphisations and no
-//! enum of streams.
-
 use std::io;
 use std::time::Duration;
 
@@ -29,43 +16,19 @@ use crate::smtp::wire::{self, WireError};
 use crate::spool::{Spool, new_id};
 use crate::srs::Srs;
 
-/// How many recipients one message may have before mxhop asks the client to
-/// come back for the rest.
 pub const MAX_RECIPIENTS: usize = 100;
 
-/// How many refused commands a session may collect before mxhop stops
-/// talking. A client that cannot speak SMTP is either broken or probing.
 pub const MAX_ERRORS: u32 = 10;
 
-/// How long a session may sit between commands, and inside DATA. RFC 5321
-/// §4.5.3.2 asks for these; without them a connection that says nothing holds
-/// a task for as long as it likes.
 pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 pub const DATA_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
-/// How long the TLS handshake may take. A client that has said `STARTTLS` and
-/// then nothing is past the point where an SMTP timeout could answer it, so
-/// this is the only thing that can end the session.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// How long the peer's reverse lookup may take before the trace says
-/// `unknown`. Two seconds because the sending server is waiting on the final
-/// dot while this happens, and a PTR record is a nicety: nothing is decided
-/// on it, so a slow resolver must cost the message almost nothing.
 pub const PTR_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// How long everything after the final dot may take: the reverse lookup, and
-/// every destination group's delivery together.
-///
-/// Five minutes, not the delivery side's own 180 s per domain. The sending
-/// server is holding its connection open for all of this, and Postfix gives
-/// up on an unanswered final dot after ten minutes
-/// (`smtp_data_done_timeout`) and resends — so the ceiling has to be
-/// comfortably under that however many destination domains one alias fans
-/// out to, or the domains that already accepted get a second copy.
 pub const RELAY_BUDGET: Duration = Duration::from_secs(300);
 
-/// What the session needs to know about itself.
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
     pub hostname: String,
@@ -76,21 +39,9 @@ pub struct SessionConfig {
     pub data_timeout: Duration,
     pub handshake_timeout: Duration,
     pub ptr_timeout: Duration,
-    /// Everything after the final dot, shared by every destination group of
-    /// one message. See [`RELAY_BUDGET`].
     pub relay_budget: Duration,
-    /// What counts as a loop. See [`crate::policy::Limits`].
     pub limits: Limits,
-    /// `[auth] enabled`. Carried here only so that the forged-header strip
-    /// can be switched off with it: the lookups are already switched off by
-    /// the relay handing back [`crate::auth::Auth::not_checked`], but the
-    /// strip runs in this file and would otherwise keep running. See where it
-    /// is read for why that matters.
     pub auth_enabled: bool,
-    /// When the queue runner will try a held message again. The session
-    /// writes the first interval into the envelope it holds, so it has to be
-    /// the one the runner would have computed: two copies of that number
-    /// would mean a message scheduled by one and read by the other.
     pub queue: crate::queue::Schedule,
 }
 
@@ -116,27 +67,16 @@ impl SessionConfig {
     }
 }
 
-/// What happened, for the log line.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Outcome {
-    /// Messages handed on, in whole or in part — the ones the sending server
-    /// was told 250 for.
     pub accepted: usize,
-    /// Whether the client said QUIT rather than vanishing.
     pub quit: bool,
-    /// Whether the session ended up inside a TLS tunnel.
     pub tls: bool,
 }
 
-/// Everything the loop knows. The three facts a transaction is made of, plus
-/// what the connection itself has become.
 #[derive(Debug, Default)]
 struct State {
-    /// `from` is `Some(None)` for the null sender, which is a sender — just
-    /// not one you can reply to.
     helo: Option<String>,
-    /// Whether the client said EHLO rather than HELO, which is the `ESMTP`
-    /// or `SMTP` the trace records.
     esmtp: bool,
     from: Option<Option<String>>,
     recipients: Vec<String>,
@@ -145,10 +85,6 @@ struct State {
 }
 
 impl State {
-    /// RFC 3207 §4.2: the handshake resets the session to the state right
-    /// after the greeting. The error count is not reset — it is ours, not the
-    /// client's, and a client that has already made nine mistakes does not
-    /// earn ten more by starting TLS.
     fn after_handshake(&mut self) {
         self.helo = None;
         self.esmtp = false;
@@ -158,23 +94,11 @@ impl State {
     }
 }
 
-/// Why [`talk`] came back.
 enum Step {
-    /// The conversation is over; the outcome is in the [`State`].
     Done,
-    /// The client asked for a handshake and may have one.
     StartTls,
 }
 
-/// Serves one session to its end. A client that disappears is not an error:
-/// it happens all day, and nothing was promised to it.
-///
-/// `tls` is the certificate snapshot this connection was accepted with, or
-/// `None` when no certificate is configured. TLS here is opportunistic and
-/// never required: this is an MX, and refusing plaintext loses mail.
-///
-/// `srs` is the sender rewriter, or `None` when no `[srs]` table is
-/// configured — in which case the envelope sender goes out as it arrived.
 #[allow(clippy::too_many_arguments)]
 pub async fn serve<S, L>(
     stream: S,
@@ -190,9 +114,6 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
     L: Relay,
 {
-    // One `BufReader` over the whole stream, written through `get_mut`: the
-    // split halves that a session normally wants are exactly what makes the
-    // stream impossible to swap out mid-conversation.
     let mut reader = BufReader::new(stream);
     let mut state = State::default();
 
@@ -219,19 +140,9 @@ where
         Step::StartTls => {}
     }
 
-    // `talk` only asks for this when a certificate was configured.
     let acceptor = tls.clone().expect("STARTTLS is offered with a certificate");
 
-    // **CVE-2011-0411.** Anything already buffered arrived in plaintext and
-    // was not sent by whoever is about to hold the other end of the tunnel.
-    // `BufReader::into_inner` discards its buffer by design, so this check has
-    // to come before the upgrade, and refusing is the only safe answer:
-    // replaying the bytes inside the tunnel is the vulnerability, and so is
-    // running them before it.
     if !reader.buffer().is_empty() {
-        // Worth a line: this is somebody trying the CVE on a live MX, and
-        // without it the attempt is invisible — the session simply ends, and
-        // the operator has no way to see it happening.
         info!(
             %peer,
             "commands were pipelined behind STARTTLS; refusing rather than upgrading"
@@ -249,9 +160,6 @@ where
     let plain = reader.into_inner();
     let encrypted = match timeout(config.handshake_timeout, acceptor.accept(plain)).await {
         Ok(Ok(encrypted)) => encrypted,
-        // A handshake that did not happen admits no SMTP reply: there is no
-        // agreed encoding left to send one in. Scanners do this all day, and
-        // it is not a session failure.
         Ok(Err(e)) => {
             info!(%peer, "TLS handshake failed: {e}");
             return Ok(state.outcome);
@@ -265,8 +173,6 @@ where
     state.after_handshake();
     let mut reader = BufReader::new(encrypted);
 
-    // Inside the tunnel `talk` answers a second STARTTLS itself, so the only
-    // way back here is `Done`.
     let step = talk(
         &mut reader,
         &mut state,
@@ -280,8 +186,6 @@ where
     )
     .await?;
 
-    // `close_notify`, so the sender's own log does not record our goodbye as a
-    // truncation attack. A client that has already gone is not an error here.
     let _ = reader.get_mut().shutdown().await;
 
     match step {
@@ -289,7 +193,6 @@ where
     }
 }
 
-/// The command loop, over whatever the stream currently is.
 #[allow(clippy::too_many_arguments)]
 async fn talk<S, L>(
     reader: &mut BufReader<S>,
@@ -345,9 +248,6 @@ where
                      250-PIPELINING\r\n",
                     config.hostname, name, config.max_message_bytes
                 );
-                // Advertised only when there is a certificate to serve, and
-                // never once the tunnel is up: RFC 3207 §4.2 forbids
-                // re-offering it.
                 if tls.is_some() && !state.outcome.tls {
                     greeting.push_str("250-STARTTLS\r\n");
                 }
@@ -363,8 +263,6 @@ where
                 say(reader.get_mut(), &format!("250 {}", config.hostname)).await?;
             }
 
-            // Allowed before EHLO on purpose: HELO-only clients exist, and a
-            // client that wants encryption first is not making a mistake.
             Command::StartTls => {
                 if state.outcome.tls {
                     say(reader.get_mut(), "503 5.5.1 TLS is already active").await?;
@@ -374,7 +272,6 @@ where
                         return Ok(Step::Done);
                     }
                 } else {
-                    // `serve` says `220` — it owns the stream from here.
                     return Ok(Step::StartTls);
                 }
             }
@@ -391,8 +288,6 @@ where
                     )
                     .await?;
                 } else if size.is_some_and(|size| size > config.max_message_bytes) {
-                    // The client said how big it is. Reading it anyway would
-                    // waste both sides' time.
                     say(
                         reader.get_mut(),
                         &format!(
@@ -405,25 +300,6 @@ where
                     .zip(sender.as_deref())
                     .and_then(|(srs, from)| srs.wrappable(from).err())
                 {
-                    // Refused here, not forwarded unprotected. `command`
-                    // accepts addresses `Mailbox::parse` does not —
-                    // `bob@localhost`, `user@[192.0.2.1]`, `"a b"@x.test` —
-                    // and with SRS configured those used to be accepted,
-                    // found unwrappable at the final dot, and handed to the
-                    // destination with the original sender intact: the SPF
-                    // failure and the backscatter path SRS exists to remove,
-                    // silently, on exactly the addresses nobody tests with.
-                    //
-                    // A refusal at `MAIL FROM` is the strict choice and it is
-                    // the right one, because the sending server is still
-                    // holding the message: it gets a sentence it can report
-                    // to whoever wrote it, rather than a message delivered to
-                    // junk and a bounce sent to a stranger. The senders this
-                    // affects are ones mxhop could never have protected.
-                    //
-                    // Only when SRS is configured: without an `[srs]` table
-                    // there is nothing to rewrite, and an operator who never
-                    // asked for SRS must not get a stricter MX than they had.
                     say(
                         reader.get_mut(),
                         &format!(
@@ -444,8 +320,6 @@ where
                 if state.from.is_none() {
                     say(reader.get_mut(), "503 5.5.1 say MAIL FROM first").await?;
                 } else if state.recipients.len() >= config.max_recipients {
-                    // Temporary on purpose: the client should send the rest
-                    // in another message rather than give up on them.
                     say(
                         reader.get_mut(),
                         "452 4.5.3 too many recipients for one message",
@@ -455,25 +329,6 @@ where
                     let reply = decide_recipient(router, srs, &address, &mut state.recipients);
                     let refused = reply.starts_with('5');
                     say(reader.get_mut(), &reply).await?;
-                    // A refused recipient costs the client an error, like
-                    // every other refusal. It did not, and that made the SRS
-                    // domain a relay with a two-minute setup time: guessing
-                    // the MAC is an online attack, one guess per `RCPT TO`,
-                    // and 20 000 pipelined guesses in one session drew 20 000
-                    // refusals, no disconnect, and 380 000 guesses a second
-                    // against the release binary — the whole 38^4 space of a
-                    // four-character MAC in seconds. postsrsd has the same
-                    // MAC length and survives because Postfix's
-                    // `smtpd_hard_error_limit`, `smtpd_error_sleep_time` and
-                    // anvil are in front of it; mxhop has this counter.
-                    //
-                    // The same counter bounds the older and quieter attack:
-                    // reading an alias table by guessing names at a domain in
-                    // `[domains]`, where every guess was likewise free.
-                    //
-                    // `5` and not `4`: a 452 means mxhop's own per-message
-                    // recipient cap, which is our limit and not the client's
-                    // mistake, and the client is being asked to come back.
                     if refused && too_many_errors(reader, state, config, peer).await? {
                         return Ok(Step::Done);
                     }
@@ -499,9 +354,6 @@ where
                     }
                     Ok(Ok(body)) => body,
                     Ok(Err(WireError::TooLarge { limit })) => {
-                        // The stream now holds the rest of a message we have
-                        // already refused; draining it is work on behalf of
-                        // whoever sent it.
                         say(
                             reader.get_mut(),
                             &format!("552 5.3.4 message larger than {limit} bytes"),
@@ -544,8 +396,6 @@ where
                 return Ok(Step::Done);
             }
 
-            // An alias table is not a directory for strangers to read, so the
-            // answer is the same whether the address exists or not.
             Command::Vrfy => {
                 say(
                     reader.get_mut(),
@@ -572,12 +422,6 @@ where
     }
 }
 
-/// Everything between the final dot and the reply: the trace, the decision,
-/// the deliveries, and whatever is left over.
-///
-/// Nothing is stored before delivery is attempted. While the message is only
-/// on the wire the sending server still owns it, and its retry queue is
-/// better than ours: it is somebody else's disk.
 #[allow(clippy::too_many_arguments)]
 async fn hand_on<L>(
     config: &SessionConfig,
@@ -595,30 +439,8 @@ where
     let id = new_id();
     let helo = state.helo.clone().unwrap_or_default();
 
-    // One deadline for everything after the final dot, started here rather
-    // than just before the deliveries: the authentication check below spends
-    // real time on DNS while the sending server waits, so it is charged
-    // against this budget instead of being added on top of it. Postfix gives
-    // up on an unanswered final dot after ten minutes and resends, and a
-    // duplicate produced by nothing but arithmetic is the worst kind.
     let deadline = std::time::Instant::now() + config.relay_budget;
 
-    // RFC 8601 §5: any `Authentication-Results` header already in this
-    // message that claims to be ours is spliced out before ours is written,
-    // and before anything is verified. This is the one place mxhop changes
-    // the bytes of a message, and it changes them for one reason — otherwise
-    // a sender writes the header itself, under our name, and nothing
-    // downstream can tell its claim from our finding.
-    //
-    // Gated on `enabled`, because the documented reason to switch the check
-    // off is that something in front of mxhop already does it and writes the
-    // header — and the natural thing for that box to use as its authserv-id
-    // is this host's name, which the same operator configured. Stripping then
-    // deletes the upstream finding and writes nothing in its place, while the
-    // configuration promises "no lookups, no header, no refusals". With the
-    // check off mxhop has no opinion about this header, so it leaves it
-    // alone; it is also then the only state in which the message's bytes
-    // leave exactly as they arrived.
     let body = match config
         .auth_enabled
         .then(|| crate::auth::strip_forged_results(&body, &config.hostname))
@@ -638,16 +460,11 @@ where
         None => body,
     };
 
-    // The peer's own name, under a short clock: nothing is decided on it, so
-    // a resolver that is thinking must not cost the sending server its
-    // session. `unknown` in the trace is the honest answer.
     let address = peer.parse::<std::net::SocketAddr>();
     let ptr = match &address {
         Ok(address) => timeout(config.ptr_timeout, relay.ptr(address.ip()))
             .await
             .unwrap_or(None),
-        // A peer that is not an address at all happens only in a test, and
-        // the header says `unknown` rather than guessing.
         Err(_) => None,
     };
     let ip = match &address {
@@ -677,25 +494,12 @@ where
         received_at_unix_ms: now_unix_ms(),
         size: body.len() as u64,
         received: received.clone(),
-        // Filled in below, once the check has run.
         authentication_results: String::new(),
         last_reply: None,
-        // Nothing has been attempted yet, and this envelope is only stored
-        // if part of the delivery below defers — the `held` copy at the foot
-        // of this function is where the schedule is set.
         attempts: 0,
         next_attempt_unix_ms: 0,
     };
 
-    // The message's own trace, read before anything leaves: the loop that
-    // bites a forwarder is not in the alias table but in somebody else's
-    // filter rule.
-    //
-    // Read, and acted on, *before* the authentication check below, because
-    // this is pure and that spends up to the whole DNS budget. A message
-    // going round a loop would otherwise burn twenty seconds of resolver
-    // time on every hop before earning the one refusal that needed nothing
-    // from the network — and the server waiting through it is this host.
     let head = policy::Head::scan(&body, &config.hostname);
     if let Some(reply) = policy::check_trace(&head, &config.limits) {
         info!(
@@ -708,45 +512,16 @@ where
         return (reply, false);
     }
 
-    // SPF, DKIM and DMARC, once, here — not at MAIL FROM and not at RCPT TO.
-    //
-    // SPF *could* run at MAIL FROM, and refusing there would pre-empt DMARC:
-    // an SPF hard failure with an aligned DKIM pass is a DMARC pass, and that
-    // is exactly what mail forwarded by somebody else looks like. DKIM needs
-    // the whole body and DMARC needs the `From:` header plus both results, so
-    // end-of-DATA is the first moment any of it can be decided — and it is
-    // still early enough that the sending server holds the message.
-    //
-    // `mail-auth` has no clock of its own, so every clock is one of ours.
-    // There are four: one per stage inside `Verifier::check`, and this one
-    // around the whole call as a backstop.
-    //
-    // The three inside are what matter, and `auth::Budget` says why: with a
-    // single clock the sender chooses the names for the first two stages and
-    // can therefore spend the whole budget before the third stage — the one
-    // that fetches the policy a refusal rests on — has asked anything.
-    //
-    // This one is a second longer than the three together, so that an
-    // expired stage always wins the race and this fires only for something
-    // the stages cannot cover: a future that blocks without reaching an
-    // await point. When it does fire the verdict is `temperror` throughout
-    // rather than `none`: see `Auth::timed_out`.
     let auth = {
         let budget =
             crate::auth::Budget::of(deadline.saturating_duration_since(std::time::Instant::now()));
         let backstop = budget.total() + std::time::Duration::from_secs(1);
         let probe = crate::auth::Probe {
-            // A peer that is not an address at all happens only in a test;
-            // the unspecified address matches no SPF mechanism, which makes
-            // every result honest rather than invented.
             ip: address.as_ref().map_or(
                 std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
                 |address| address.ip(),
             ),
             helo: &helo,
-            // The sender as it arrived, before SRS: here mxhop is the
-            // receiver, and the question is whether the *original* sender's
-            // domain allows this peer to send for it.
             mail_from: envelope.from.as_deref(),
             body: &body,
         };
@@ -762,34 +537,21 @@ where
                      forwarded with that in its header, because an expired clock \
                      of ours is not evidence against the sender"
                 );
-                // The body, not the envelope sender: the DMARC identity is
-                // the `From` header's, and `timed_out` reads it from here so
-                // the header does not name a domain nothing examined.
                 crate::auth::Auth::timed_out(envelope.from.as_deref(), &helo, &body)
             }
         }
     };
 
-    // Empty when the check is switched off: a header that reported nothing
-    // having looked nothing up would be a claim of its own.
     let results = if auth.checked {
         auth.header(&config.hostname)
     } else {
         String::new()
     };
-    // Kept on the envelope beside `received`, and for the same reason that
-    // field exists: a held copy has to be retried with the identical bytes,
-    // and a second attempt that re-derived this header would have to repeat
-    // every lookup and might get different answers — so the record of what
-    // was found when the message arrived would be lost.
     let envelope = Envelope {
         authentication_results: results.clone(),
         ..envelope
     };
 
-    // `head` was scanned above, before the DNS budget was spent, and the loop
-    // rules were already applied to it there; `decide` re-checks them, which
-    // costs a comparison and keeps the rule true for any other caller.
     let plan = match policy::decide(&envelope, router, &head, &config.limits, &auth) {
         Decision::Refuse(reply) => {
             info!(
@@ -804,25 +566,9 @@ where
         Decision::Deliver(plan) => plan,
     };
 
-    // The envelope sender the destination will check SPF against. Rewritten
-    // here rather than in `policy::decide` because the rewrite needs today's
-    // date, and `policy` is deliberately a file with no clock in it: every
-    // rule about who a message is copied to stays a pure function of its
-    // arguments, and this is the one decision that does not fit that.
-    //
-    // Written as three arms rather than as `rewrite(...).unwrap_or(sender)`,
-    // because the comment that said `None` meant "the null sender or our own
-    // domain" was not true: `rewrite` also returns `None` for a sender
-    // `Mailbox::parse` refuses, and that case was silently forwarded
-    // unprotected. Each `None` now has a name.
     let sender = match (srs, plan.sender.as_deref()) {
-        // No `[srs]` table: the sender goes out exactly as it arrived, which
-        // is what every deployment that never configured SRS expects.
         (None, _) => plan.sender.clone(),
 
-        // The null sender. A bounce has nothing to rewrite and must acquire
-        // nothing: an address in a bounce's envelope is an address that
-        // bounce can itself be bounced to.
         (Some(_), None) => None,
 
         (Some(srs), Some(from)) => match srs.rewrite(Some(from), crate::srs::today()) {
@@ -834,13 +580,6 @@ where
                     "rewrote the envelope sender so the destination's SPF check \
                      is made against a domain that names this host"
                 );
-                // See `Srs::rewrite`: an over-long wrapped sender is sent
-                // anyway rather than dropped or truncated, because the
-                // alternative is the SPF failure and backscatter this exists
-                // to remove. The decision is deliberate, so the one thing it
-                // must not be is invisible — a receiver that refuses the
-                // length answers the `MAIL FROM`, and this is the line that
-                // says which sender it was.
                 let local = rewritten.rsplit_once('@').map_or("", |(l, _)| l);
                 if local.len() > crate::srs::MAX_LOCAL_PART_OCTETS {
                     warn!(
@@ -855,14 +594,6 @@ where
                 }
                 Some(rewritten)
             }
-            // One case left, and only one: a sender already at our own SRS
-            // domain, which is left alone because wrapping it again adds a
-            // layer per hop until the local part stops being an address. A
-            // sender that is not a `Mailbox` cannot reach here — the
-            // `MAIL FROM` arm refuses it while the sending server still holds
-            // the message — and the `warn` is there because if that ever
-            // stops being true, this is the bug that hands a destination an
-            // unprotected sender, and last time it did so in silence.
             None => {
                 if !srs.is_ours(from.rsplit_once('@').map_or("", |(_, d)| d)) {
                     warn!(
@@ -878,41 +609,13 @@ where
         },
     };
 
-    // One `Arc` for every group: the body is handed to each delivery without
-    // being copied, which for a 25 MiB message to three domains is the
-    // difference between one copy and four.
     let body: std::sync::Arc<[u8]> = body.into();
 
-    // The `Received` header, then ours directly under it: a reader of the
-    // destination's "Show original" sees the hop and what we found out about
-    // it together, and the spooled bytes stay exactly what arrived.
     let mut prepended = received.clone();
     prepended.push_str(&results);
 
-    // The deadline for all of this was started at the top of this function,
-    // where the authentication check began spending it.
-    //
-    // The groups are delivered in turn, so a per-group budget multiplies:
-    // four destination domains at `Budget::overall` each is up to twelve
-    // minutes, while Postfix abandons an unanswered final dot after ten
-    // (`smtp_data_done_timeout`) and resends — and every domain that had
-    // already accepted gets a second copy. A duplicate produced by nothing
-    // but arithmetic is the worst kind.
-    //
-    // The alternative was to cap the destination domains per alias in
-    // `config::check`. Rejected: it refuses a configuration that is not
-    // wrong — an alias fanning out to five people is an ordinary thing to
-    // want — and it would still be wrong for one slow domain, since the cap
-    // bounds the count and not the time. Sharing the clock bounds the thing
-    // that actually has to be bounded, and costs the last group its chance
-    // when the earlier ones were slow, which is the right trade: a deferral
-    // is retried, a duplicate is not undone.
-
     let mut outcomes = Vec::with_capacity(plan.groups.len());
     for group in &plan.groups {
-        // Sequentially, on purpose. The inbound sender is waiting, but three
-        // concurrent deliveries would also mean three connections out of one
-        // inbound session, which is how a forwarder becomes an amplifier.
         outcomes.push(
             relay
                 .deliver(
@@ -931,12 +634,6 @@ where
     let verdict = policy::reply_for(&outcomes, &envelope.id);
     let delivered = (200..300).contains(&verdict.reply.code);
 
-    // Every copy that is being thrown away, named one line at a time. The
-    // sending server has been told 250 and cannot be told otherwise, and
-    // there is no DSN generator yet, so this log line is the only record
-    // these recipients' mail ever existed — one line each rather than a
-    // count, because an operator asked "did my mail to b@ arrive?" has to be
-    // able to grep for `b@`.
     for (mailbox, reply) in &verdict.lost {
         error!(
             %peer,
@@ -960,18 +657,6 @@ where
         return (verdict.reply, delivered);
     }
 
-    // Some of it arrived, so the sender is told 250 and must not send it
-    // again — which makes the rest ours. It is written to the spool before
-    // the 250 goes out, in that order: a crash in between then leaves the
-    // sending server still holding the message rather than nobody holding it.
-    // One reason per held recipient, in the same order as `to`: two
-    // recipients at two hosts are stuck for two different reasons, and an
-    // operator reading the sidecar has to be able to tell which belongs to
-    // which.
-    // The attempt that just deferred is the first one, so the wait before
-    // the second is `backoff(1)` and not `backoff(0)`: counting from zero
-    // would have the queue runner knock on the same destination twice inside
-    // five minutes, which is how a deferral becomes a rate limit.
     let attempts = 1;
     let held = Envelope {
         to: verdict
@@ -992,9 +677,6 @@ where
         ..envelope.clone()
     };
     match spool.store(&held, &body).await {
-        // Error level because nothing collects these yet: until the
-        // retry-queue milestone they sit in `queue/`, and an operator has to
-        // be able to see that they are there.
         Ok(()) => warn!(
             %peer,
             id = %held.id,
@@ -1004,11 +686,6 @@ where
              runner to retry: {}",
             held.last_reply.as_deref().unwrap_or("no reason recorded")
         ),
-        // The sender is still told 250: the copies that did arrive have
-        // arrived, and asking for the message again would deliver those
-        // twice. These recipients have lost their copy — the same hole a
-        // permanent refusal in a mixed outcome falls into, and it closes only
-        // when mxhop can send a DSN of its own.
         Err(e) => error!(
             %peer,
             id = %held.id,
@@ -1020,8 +697,6 @@ where
     (verdict.reply, delivered)
 }
 
-/// Counts one refusal and says goodbye if the client has made too many.
-/// `true` means the session is over.
 async fn too_many_errors<S>(
     reader: &mut BufReader<S>,
     state: &mut State,
@@ -1033,11 +708,6 @@ where
 {
     state.errors += 1;
     if state.errors >= config.max_errors {
-        // One line per cut session, naming the peer, at `warn`. This is the
-        // line an operator looking for a sweep should be able to find: the
-        // per-address refusals are at `debug` precisely because a sweep is
-        // thousands of them, and the single line that says a session was cut
-        // off is both rarer and the one worth a firewall rule.
         warn!(
             peer = %peer,
             errors = state.errors,
@@ -1049,8 +719,6 @@ where
     Ok(false)
 }
 
-/// The reply for one `RCPT TO`, and the recipient added to the envelope if it
-/// is one of ours.
 fn decide_recipient(
     router: &Router,
     srs: Option<&Srs>,
@@ -1061,20 +729,9 @@ fn decide_recipient(
         return "501 5.1.3 recipient is not <local@domain>".to_string();
     };
 
-    // The SRS domain is checked before the alias table, and it is never in
-    // it: `config::check` refuses a configuration where it is both. An
-    // address here is not an alias name — it is a signed address that decodes
-    // to somebody else's mailbox anywhere in the world, and the signature is
-    // the only thing between this branch and an open relay.
     if let Some(srs) = srs.filter(|srs| srs.is_ours(domain)) {
         return match srs.verify(local, crate::srs::today()) {
             Ok(mailbox) => {
-                // The decoded address, not the one offered, goes in the
-                // envelope: everything downstream — the alias expansion, the
-                // delivery, the `for` clause of our own `Received` header —
-                // then works on the mailbox the bounce is actually for,
-                // rather than on a domain whose MX record is this host and
-                // whose next hop would be ourselves.
                 info!(
                     srs = %address,
                     decoded = %mailbox,
@@ -1084,19 +741,6 @@ fn decide_recipient(
                 "250 2.1.5 recipient accepted".to_string()
             }
             Err(refusal) => {
-                // Two levels, because the two cases are different kinds of
-                // news. An expired address is a real bounce arriving after
-                // the window — mail somebody loses, nobody is told about, and
-                // an operator can only find in this log — so it gets `info`,
-                // one line, and the address.
-                //
-                // Everything else is a forgery or a guess, and a sweep is
-                // thousands of them in one session: at `info` that is
-                // thousands of lines in which the operator's own mail is
-                // buried, and a log that fills a disk is an outage an
-                // attacker chose. Those go to `debug`, where the one line
-                // worth reading is the `warn` from `too_many_errors` naming
-                // the peer whose session was cut off.
                 match refusal {
                     crate::srs::Refusal::Expired => {
                         info!(srs = %address, "refusing an address at the srs domain: {refusal}")
@@ -1116,20 +760,11 @@ fn decide_recipient(
             recipients.push(address.to_string());
             "250 2.1.5 recipient accepted".to_string()
         }
-        // Two different refusals, and the difference matters: one means the
-        // address does not exist, the other that mxhop is not this domain's
-        // mail server. An operator chasing a misdirected MX record needs to
-        // be able to tell them apart.
         None if router.handles_domain(domain) => "550 5.1.1 no such address here".to_string(),
         None => "550 5.7.1 relaying is not allowed".to_string(),
     }
 }
 
-/// Writes one reply, terminator included, as a single write.
-///
-/// Splitting the CRLF into a write of its own is what breaks a client that
-/// reads the STARTTLS prologue a `recv` at a time — `openssl s_client` among
-/// them.
 async fn say<W>(out: &mut W, line: &str) -> io::Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -1141,14 +776,6 @@ where
     out.flush().await
 }
 
-/// Writes a destination's reply back to the sending server, as however many
-/// lines it arrived on.
-///
-/// Flattened into one line it reaches the sender with the enhanced code
-/// stranded mid-sentence — `... Please try 5.1.1 double-checking ...` — and
-/// a verbose destination's reply can pass RFC 5321's 512-octet limit for a
-/// single line. The whole reply is one write, for the same reason `say` is:
-/// a client that reads a reply a `recv` at a time must not see half of it.
 async fn say_reply<W>(out: &mut W, reply: &client::Reply) -> io::Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -1177,9 +804,6 @@ mod tests {
         dir
     }
 
-    /// `example.com` is served: `hi` forwards, `team` forwards to two,
-    /// `noreply` refuses, and there is no catch-all — so an unknown local part
-    /// is not ours. `elsewhere.test` is not served at all.
     fn test_router() -> Router {
         let mut r = Router::default();
         r.insert(
@@ -1203,31 +827,15 @@ mod tests {
         r
     }
 
-    /// A destination that answers however the test tells it to, and keeps
-    /// what it was handed.
-    ///
-    /// The session must never be near a socket in a test, and this is the
-    /// whole of what it asks of the delivery side: hand this on, and what is
-    /// the peer called.
     #[derive(Clone, Default)]
     struct Fake {
         seen: std::sync::Arc<std::sync::Mutex<Vec<Delivery>>>,
-        /// What each destination domain says. Anything not listed accepts.
         answers: std::collections::BTreeMap<String, client::Verdict>,
         ptr: Option<String>,
-        /// The verdict the authentication check comes back with, and the
-        /// probe it was asked about. A literal, because the session's job
-        /// here is to put the verdict's header in the right place and hand
-        /// the refusal to `decide` — not to work out what the verdict is,
-        /// which `auth.rs` and `policy.rs` are tested on separately.
         auth: crate::auth::Auth,
         probed: std::sync::Arc<std::sync::Mutex<Vec<Probed>>>,
     }
 
-    /// One call of `Relay::verify`, as the test wants to read it back: the
-    /// HELO name, the envelope sender and how many bytes of message the check
-    /// was given. The identities matter because the check has to be made
-    /// against the sender that *arrived*, not the SRS-rewritten one.
     type Probed = (String, Option<String>, usize);
 
     impl Fake {
@@ -1296,7 +904,6 @@ mod tests {
         }
     }
 
-    /// A reply from a destination, as it would arrive off the wire.
     fn theirs(code: u16, enhanced: &str, text: &str) -> client::Reply {
         client::Reply {
             code,
@@ -1314,8 +921,6 @@ mod tests {
     }
 
     impl Talk {
-        /// The final reply codes, in order. Continuation lines (`250-…`) are
-        /// part of one reply and are not counted twice.
         fn codes(&self) -> Vec<&str> {
             self.out
                 .lines()
@@ -1337,8 +942,6 @@ mod tests {
         talk_all(relay, limit, None, script).await
     }
 
-    /// A rewriter with a key made up here rather than written down: a
-    /// key-shaped literal in a source file is a key in a source file.
     fn test_srs() -> Srs {
         Srs::new(
             "srs.mx.test",
@@ -1355,8 +958,6 @@ mod tests {
         talk_everything(relay, limit, srs, true, script).await
     }
 
-    /// `talk_all` with `[auth] enabled` turned down, for the one test that is
-    /// about what a disabled check leaves alone.
     async fn talk_unchecked(relay: Fake, script: &str) -> Talk {
         talk_everything(relay, 26_214_400, None, false, script).await
     }
@@ -1431,9 +1032,6 @@ mod tests {
                            .\r\n\
                            QUIT\r\n";
 
-    /// What the destination is actually told the sender is. Gmail checks SPF
-    /// against this and nothing else, and before SRS it was the original
-    /// sender — a domain whose record does not list this host.
     #[tokio::test]
     async fn the_envelope_sender_handed_to_the_destination_is_rewritten() {
         let srs = test_srs();
@@ -1455,24 +1053,12 @@ mod tests {
         );
     }
 
-    /// **The open-relay test.** A `RCPT TO` at the SRS domain is not an alias
-    /// lookup: it names somebody else's mailbox anywhere in the world, and
-    /// the signature is the only thing that makes relaying to it anything
-    /// other than running an open relay. One character changed has to be a
-    /// 550 and nothing on the wire.
     #[tokio::test]
     async fn a_forged_srs_recipient_is_550_not_relayed() {
         let srs = test_srs();
         let honest = srs
             .rewrite(Some("victim@elsewhere.test"), crate::srs::today())
             .unwrap();
-        // One character of the MAC, flipped. Everything else about the
-        // address is exactly what we would have issued.
-        //
-        // The MAC runs from index 5 to the next `=`, and the index flipped
-        // below has to land inside it or the test proves nothing about the
-        // signature. Asserted rather than trusted, because the MAC's length
-        // has been changed once already.
         assert!(
             honest[5..].find('=').expect("a MAC terminator") + 5 > 6,
             "index 6 has to be inside the MAC of {honest}"
@@ -1510,9 +1096,6 @@ mod tests {
         );
     }
 
-    /// The bounce path. A delivery report comes back to the rewritten sender
-    /// with an empty envelope sender of its own, and has to reach the person
-    /// who wrote the original message.
     #[tokio::test]
     async fn a_valid_srs_recipient_is_routed_to_the_decoded_sender() {
         let srs = test_srs();
@@ -1536,11 +1119,6 @@ mod tests {
         )
         .await;
 
-        // The *last* code, not merely *a* 250 somewhere in the transcript:
-        // `codes().contains("250")` is satisfied by the EHLO reply alone, so
-        // that weaker form passes even when DATA is refused and nothing is
-        // relayed. 221 is the QUIT only a session that accepted the message
-        // ever reaches.
         assert_eq!(talk.last_code(), "221", "{}", talk.out);
         let seen = talk.relay.seen.lock().unwrap();
         assert_eq!(seen.len(), 1, "{}", talk.out);
@@ -1561,18 +1139,9 @@ mod tests {
         );
     }
 
-    /// **The rate-limit test.** A refused `RCPT` has to cost the client
-    /// something, because guessing an SRS MAC is an online attack and a
-    /// refused `RCPT` is one guess. Before this, 20 000 pipelined guesses in
-    /// a single session drew 20 000 × 550 and no disconnect — measured
-    /// against the release binary at 380 000 guesses a second. The same count
-    /// also bounds the older alias dictionary attack, where every guess at a
-    /// name in `[domains]` was likewise free.
     #[tokio::test]
     async fn a_session_that_collects_max_errors_refused_recipients_is_disconnected() {
         let srs = test_srs();
-        // Four is `max_errors` in the test config; the fourth refusal is the
-        // one that trips it.
         let talk = talk_srs(
             &srs,
             "EHLO mail.elsewhere.test\r\n\
@@ -1599,9 +1168,6 @@ mod tests {
         );
     }
 
-    /// The other side of the limit: an ordinary sender who typos one address
-    /// out of several must not be cut off. The error limit is there to make a
-    /// sweep expensive, and a sweep is not three mistakes.
     #[tokio::test]
     async fn refusals_below_the_limit_do_not_end_the_session() {
         let talk = talk(
@@ -1623,15 +1189,6 @@ mod tests {
         );
     }
 
-    /// A sender mxhop cannot wrap is refused while the sending server still
-    /// holds the message.
-    ///
-    /// `command::address` is looser than `Mailbox::parse`: it takes
-    /// `bob@localhost`, an address literal and a quoted local part, and
-    /// `Mailbox::parse` takes none of the three. Accepting one of those with
-    /// SRS configured used to hand the destination the original sender —
-    /// exactly the SPF failure and the backscatter path SRS exists to remove
-    /// — and logged nothing at all.
     #[tokio::test]
     async fn a_sender_that_cannot_be_wrapped_is_refused_at_mail_from() {
         let srs = test_srs();
@@ -1657,9 +1214,6 @@ mod tests {
         }
     }
 
-    /// And the refusal is only SRS's to make: without an `[srs]` table there
-    /// is no rewriting to fail, so an operator who never configured SRS does
-    /// not get a stricter MX than they had.
     #[tokio::test]
     async fn without_srs_an_unwrappable_sender_is_still_accepted() {
         let talk = talk(
@@ -1678,10 +1232,6 @@ mod tests {
         );
     }
 
-    /// Anything else at the SRS domain is refused rather than looked up. The
-    /// domain is not in `[domains]` — `check` refuses that — so there is no
-    /// alias table behind it, and `550 relaying is not allowed` would be the
-    /// wrong sentence for an address that is simply not one of ours.
     #[tokio::test]
     async fn an_ordinary_address_at_the_srs_domain_is_refused() {
         let srs = test_srs();
@@ -1698,10 +1248,6 @@ mod tests {
         assert!(talk.relay.seen.lock().unwrap().is_empty());
     }
 
-    /// Without an `[srs]` table nothing changes: the sender goes out as it
-    /// arrived. Worth a test of its own because that is the state every
-    /// existing deployment is in, and SRS must not be the thing that starts
-    /// rewriting senders for an operator who never configured it.
     #[tokio::test]
     async fn without_srs_the_envelope_sender_is_left_alone() {
         let talk = talk(DELIVER).await;
@@ -1712,12 +1258,6 @@ mod tests {
         );
     }
 
-    /// A reply has to leave as one write. `openssl s_client -starttls smtp`
-    /// reads the prologue with one `recv` per line and takes a segment
-    /// without CRLF for a whole line; split the terminator off and its reader
-    /// runs a line behind, sends its ClientHello early, and reads our
-    /// `220 go ahead` as a TLS record — "wrong version number", with no
-    /// handshake. Found by hand against a real listener.
     #[tokio::test]
     async fn a_reply_leaves_in_one_write() {
         struct Segments(std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>);
@@ -1860,9 +1400,6 @@ mod tests {
         );
         assert_eq!(t.outcome.accepted, 1);
 
-        // What used to be read back out of the spool is read off the
-        // delivery: a message that arrived is handed on inside the session
-        // and never stored.
         let delivery = t.relay.only();
         assert_eq!(delivery.from.as_deref(), Some("sender@elsewhere.test"));
         assert_eq!(
@@ -1993,12 +1530,6 @@ mod tests {
         );
     }
 
-    // ------------------------------------------------- handing the message on
-
-    /// The whole point of the milestone. Before this the session answered
-    /// `250 queued as …` and the message sat in `queue/` with nothing to
-    /// collect it, so every sender was told the mail had been accepted and
-    /// nobody ever received it.
     #[tokio::test]
     async fn a_delivered_message_is_not_stored() {
         let t = talk(DELIVER).await;
@@ -2026,9 +1557,6 @@ mod tests {
         );
     }
 
-    /// The stored message is the sender's bytes and nothing else, and the
-    /// trace is prepended on the wire. A `Received` baked into the stored
-    /// file would be written twice on a retry.
     #[tokio::test]
     async fn the_received_header_is_prepended_on_the_wire() {
         let t = talk(DELIVER).await;
@@ -2056,14 +1584,8 @@ mod tests {
         );
     }
 
-    /// A crafted HELO name reaching the header would let a stranger forge a
-    /// trace line — or an `Authentication-Results` the destination believes.
-    /// The session is the place this arrives from, so it is checked here too
-    /// and not only in `policy`.
     #[tokio::test]
     async fn a_crafted_helo_cannot_forge_a_header_through_the_session() {
-        // A HELO name that is not domain-shaped: the parser keeps it, and
-        // only the sanitising stops it reaching the header.
         let script = "EHLO not a domain\r\nMAIL FROM:<a@b.test>\r\nRCPT TO:<hi@example.com>\r\n\
                       DATA\r\nbody\r\n.\r\nQUIT\r\n";
         let t = talk(script).await;
@@ -2081,10 +1603,6 @@ mod tests {
         }
     }
 
-    /// The reply a forwarder exists to relay. Gmail's own sentence tells the
-    /// person who mistyped an address what is wrong with it; "delivery
-    /// failed, contact your postmaster" from a host they have never heard of
-    /// does not.
     #[tokio::test]
     async fn a_destination_5xx_reaches_the_sending_server_inside_the_same_session() {
         let refusing = Fake::answering(
@@ -2116,8 +1634,6 @@ mod tests {
         );
     }
 
-    /// A deferral means nothing is known yet. The sending server still has
-    /// the message and a retry queue of its own; mxhop has neither.
     #[tokio::test]
     async fn a_deferral_is_451_and_the_spool_stays_empty() {
         let slow = Fake::answering(
@@ -2141,8 +1657,6 @@ mod tests {
         );
     }
 
-    /// One of two destinations took it, so the sender must not send it again
-    /// — which means 250 — and the other recipient's copy is ours to keep.
     #[tokio::test]
     async fn a_mixed_outcome_is_250_and_holds_the_rest() {
         let half = Fake::answering(
@@ -2181,15 +1695,6 @@ mod tests {
         );
     }
 
-    /// A destination's multi-line refusal reaches the sending server as a
-    /// multi-line reply.
-    ///
-    /// Gmail's "does not exist" refusal arrives on three lines. Flattened
-    /// into one, the sender reads `550 5.1.1 mx.gmail.test said: ... Please
-    /// try 5.1.1 double-checking ...` — our enhanced code at the front and
-    /// the destination's stranded in the middle of the sentence — and a
-    /// longer reply of the same shape goes past the 512 octets RFC 5321
-    /// allows one line.
     #[tokio::test]
     async fn a_destinations_multi_line_refusal_is_refolded_for_the_sender() {
         let refusal = client::Reply {
@@ -2221,15 +1726,6 @@ mod tests {
         );
     }
 
-    /// Every destination group shares one deadline, because the inbound
-    /// sender's patience is one thing and not one thing per domain.
-    ///
-    /// The groups are delivered one after another, so a per-group budget
-    /// multiplies: four destination domains at 180 s each is up to twelve
-    /// minutes, and Postfix gives up on an unanswered final dot after ten
-    /// (`smtp_data_done_timeout`) and **resends**. The domains that already
-    /// accepted then get a second copy — a duplicate caused by nothing but
-    /// arithmetic.
     #[tokio::test]
     async fn every_destination_group_shares_one_deadline() {
         let script = "EHLO x.test\r\nMAIL FROM:<a@b.test>\r\nRCPT TO:<team@example.com>\r\n\
@@ -2250,9 +1746,6 @@ mod tests {
         );
     }
 
-    /// One alias leading to two destinations is two connections, and each
-    /// one carries only its own recipient: an envelope that named the other
-    /// would tell each destination where else the alias forwards.
     #[tokio::test]
     async fn two_destinations_are_two_deliveries() {
         let script = "EHLO x.test\r\nMAIL FROM:<a@b.test>\r\nRCPT TO:<team@example.com>\r\n\
@@ -2279,14 +1772,6 @@ mod tests {
         }
     }
 
-    /// The loop the alias table cannot see, arriving as a real message: our
-    /// own name already in the trace three times means the message has been
-    /// here before and is going round.
-    ///
-    /// Folded, like every `Received` header a real mail server writes, and
-    /// with our name in the `by` clause on the continuation line where real
-    /// ones put it. Written unfolded this test passed while the scanner was
-    /// counting nothing at all in production.
     #[tokio::test]
     async fn a_message_that_has_been_here_three_times_is_refused_554() {
         let script = "EHLO x.test\r\nMAIL FROM:<a@b.test>\r\nRCPT TO:<hi@example.com>\r\nDATA\r\n\
@@ -2408,8 +1893,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_client_that_says_nothing_is_dropped_rather_than_held_forever() {
-        // This one keeps its end of the pipe open, so only the server's own
-        // timeout can end it.
         let root = scratch("timeout");
         let spool = Spool::open(&root).await.unwrap();
         let config = SessionConfig {
@@ -2475,8 +1958,6 @@ mod tests {
         );
     }
 
-    // --------------------------------------------------------------- STARTTLS
-
     use crate::config::TlsPaths;
     use crate::tls::{Holder, testing};
     use rustls_pki_types::pem::PemObject;
@@ -2485,8 +1966,6 @@ mod tests {
     use tokio_rustls::TlsConnector;
     use tokio_rustls::rustls::{self, ClientConfig};
 
-    /// A server-side acceptor for a freshly generated certificate, together
-    /// with the leaf DER, so a test can say *which* certificate was served.
     fn acceptor(common_name: &str) -> (tokio_rustls::TlsAcceptor, Vec<u8>) {
         let dir = testing::scratch("session-tls");
         let (crt, key) = testing::write(&dir, "mx", common_name);
@@ -2503,10 +1982,6 @@ mod tests {
         (holder.acceptor(), der)
     }
 
-    /// These tests are about mxhop's side of the handshake, not about PKI, so
-    /// the client checks nothing. The boilerplate buys one thing:
-    /// `peer_certificates()`, which is how a test proves which certificate
-    /// came out of the holder.
     #[derive(Debug)]
     struct AcceptAnything(Arc<rustls::crypto::CryptoProvider>);
 
@@ -2555,10 +2030,6 @@ mod tests {
         }
     }
 
-    /// Collects log output so a test can assert a line was written.
-    /// `#[tokio::test]` builds a current-thread runtime, so the session task
-    /// spawned inside the test body is polled on this same thread and sees
-    /// the subscriber `set_default` installed here.
     #[derive(Clone, Default)]
     struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
 
@@ -2598,7 +2069,6 @@ mod tests {
         TlsConnector::from(Arc::new(config))
     }
 
-    /// The client's side of a session: whole replies in, commands out.
     struct Peer<S> {
         io: BufReader<S>,
     }
@@ -2610,7 +2080,6 @@ mod tests {
             }
         }
 
-        /// One reply, continuation lines included.
         async fn reply(&mut self) -> String {
             let mut whole = String::new();
             loop {
@@ -2633,7 +2102,6 @@ mod tests {
             io.flush().await.expect("flush");
         }
 
-        /// Whatever is left once the server is finished.
         async fn rest(&mut self) -> String {
             let mut rest = String::new();
             self.io.read_to_string(&mut rest).await.expect("read rest");
@@ -2733,8 +2201,6 @@ mod tests {
         assert!(greeting.contains("250-STARTTLS"), "{greeting}");
     }
 
-    /// An implementation that requires TLS loses mail: this is an MX, and a
-    /// sender that offers no TLS still has to be able to deliver.
     #[tokio::test]
     async fn plaintext_delivery_still_works_when_tls_is_configured() {
         let (mut client, served, _) = serve_with_tls("mx.test").await;
@@ -2772,9 +2238,6 @@ mod tests {
         assert!(served.spool.queued().await.unwrap().is_empty());
     }
 
-    /// RFC 3207 §4.2. If this is forgotten, an EHLO or MAIL an attacker
-    /// injected before the handshake is honoured inside the tunnel, and the
-    /// spooled envelope's `helo` claims an identity nobody authenticated.
     #[tokio::test]
     async fn the_handshake_discards_helo_and_envelope() {
         let (mut client, served, der) = serve_with_tls("mx.test").await;
@@ -2836,9 +2299,6 @@ mod tests {
         assert!(answer.starts_with("503 5.5.1"), "{answer}");
     }
 
-    /// CVE-2011-0411. Bytes pipelined behind STARTTLS belong to the plaintext
-    /// conversation; replaying them inside the tunnel would let anyone on the
-    /// path inject commands the client believes it sent encrypted.
     #[tokio::test]
     async fn commands_pipelined_behind_starttls_are_not_replayed() {
         let (mut client, served, _) = serve_with_tls("mx.test").await;
@@ -2846,7 +2306,7 @@ mod tests {
         client
             .send("EHLO x.test\r\nSTARTTLS\r\nMAIL FROM:<attacker@evil.test>\r\n")
             .await;
-        client.reply().await; // the EHLO
+        client.reply().await;
         let answer = client.reply().await;
         let rest = client.rest().await;
         let outcome = served.task.await.unwrap().unwrap();
@@ -2863,10 +2323,6 @@ mod tests {
         assert!(!outcome.tls);
     }
 
-    /// Looks like an SMTP reply: three digits and a space or a hyphen. Used
-    /// to assert the *absence* of any reply, which naming two codes cannot
-    /// do — a stray `say("554 …")` on a path that must stay silent would slip
-    /// past a test that only looks for `500` and `421`.
     fn is_reply_line(line: &str) -> bool {
         let bytes = line.as_bytes();
         bytes.len() >= 4
@@ -2881,12 +2337,6 @@ mod tests {
         client.send("STARTTLS\r\n").await;
         assert!(client.reply().await.starts_with("220"));
 
-        // Not a TLS ClientHello but a whole plaintext SMTP transaction: the
-        // case of an attacker's commands arriving *after* the go-ahead.
-        // Scanners send nonsense here all day and that is not a session
-        // failure; what must never happen is mxhop answering in the clear, or
-        // spooling a message, on a connection it has already promised to
-        // encrypt.
         client.send(DELIVER).await;
         let rest = client.rest().await;
         let outcome = served.task.await.unwrap().expect("not a session failure");
@@ -2907,8 +2357,6 @@ mod tests {
         assert!(!outcome.quit);
     }
 
-    /// The reply alone leaves no trace: an operator watching an MX being
-    /// probed for CVE-2011-0411 sees a session that simply ended.
     #[tokio::test]
     async fn an_injection_behind_starttls_is_logged_with_the_peer() {
         let logs = Captured::default();
@@ -2924,8 +2372,8 @@ mod tests {
         client
             .send("EHLO x.test\r\nSTARTTLS\r\nMAIL FROM:<attacker@evil.test>\r\n")
             .await;
-        client.reply().await; // the EHLO
-        client.reply().await; // the refusal
+        client.reply().await;
+        client.reply().await;
         client.rest().await;
         served.task.await.unwrap().unwrap();
 
@@ -2947,7 +2395,6 @@ mod tests {
         client.send("STARTTLS\r\n").await;
         client.reply().await;
 
-        // Says nothing at all: only the handshake timeout can end this.
         let outcome = timeout(Duration::from_secs(5), served.task)
             .await
             .expect("a stalled handshake must not hold the task open")
@@ -2957,11 +2404,8 @@ mod tests {
         assert!(!outcome.tls);
     }
 
-    // ------------------------------ what the session does with the verdict
-
     use crate::auth::{Auth, Dmarc, DmarcVerdict, Policy as DmarcPolicy, Spf};
 
-    /// A relay whose authentication check comes back with `auth`.
     fn fake_with(auth: Auth) -> Fake {
         Fake {
             auth,
@@ -2986,11 +2430,6 @@ mod tests {
         }
     }
 
-    /// The header has to sit *under* our `Received`, and in the delivery's
-    /// prepended bytes rather than in the stored message: the spooled file
-    /// stays exactly what arrived, which is what makes a held copy retryable
-    /// with identical bytes. A reader of the destination's "Show original"
-    /// then sees the hop and what we found out about it together.
     #[tokio::test]
     async fn the_results_header_goes_on_the_wire_directly_under_our_received() {
         let auth = verdict(
@@ -3020,10 +2459,6 @@ mod tests {
         );
     }
 
-    /// The check is told the sender as it arrived, not the SRS-rewritten one.
-    /// Rewritten, the question becomes whether this host may send for its own
-    /// SRS domain, which it always may — so every message would pass SPF and
-    /// the whole check would be a no-op that looks like it works.
     #[tokio::test]
     async fn the_check_is_made_against_the_sender_that_arrived() {
         let srs = test_srs();
@@ -3053,10 +2488,6 @@ mod tests {
         );
     }
 
-    /// The whole point: a forgery is refused while the sending server still
-    /// holds the message, and nothing leaves. A 550 that still handed the
-    /// message to Gmail would be the worst of both — the sender told it
-    /// failed and the forgery delivered anyway.
     #[tokio::test]
     async fn a_reject_policy_failure_is_refused_and_nothing_leaves() {
         let auth = verdict("paypal.test", DmarcVerdict::Fail, Some(DmarcPolicy::Reject));
@@ -3076,9 +2507,6 @@ mod tests {
         assert_eq!(talk.outcome.accepted, 0);
     }
 
-    /// And a deferral is a deferral all the way out to the wire: 451, nothing
-    /// delivered and nothing stored, so the message waits where it already is
-    /// — on a sending server that has a retry queue, which mxhop does not.
     #[tokio::test]
     async fn a_dmarc_temperror_under_p_reject_is_deferred_on_the_wire() {
         let auth = verdict(
@@ -3096,8 +2524,6 @@ mod tests {
         );
     }
 
-    /// `p=quarantine` forwards, and the destination is told what the domain
-    /// asked for — because the destination is the one with a spam folder.
     #[tokio::test]
     async fn a_quarantine_failure_is_delivered_with_the_policy_in_the_header() {
         let auth = verdict(
@@ -3112,9 +2538,6 @@ mod tests {
         assert!(head.contains("policy.dmarc=quarantine"), "{head:?}");
     }
 
-    /// With the check switched off no header is written at all. A header that
-    /// reported `none` throughout, having looked nothing up, would be a claim
-    /// of its own — and the next hop would read it as a finding.
     #[tokio::test]
     async fn a_check_that_was_never_run_writes_no_header() {
         let talk = talk_with(fake_with(Auth::not_checked()), 26_214_400, DELIVER).await;
@@ -3126,10 +2549,6 @@ mod tests {
         );
     }
 
-    /// RFC 8601 §5, end to end. The forged header is gone from the bytes that
-    /// leave, and the one that leaves in its place is ours — otherwise the
-    /// destination sees two headers under our name and no way to tell them
-    /// apart.
     #[tokio::test]
     async fn a_forged_results_header_does_not_reach_the_destination() {
         let auth = verdict("paypal.test", DmarcVerdict::Fail, Some(DmarcPolicy::None));
@@ -3162,12 +2581,6 @@ mod tests {
         );
     }
 
-    /// **`enabled = false` changes no bytes.** The documented reason to switch
-    /// the check off is that something in front of mxhop already does it and
-    /// writes the header — and the natural authserv-id for that box is this
-    /// host's name, because the same operator configured both. The strip then
-    /// deleted the upstream finding and wrote nothing in its place, while the
-    /// example config promised "no lookups, no header, no refusals".
     #[tokio::test]
     async fn a_disabled_check_leaves_an_upstream_results_header_where_it_is() {
         let script = "EHLO mail.elsewhere.test\r\n\
@@ -3199,12 +2612,6 @@ mod tests {
         );
     }
 
-    /// **A loop must not cost the DNS budget first.** `Head::scan` is pure,
-    /// the authentication check can spend the whole twenty seconds, and the
-    /// loop refusal needs nothing from the network — so a message going round
-    /// a loop used to buy twenty seconds of resolver time per hop before
-    /// being refused for a reason that was certain before any lookup. An
-    /// empty `probed` is the proof: the check was never reached.
     #[tokio::test]
     async fn a_looping_message_is_refused_before_any_authentication_lookup() {
         let script = "EHLO mail.elsewhere.test\r\n\

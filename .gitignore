@@ -1,6 +1,5 @@
 /target
 
-# local runtime state
 /spool/
 *.pem
 .env

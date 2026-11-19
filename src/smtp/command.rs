@@ -1,53 +1,32 @@
-//! Turning a protocol line into a command.
-//!
-//! Kept separate from the session, and pure, because this is where a mail
-//! server meets whatever the internet decides to send it: pipelined lines,
-//! lowercase verbs, a space after the colon, `<>`, parameters in any order.
-
 use std::fmt;
 
-/// A command as mxhop understands it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     Ehlo(String),
     Helo(String),
     Mail {
-        /// `None` is the null sender, `<>`, which every bounce uses.
         from: Option<String>,
-        /// What the client claims the message will weigh.
         size: Option<u64>,
-        /// Whether the client announced 8-bit content.
         body_8bitmime: bool,
     },
     Rcpt(String),
     Data,
     Rset,
     Noop,
-    /// RFC 3207: the client asks to start a TLS handshake. Whether mxhop can
-    /// is the session's business, not the parser's.
     StartTls,
     Quit,
-    /// `VRFY` and `EXPN` — answered, never obeyed: an alias table is not a
-    /// directory for strangers to read.
     Vrfy,
     Help,
-    /// A verb mxhop does not implement, kept for the reply.
     Unknown(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandError {
-    /// `MAIL`/`RCPT` without the `FROM:`/`TO:` part.
     MissingPath { verb: &'static str },
-    /// A path that is not `<address>`.
     MalformedPath { verb: &'static str },
-    /// `SIZE=` that is not a number.
     MalformedSize,
-    /// A parameter mxhop does not implement.
     UnknownParameter(String),
-    /// A non-ASCII envelope, which needs SMTPUTF8 — not advertised in v1.
     NeedsSmtpUtf8,
-    /// A verb with arguments it should not have.
     UnexpectedArguments { verb: &'static str },
 }
 
@@ -74,7 +53,6 @@ impl fmt::Display for CommandError {
     }
 }
 
-/// Parses one command line (without its terminator).
 pub fn parse(line: &str) -> Result<Command, CommandError> {
     let line = line.trim_end();
     let (verb, rest) = match line.split_once(' ') {
@@ -91,8 +69,6 @@ pub fn parse(line: &str) -> Result<Command, CommandError> {
         "RSET" => no_arguments(rest, "RSET", Command::Rset),
         "QUIT" => no_arguments(rest, "QUIT", Command::Quit),
         "STARTTLS" => no_arguments(rest, "STARTTLS", Command::StartTls),
-        // RFC 5321 gives NOOP an optional argument, and some clients use it
-        // as a keepalive.
         "NOOP" => Ok(Command::Noop),
         "VRFY" | "EXPN" => Ok(Command::Vrfy),
         "HELP" => Ok(Command::Help),
@@ -112,8 +88,6 @@ fn parse_mail(rest: &str) -> Result<Command, CommandError> {
     let after = keyword(rest, "FROM").ok_or(CommandError::MissingPath { verb: "MAIL" })?;
     let (path, params) = path(after).ok_or(CommandError::MalformedPath { verb: "MAIL" })?;
 
-    // An empty path is `<>`: the null sender, which is how every bounce in
-    // the world identifies itself.
     let from = if path.is_empty() {
         None
     } else {
@@ -131,8 +105,6 @@ fn parse_mail(rest: &str) -> Result<Command, CommandError> {
                 "7BIT" => {}
                 other => return Err(CommandError::UnknownParameter(format!("BODY={other}"))),
             },
-            // Accepting a parameter we do not honour would be a lie about
-            // what happens to the message.
             other => return Err(CommandError::UnknownParameter(other.to_string())),
         }
     }
@@ -156,7 +128,6 @@ fn parse_rcpt(rest: &str) -> Result<Command, CommandError> {
     Ok(Command::Rcpt(address(path, "RCPT")?))
 }
 
-/// `FROM:` / `TO:`, in any case, with or without a space before the path.
 fn keyword<'a>(rest: &'a str, word: &str) -> Option<&'a str> {
     let rest = rest.trim_start();
     let head = rest.get(..word.len())?;
@@ -167,7 +138,6 @@ fn keyword<'a>(rest: &'a str, word: &str) -> Option<&'a str> {
     Some(after.strip_prefix(':')?.trim_start())
 }
 
-/// Splits `<address> PARAMS` into the address and whatever follows.
 fn path(s: &str) -> Option<(&str, &str)> {
     let inner = s.trim_start().strip_prefix('<')?;
     let end = inner.find('>')?;
@@ -175,8 +145,6 @@ fn path(s: &str) -> Option<(&str, &str)> {
 }
 
 fn address(path: &str, verb: &'static str) -> Result<String, CommandError> {
-    // SMTPUTF8 is not advertised, so a non-ASCII envelope is something mxhop
-    // cannot carry — and saying so is better than mangling it.
     if !path.is_ascii() {
         return Err(CommandError::NeedsSmtpUtf8);
     }
@@ -231,7 +199,6 @@ mod tests {
 
     #[test]
     fn a_greeting_without_a_name_is_still_a_greeting() {
-        // Plenty of clients send a bare EHLO. Refusing it buys nothing.
         assert_eq!(parse("EHLO").unwrap(), Command::Ehlo(String::new()));
     }
 
@@ -242,7 +209,6 @@ mod tests {
 
     #[test]
     fn a_space_after_the_colon_is_tolerated() {
-        // Not what RFC 5321 says; what clients do.
         assert_eq!(
             parse("MAIL FROM: <a@b.com>").unwrap(),
             mail(Some("a@b.com"))
@@ -300,8 +266,6 @@ mod tests {
 
     #[test]
     fn a_parameter_we_do_not_implement_is_refused_rather_than_ignored() {
-        // Silently ignoring RET or ENVID would be lying about what happened
-        // to the message.
         assert_eq!(
             parse("MAIL FROM:<a@b.com> RET=FULL"),
             Err(CommandError::UnknownParameter("RET".into()))
@@ -371,7 +335,6 @@ mod tests {
 
     #[test]
     fn noop_may_carry_a_string_but_data_may_not() {
-        // RFC 5321: NOOP takes an optional argument; DATA takes none.
         assert_eq!(parse("NOOP keepalive").unwrap(), Command::Noop);
         assert_eq!(
             parse("DATA now"),
@@ -379,9 +342,6 @@ mod tests {
         );
     }
 
-    /// RFC 3207 §4: STARTTLS takes no parameters. A client that sends one is
-    /// talking a protocol mxhop does not know, and the answer has to come
-    /// before the handshake rather than inside it.
     #[test]
     fn starttls_takes_no_arguments() {
         assert_eq!(parse("STARTTLS").unwrap(), Command::StartTls);

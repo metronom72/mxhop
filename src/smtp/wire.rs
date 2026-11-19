@@ -1,36 +1,16 @@
-//! Reading the wire: command lines, and the message body that follows DATA.
-//!
-//! Two rules decide everything here. A command line has a length limit, and
-//! exceeding it has to be an error rather than a silently truncated command.
-//! And the body must come out of the socket byte for byte: the only change
-//! allowed is removing the dot that the client added to lines starting with
-//! one, because a single re-encoded byte invalidates the sender's DKIM
-//! signature and turns a forwarded message into a suspected forgery.
-
 use std::fmt;
 
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 
-/// RFC 5321 §4.5.3.1.4: 512 octets including CRLF. The limit here is larger
-/// because real senders exceed the letter of it and nothing good comes of
-/// refusing them, but it is still a limit: an unbounded line is a way to make
-/// a server allocate until it dies.
 pub const MAX_COMMAND_LINE: usize = 4096;
 
-/// The sequence that ends a message body.
 const TERMINATOR: &[u8] = b".";
 
 #[derive(Debug)]
 pub enum WireError {
-    /// The peer went away mid-command.
     Closed,
-    /// A command line longer than [`MAX_COMMAND_LINE`].
     LineTooLong,
-    /// A body larger than the configured limit.
-    TooLarge {
-        limit: u64,
-    },
-    /// The peer went away before the body ended.
+    TooLarge { limit: u64 },
     UnterminatedBody,
     Io(std::io::Error),
 }
@@ -53,32 +33,19 @@ impl From<std::io::Error> for WireError {
     }
 }
 
-/// Reads one command line and returns it without its terminator.
-///
-/// A bare LF is accepted as a line ending. It is illegal on the wire, but it
-/// arrives, and the alternative is a session that hangs.
 pub async fn read_line<R>(reader: &mut R) -> Result<String, WireError>
 where
     R: AsyncBufRead + Unpin,
 {
     let mut line = Vec::with_capacity(128);
     match raw_line(reader, &mut line, MAX_COMMAND_LINE as u64).await {
-        Ok(true) => {
-            // A command that is not ASCII cannot be valid; handing it on
-            // lossily lets the parser refuse it with a reason.
-            Ok(String::from_utf8_lossy(&line).into_owned())
-        }
+        Ok(true) => Ok(String::from_utf8_lossy(&line).into_owned()),
         Ok(false) => Err(WireError::Closed),
         Err(WireError::TooLarge { .. }) => Err(WireError::LineTooLong),
         Err(e) => Err(e),
     }
 }
 
-/// Reads a message body up to the lone `.` line, undoing dot-stuffing.
-///
-/// `limit` is in bytes of the message as stored. Going over it stops the read:
-/// the session answers 552 and closes, because draining a message we have
-/// already refused is work on behalf of whoever sent it.
 pub async fn read_body<R>(reader: &mut R, limit: u64) -> Result<Vec<u8>, WireError>
 where
     R: AsyncBufRead + Unpin,
@@ -87,8 +54,6 @@ where
 
     loop {
         let mut line = Vec::new();
-        // One line may not exceed what the whole message may: that is what
-        // keeps a sender from making us allocate without end.
         if !raw_line(reader, &mut line, limit + 2).await? {
             return Err(WireError::UnterminatedBody);
         }
@@ -97,8 +62,6 @@ where
             return Ok(body);
         }
 
-        // Undo dot-stuffing, and nothing else. The second dot of `..` belongs
-        // to the message.
         let content = if line.first() == Some(&b'.') {
             &line[1..]
         } else {
@@ -113,13 +76,6 @@ where
     }
 }
 
-/// Reads one line, terminator stripped. `Ok(false)` means the peer closed
-/// with nothing left to read.
-///
-/// A line ending in a bare LF is accepted and becomes CRLF in the body. That
-/// is a change to the bytes, which is otherwise forbidden here, but a bare LF
-/// is illegal on the wire and every MTA normalises it; a message carrying one
-/// has already lost its signature.
 async fn raw_line<R>(reader: &mut R, out: &mut Vec<u8>, cap: u64) -> Result<bool, WireError>
 where
     R: AsyncBufRead + Unpin,
@@ -171,8 +127,6 @@ mod tests {
 
     #[tokio::test]
     async fn lines_come_back_one_at_a_time_when_pipelined() {
-        // A client that pipelines sends several commands in one packet; each
-        // read has to take exactly one of them.
         let mut r = reader("MAIL FROM:<a@b.com>\r\nRCPT TO:<c@d.com>\r\nDATA\r\n");
         assert_eq!(read_line(&mut r).await.unwrap(), "MAIL FROM:<a@b.com>");
         assert_eq!(read_line(&mut r).await.unwrap(), "RCPT TO:<c@d.com>");
@@ -239,8 +193,6 @@ mod tests {
 
     #[tokio::test]
     async fn body_bytes_are_otherwise_untouched() {
-        // Trailing whitespace, a long line, bare 8-bit bytes: all of it is
-        // inside somebody's DKIM signature.
         let odd = "From: a@b.com\r\nSubject: =?utf-8?B?0L/RgNC40LLQtdGC?=\r\n\r\n  leading and trailing  \r\n\r\n";
         let script = format!("{odd}.\r\n");
         let mut r = reader(&script);
@@ -283,8 +235,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_line_inside_the_body_may_be_long() {
-        // The command-line limit does not apply to the body: messages have
-        // very long lines, base64 among them.
         let long = "Q".repeat(MAX_COMMAND_LINE * 2);
         let script = format!("{long}\r\n.\r\n");
         let mut r = reader(&script);

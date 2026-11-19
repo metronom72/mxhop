@@ -1,12 +1,3 @@
-//! SRS over real sockets, both directions.
-//!
-//! The session-level tests in `smtp::session` drive the state machine over a
-//! pipe and read the sender off the `Delivery` struct. That proves what mxhop
-//! decided; it does not prove what it *wrote*. The envelope sender is the one
-//! field a destination's SPF check is made against, so the bytes of the
-//! `MAIL FROM` line are worth a test that reads them off a socket — and it is
-//! the same test the deployment is verified with, one port number apart.
-
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -20,8 +11,6 @@ use mxhop::srs::{DEFAULT_MAX_AGE_DAYS, Srs};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
-/// Everything a destination was told, line by line, with the envelope it was
-/// given kept apart from the chatter.
 #[derive(Debug, Default)]
 struct Seen {
     lines: Vec<String>,
@@ -36,11 +25,6 @@ impl Seen {
     }
 }
 
-/// A destination that accepts everything and writes down what it was told.
-///
-/// Deliberately not mxhop: what is being checked is the bytes one SMTP
-/// implementation puts on the wire, and a second copy of the same parser
-/// would agree with a shared mistake.
 async fn sink() -> (u16, Arc<Mutex<Seen>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind a sink");
     let port = listener.local_addr().unwrap().port();
@@ -97,16 +81,12 @@ async fn sink() -> (u16, Arc<Mutex<Seen>>) {
     (port, seen)
 }
 
-/// A secret generated here. A key-shaped literal in a source file is a key in
-/// a source file, whatever the comment beside it says.
 fn secret() -> Vec<u8> {
     format!("mxhop-wire-test-{}", mxhop::spool::new_id()).into_bytes()
 }
 
 const SRS_DOMAIN: &str = "srs.tooling.ninja";
 
-/// mxhop on a high port, forwarding `hi@forwarded.test` to
-/// `destination@mailbox.test`, whose only mail exchanger is the sink.
 async fn serve_mxhop(srs: Srs, sink_port: u16) -> (u16, Spool) {
     let mut router = Router::default();
     router.insert(
@@ -121,12 +101,8 @@ async fn serve_mxhop(srs: Srs, sink_port: u16) -> (u16, Spool) {
         .mx("elsewhere.test", &[(10, "mx.elsewhere.test")])
         .addr("mx.elsewhere.test", "127.0.0.1".parse().unwrap());
 
-    // The real outbound client, over real TCP, with nothing changed but the
-    // port — binding 25 needs privileges a test does not have.
     let mut out = Outbound::new("mx.tooling.ninja", false);
     out.port = sink_port;
-    // Plaintext: the sink offers no STARTTLS, and the handshake is not what
-    // is under test.
     out.tls = None;
     let relay = Arc::new(Direct::new(table, out, None));
 
@@ -182,8 +158,6 @@ async fn serve_mxhop(srs: Srs, sink_port: u16) -> (u16, Spool) {
     (port, spool)
 }
 
-/// One SMTP conversation against mxhop, as a sending server has it: the
-/// script in, the replies out.
 async fn send(port: u16, script: &str) -> String {
     let stream = TcpStream::connect(("127.0.0.1", port))
         .await
@@ -191,8 +165,6 @@ async fn send(port: u16, script: &str) -> String {
     let mut reader = BufReader::new(stream);
     let mut out = String::new();
 
-    /// One reply, continuation lines included: a `-` in the fourth column
-    /// means there is more of it coming.
     async fn reply<S>(reader: &mut BufReader<S>) -> String
     where
         S: tokio::io::AsyncRead + Unpin,
@@ -212,8 +184,6 @@ async fn send(port: u16, script: &str) -> String {
 
     out.push_str(&reply(&mut reader).await);
 
-    // The body of a DATA block is not answered line by line, so a reader
-    // that waits for a reply after every line deadlocks on the first one.
     let mut in_body = false;
     for step in script.split_inclusive('\n') {
         reader
@@ -237,20 +207,6 @@ async fn send(port: u16, script: &str) -> String {
     out
 }
 
-/// What the destination is actually told, in the bytes it reads.
-///
-/// Before SRS this line carried the original sender, whose SPF record does
-/// not name this host; Gmail junked two test messages from this project for
-/// exactly that.
-///
-/// It exists because it reads the `MAIL FROM` line off a socket. Reverting
-/// the rewrite in `session::hand_on` also fails the unit test
-/// `smtp::session::tests::the_envelope_sender_handed_to_the_destination_is_rewritten`,
-/// which an earlier version of this comment denied — but that one asks the
-/// fake relay what it was handed, and this one asks what was written to a
-/// real TCP socket and read back by a real SMTP peer. A rewrite that is
-/// correct in the struct and lost on the way to the wire fails only this
-/// one, and that is a failure this project has had before.
 #[tokio::test]
 async fn the_mail_from_line_the_destination_reads_is_at_our_srs_domain() {
     let srs = Srs::new(SRS_DOMAIN, vec![secret()], DEFAULT_MAX_AGE_DAYS);
@@ -301,9 +257,6 @@ async fn the_mail_from_line_the_destination_reads_is_at_our_srs_domain() {
     );
 }
 
-/// The bounce, end to end over sockets: a destination takes the address it
-/// read off our `MAIL FROM` line and offers it back with an empty envelope
-/// sender, which is what a delivery report looks like.
 #[tokio::test]
 async fn a_bounce_to_an_address_we_wrote_is_relayed_and_a_forged_one_is_not() {
     let srs = Srs::new(SRS_DOMAIN, vec![secret()], DEFAULT_MAX_AGE_DAYS);
@@ -347,14 +300,6 @@ async fn a_bounce_to_an_address_we_wrote_is_relayed_and_a_forged_one_is_not() {
         );
     }
 
-    // The same address with one character of the MAC changed. This is the
-    // open-relay case: if it were accepted, anyone could post mail through
-    // this host to any address in the world.
-    //
-    // The MAC runs from index 5 to the next `=`, and the index flipped below
-    // has to land inside it or nothing about the signature is being tested.
-    // Asserted rather than trusted, because the MAC's length has been
-    // changed once already.
     assert!(
         honest[5..].find('=').expect("a MAC terminator") + 5 > 6,
         "index 6 has to be inside the MAC of {honest}"
@@ -379,8 +324,6 @@ async fn a_bounce_to_an_address_we_wrote_is_relayed_and_a_forged_one_is_not() {
         "a forged SRS recipient has to be refused: {out}"
     );
 
-    // Nothing left this host for the forged address: the sink's record still
-    // has exactly the one conversation the honest bounce made.
     let seen = seen.lock().unwrap();
     let conversations = seen
         .lines

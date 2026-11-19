@@ -1,6 +1,3 @@
-//! `mxhop check` as an operator runs it: a real binary, a real file, an exit
-//! code a CI job can read.
-
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Output};
@@ -31,8 +28,6 @@ hi = "me@gmail.com"
 "*" = "catch@gmail.com"
 "#;
 
-/// `hi` and `loop` point at each other: the table is a trap, and `check` is
-/// the only thing standing between it and a mail loop in production.
 const CYCLIC: &str = r#"hostname = "mx.example.com"
 listen = "0.0.0.0:25"
 spool_dir = "/var/lib/mxhop/spool"
@@ -84,9 +79,6 @@ fn a_missing_file_is_reported_as_such() {
     );
 }
 
-/// Without a `[tls]` block mxhop speaks plaintext only, and the ok line has to
-/// say so: an operator who thinks TLS is on and is wrong finds out from
-/// somebody else's deferral log.
 #[test]
 fn check_says_whether_there_is_a_certificate() {
     let path = write_config("no-tls.toml", GOOD);
@@ -96,9 +88,6 @@ fn check_says_whether_there_is_a_certificate() {
     assert!(stdout.contains("no TLS"), "{stdout}");
 }
 
-/// `check` answers "would `run` start?", and `run` refuses to start on a
-/// certificate it cannot read. A `check` that only looked at the paths would
-/// pass a configuration that then fails to boot.
 #[test]
 fn check_reads_the_certificate_and_fails_at_the_tls_line() {
     let body = format!(
@@ -119,10 +108,6 @@ fn check_reads_the_certificate_and_fails_at_the_tls_line() {
     );
 }
 
-/// A certificate the admin can read and the service user may not is the
-/// ordinary case — Caddy writes the key 0600 — so the ok line has to say
-/// whose permissions were used. Without it, "ok" reads as a promise about the
-/// service user that `check` never made.
 #[test]
 fn the_ok_line_names_the_user_that_read_the_certificate() {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("check_cli");
@@ -156,10 +141,6 @@ fn the_ok_line_names_the_user_that_read_the_certificate() {
     );
 }
 
-/// `check` answers "would `run` start?", and `run` cannot sign an envelope
-/// sender with a key that is not there. A `check` that only looked at the
-/// path would pass a configuration whose every forwarded message then went
-/// out with the original sender and failed SPF.
 #[test]
 fn check_reads_the_srs_secret_and_fails_at_the_srs_line() {
     let body = format!(
@@ -180,12 +161,6 @@ fn check_reads_the_srs_secret_and_fails_at_the_srs_line() {
     );
 }
 
-/// A key anyone on the host can read is a key anyone on the host can forge
-/// an address with, and forging one is the whole of being an open relay.
-/// `check` is the only moment an operator looks at this file, so it is the
-/// only moment the mode can be mentioned — and a warning rather than a
-/// refusal, because group-readable is a real risk on a shared host and none
-/// at all on a single-purpose VPS.
 #[test]
 fn check_warns_when_the_srs_secret_is_readable_by_anyone_but_its_owner() {
     use std::os::unix::fs::PermissionsExt;
@@ -193,8 +168,6 @@ fn check_warns_when_the_srs_secret_is_readable_by_anyone_but_its_owner() {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("check_cli");
     fs::create_dir_all(&dir).expect("temp dir");
     let key = dir.join("loose-srs.key");
-    // Generated here, not written down: a key-shaped literal in a source
-    // file is a key in a source file.
     fs::write(&key, format!("mxhop-check-test-{}\n", "k".repeat(24))).expect("write key");
     fs::set_permissions(&key, fs::Permissions::from_mode(0o644)).expect("chmod");
 
@@ -225,10 +198,6 @@ fn check_warns_when_the_srs_secret_is_readable_by_anyone_but_its_owner() {
     );
 }
 
-/// A short key is guessable offline from one SRS address found in a
-/// `Received` header, and a guessed key makes this host an open relay. The
-/// refusal has to say what to type instead, because "too short" on its own
-/// invites a slightly longer guess.
 #[test]
 fn check_refuses_a_secret_file_too_short_to_sign_with() {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("check_cli");
@@ -255,9 +224,6 @@ fn check_refuses_a_secret_file_too_short_to_sign_with() {
     );
 }
 
-/// The ok line is what an operator reads after a deploy, and whether the
-/// envelope sender is being rewritten is the single fact that decides whether
-/// forwarded mail passes SPF at the destination.
 #[test]
 fn the_ok_line_says_whether_the_envelope_sender_is_rewritten() {
     let plain = run_check(&write_config("no-srs.toml", GOOD));
@@ -267,8 +233,6 @@ fn the_ok_line_says_whether_the_envelope_sender_is_rewritten() {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("check_cli");
     fs::create_dir_all(&dir).expect("temp dir");
     let key = dir.join("ok-srs.key");
-    // Generated here rather than written down: a key-shaped literal in a
-    // source file is a key in a source file.
     fs::write(
         &key,
         format!(
