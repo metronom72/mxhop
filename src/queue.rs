@@ -758,7 +758,11 @@ mod tests {
             None
         }
 
-        async fn verify(&self, _probe: crate::auth::Probe<'_>) -> crate::auth::Auth {
+        async fn verify(
+            &self,
+            _probe: crate::auth::Probe<'_>,
+            _budget: crate::auth::Budget,
+        ) -> crate::auth::Auth {
             crate::auth::Auth::not_checked()
         }
     }

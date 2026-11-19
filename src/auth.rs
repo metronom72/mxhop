@@ -27,6 +27,8 @@
 use std::fmt::Write as _;
 use std::net::IpAddr;
 
+use tracing::warn;
+
 use crate::policy::{is_safe_address, name_or_unknown};
 use crate::routing::is_qualified;
 
@@ -37,6 +39,78 @@ use crate::routing::is_qualified;
 /// on the final dot while this happens. It is charged against the session's
 /// relay budget rather than added to it: see [`crate::smtp::session`].
 pub const AUTH_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// How that budget is divided between the stages, in twentieths.
+///
+/// The three stages need three clocks rather than one, and the reason is that
+/// the attacker chooses two of the three names being looked up. The HELO name
+/// is his, the envelope sender is his, and the `d=` of every signature he
+/// attaches is his; `_dmarc.<the From domain>` is the victim's. Under a
+/// single clock a dozen `include:`s in his own SPF record, each pointing at a
+/// server that swallows queries rather than refusing them, spends the whole
+/// twenty seconds *before* the victim's policy has been asked for — and an
+/// expired clock reports "policy unknown", which forwards. That is a forged
+/// `From: service@paypal.com` leaving this host with our envelope on it,
+/// which is the one outcome this whole file exists to prevent.
+///
+/// Note what is *not* wrong here: the narrow deferral rule in
+/// [`crate::policy`], which forwards a `temperror` with no policy in hand.
+/// That rule is about a failure at the *sender's* end, which the sender's
+/// correspondent should not lose mail over. This is a failure the attacker
+/// arranges, and the fix belongs to the clock rather than to the rule.
+///
+/// Eight and six leave DMARC six seconds against DNS nobody hostile
+/// controls. That is far more than a healthy `_dmarc` answer needs, and it is
+/// what makes the attack pointless: he may spend both of his own stages down
+/// to the last millisecond and the policy is still fetched, still in hand,
+/// and still enforced.
+const SPF_SHARE: u32 = 8;
+const DKIM_SHARE: u32 = 6;
+const TOTAL_SHARES: u32 = 20;
+
+/// One clock per stage of the check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Budget {
+    /// Both SPF evaluations together, under one clock: see
+    /// [`Verifier::check`] for why they are not given one each.
+    pub spf: std::time::Duration,
+    /// Every `DKIM-Signature` on the message together, likewise.
+    pub dkim: std::time::Duration,
+    /// The floor under the DMARC lookup. What that lookup actually gets is
+    /// whatever is left of the total when the first two stages are done,
+    /// which by construction is never less than this.
+    pub dmarc: std::time::Duration,
+}
+
+impl Budget {
+    /// Divides `total` between the stages.
+    ///
+    /// `total` is what the session can spare, which is [`AUTH_BUDGET`] or
+    /// less — a message arriving late in a session's relay budget gets a
+    /// smaller one. It is *divided* rather than truncated, so that a short
+    /// budget shortens every stage proportionally. Truncating would mean a
+    /// tight session is one in which DMARC is simply the stage that never
+    /// runs, and DMARC is the stage the refusal turns on.
+    ///
+    /// DMARC takes the remainder rather than a share of its own, so the
+    /// rounding of the other two lands on it rather than against it.
+    pub fn of(total: std::time::Duration) -> Self {
+        let total = total.min(AUTH_BUDGET);
+        let spf = total * SPF_SHARE / TOTAL_SHARES;
+        let dkim = total * DKIM_SHARE / TOTAL_SHARES;
+        Self {
+            spf,
+            dkim,
+            dmarc: total.saturating_sub(spf).saturating_sub(dkim),
+        }
+    }
+
+    /// What the three stages add up to, which is what was handed to
+    /// [`Budget::of`] less whatever the division rounded away.
+    pub fn total(&self) -> std::time::Duration {
+        self.spf + self.dkim + self.dmarc
+    }
+}
 
 /// An SPF result (RFC 7208 §2.6), as this file's own enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -195,6 +269,18 @@ pub struct Auth {
     /// produces, and it is the one state in which no header is written and
     /// nothing can be refused.
     pub checked: bool,
+    /// Whether the DKIM stage ran out of its own budget, so that DMARC was
+    /// evaluated as though the message carried no signatures at all.
+    ///
+    /// This is the one piece of "how we got here" the decision table needs,
+    /// and it is here rather than inferred from `dkim` being empty because
+    /// an unsigned message and a message whose key lookup hung both arrive
+    /// at the table with an empty list and deserve opposite answers. An
+    /// unsigned message that fails `p=reject` is refused; a signed one whose
+    /// signature nobody managed to check is deferred, because a `550` is
+    /// permanent and the evidence that would have cleared it was never
+    /// fetched. See [`crate::policy::authentication_reply`].
+    pub dkim_timed_out: bool,
 }
 
 impl Auth {
@@ -258,6 +344,11 @@ impl Auth {
                 policy: None,
             },
             checked: true,
+            // Not the DKIM stage having run out — nothing ran at all. The
+            // flag softens a `550` into a `451`, and here there is no `550`
+            // to soften: a verdict with no policy in hand never reaches that
+            // arm of the table.
+            dkim_timed_out: false,
         }
     }
 
@@ -628,6 +719,11 @@ impl Verifier {
         options.attempts = 0;
         options.try_tcp_on_error = false;
         options.cache_size = 0;
+        // Longer than any budget a test hands `check`, so that `Rr::Hang` is
+        // ended by the stage clock under test and never by hickory's own.
+        // The default is five seconds, which would quietly stand in for the
+        // thing these tests are trying to prove.
+        options.timeout = std::time::Duration::from_secs(60);
 
         Self {
             inner: mail_auth::MessageAuthenticator::new(config, options).expect("a resolver"),
@@ -639,17 +735,25 @@ impl Verifier {
         &self.hostname
     }
 
-    /// Runs all three checks and converts the answers into an [`Auth`].
+    /// Runs all three checks, each under its own clock, and converts the
+    /// answers into an [`Auth`].
     ///
-    /// There is no clock here: `mail-auth` has no timeout of its own, so the
-    /// only one is the caller's `timeout(AUTH_BUDGET, …)`. That is why
-    /// [`Auth::timed_out`] exists and why it reports `temperror` rather than
-    /// `none` — our own expired budget is a question that was not answered,
-    /// which is precisely what `temperror` means.
-    pub async fn check(&self, probe: Probe<'_>) -> Auth {
+    /// `mail-auth` has no timeout of its own, so every clock here is one of
+    /// ours. There used to be exactly one, around the whole of this
+    /// function, and [`Budget`] says at length why that was a hole: the
+    /// first two stages look up names the sender chose, and a sender who
+    /// wants them to take twenty seconds can have them take twenty seconds.
+    ///
+    /// The caller keeps a backstop around the whole call for the case this
+    /// cannot cover — a stage that blocks without ever reaching an await
+    /// point — and [`Auth::timed_out`] is what that backstop produces. It
+    /// should now be unreachable in practice, and it stays because "should"
+    /// is not "is".
+    pub async fn check(&self, probe: Probe<'_>, budget: Budget) -> Auth {
         use mail_auth::dmarc::verify::DmarcParameters;
         use mail_auth::spf::verify::SpfParameters;
 
+        let started = std::time::Instant::now();
         let sender = probe.mail_from.unwrap_or("");
         // RFC 7208 §2.4: a null reverse-path is checked as
         // `postmaster@<helo>`, so the domain SPF — and DMARC alignment after
@@ -664,19 +768,56 @@ impl Verifier {
         // result belongs to: `spf=pass` is a different fact about a message
         // depending on whether it is about the envelope sender or the name the
         // client typed in HELO.
-        let spf_helo = self
-            .inner
-            .check_host(SpfParameters::helo(probe.ip, probe.helo, &self.hostname))
-            .await;
-        let spf_mail = self
-            .inner
-            .check_host(SpfParameters::mail_from(
-                probe.ip,
-                probe.helo,
-                &self.hostname,
-                sender,
-            ))
-            .await;
+        //
+        // One clock over both rather than one each, because the two walk the
+        // same records in practice — a HELO name and an envelope sender at
+        // the same domain share a cache — and because splitting the clock
+        // would mean a message could be half checked, which is a third state
+        // for the header to report and nothing downstream could use.
+        let both = tokio::time::timeout(budget.spf, async {
+            let helo = self
+                .inner
+                .check_host(SpfParameters::helo(probe.ip, probe.helo, &self.hostname))
+                .await;
+            let mail = self
+                .inner
+                .check_host(SpfParameters::mail_from(
+                    probe.ip,
+                    probe.helo,
+                    &self.hostname,
+                    sender,
+                ))
+                .await;
+            (helo, mail)
+        })
+        .await;
+
+        // Both `temperror` when the clock runs out, which is the honest
+        // report and is also the one that keeps the attack from paying.
+        // `mail-auth` only treats an SPF `temperror` as a DMARC `temperror`
+        // when the SPF identity is *aligned* with the `From` domain
+        // (`dmarc/verify.rs`), and an attacker forging somebody else's
+        // `From` is by definition not aligned — so his expired SPF leaves
+        // DMARC with nothing that passes, which is a plain failure and a
+        // `550`. A genuine sender whose own SPF hung *is* aligned, and gets
+        // the `451` the deferral rule was written for.
+        let (spf_helo, spf_mail) = match both {
+            Ok(pair) => pair,
+            Err(_) => {
+                warn!(
+                    helo = %probe.helo,
+                    seconds = budget.spf.as_secs(),
+                    "SPF did not finish inside its own budget; both identities \
+                     are reported as temporary and DMARC is still checked"
+                );
+                (
+                    mail_auth::SpfOutput::new(probe.helo.to_string())
+                        .with_result(mail_auth::SpfResult::TempError),
+                    mail_auth::SpfOutput::new(mail_from_domain.to_string())
+                        .with_result(mail_auth::SpfResult::TempError),
+                )
+            }
+        };
 
         let mut auth = Auth {
             spf_mail: spf(spf_mail.result()),
@@ -686,6 +827,7 @@ impl Verifier {
             dkim: Vec::new(),
             dmarc: Dmarc::default(),
             checked: true,
+            dkim_timed_out: false,
         };
 
         let Some(message) = mail_auth::AuthenticatedMessage::parse(probe.body) else {
@@ -699,7 +841,25 @@ impl Verifier {
             return auth;
         };
 
-        let dkim = self.inner.verify_dkim(&message).await;
+        // An expired DKIM clock hands DMARC an empty list, which is exactly
+        // what an unsigned message hands it — so the fact that this happened
+        // is recorded on the verdict, because the two deserve opposite
+        // answers and after this point nothing can tell them apart.
+        let dkim = match tokio::time::timeout(budget.dkim, self.inner.verify_dkim(&message)).await {
+            Ok(dkim) => dkim,
+            Err(_) => {
+                warn!(
+                    helo = %probe.helo,
+                    seconds = budget.dkim.as_secs(),
+                    "DKIM did not finish inside its own budget; DMARC is \
+                     checked as though the message were unsigned, and a \
+                     failure under p=reject will be deferred rather than \
+                     refused"
+                );
+                auth.dkim_timed_out = true;
+                Vec::new()
+            }
+        };
         auth.dkim = dkim
             .iter()
             .filter_map(|output| {
@@ -729,15 +889,51 @@ impl Verifier {
             return auth;
         }
 
-        let dmarc = self
-            .inner
-            .verify_dmarc(DmarcParameters::new(
+        // Whatever is left of the total, and never less than the floor: the
+        // first two stages are each capped at their own share, so by the
+        // time this runs at least `budget.dmarc` of the total is unspent.
+        // The `max` is belt and braces — it makes the floor hold even if a
+        // stage overruns its clock by a little, which is the only way the
+        // arithmetic above could come out short.
+        let for_dmarc = budget
+            .total()
+            .saturating_sub(started.elapsed())
+            .max(budget.dmarc);
+
+        let dmarc = match tokio::time::timeout(
+            for_dmarc,
+            self.inner.verify_dmarc(DmarcParameters::new(
                 &message,
                 &dkim,
                 mail_from_domain,
                 &spf_mail,
-            ))
-            .await;
+            )),
+        )
+        .await
+        {
+            Ok(dmarc) => dmarc,
+            Err(_) => {
+                // Six seconds against a domain's own `_dmarc` and no answer.
+                // That is the sender's DNS being broken, not an attack — an
+                // attacker has no way to slow down a name he does not
+                // control — and it lands where an unanswerable `_dmarc`
+                // already landed: `temperror` with no policy in hand, which
+                // the narrow rule in `crate::policy` forwards. The header
+                // says so, and the destination resolves it again anyway.
+                warn!(
+                    helo = %probe.helo,
+                    seconds = for_dmarc.as_secs(),
+                    "DMARC did not finish inside its own budget; the message \
+                     is forwarded with dmarc=temperror in its header"
+                );
+                auth.dmarc = Dmarc {
+                    from_domain: domains.remove(0),
+                    result: DmarcVerdict::TempError,
+                    policy: None,
+                };
+                return auth;
+            }
+        };
 
         auth.dmarc = Dmarc {
             from_domain: dmarc.domain().to_string(),
@@ -847,6 +1043,7 @@ mod tests {
                 policy: Some(Policy::None),
             },
             checked: true,
+            dkim_timed_out: false,
         }
     }
 
@@ -1249,6 +1446,15 @@ mod tests {
         /// that can produce a `temperror`, and the reason this test needs a
         /// nameserver rather than a table of records.
         ServFail,
+        /// Nothing at all, for as long as anyone is willing to wait.
+        ///
+        /// This is the shape of the attack the per-stage budgets exist for,
+        /// and it is deliberately *not* a SERVFAIL: a server that refuses
+        /// costs one round trip, and a server that swallows the query costs
+        /// the asker his whole clock. A sender's SPF record may point at a
+        /// dozen of these through `include:`, and every one of them is a
+        /// name he chose.
+        Hang,
     }
 
     /// A nameserver that answers from a script, keyed by name and type.
@@ -1303,6 +1509,13 @@ mod tests {
                     .get(&(name.to_ascii_lowercase(), qtype))
                     .cloned()
                     .unwrap_or(Rr::Empty);
+
+                // Read the question, say nothing, and go back to waiting for
+                // the next one. The asker's own clock is the only thing that
+                // will end this.
+                if matches!(rr, Rr::Hang) {
+                    continue;
+                }
 
                 let mut rdata = Vec::new();
                 if let Rr::Txt(text) = &rr {
@@ -1374,7 +1587,7 @@ mod tests {
 
         let server = nameserver(vec![("_dmarc.x.test", 16, Rr::ServFail)]).await;
         let broken = Verifier::against(server, "mx.tooling.ninja")
-            .check(probe(&body, "sender@x.test"))
+            .check(probe(&body, "sender@x.test"), Budget::of(AUTH_BUDGET))
             .await;
 
         assert_eq!(
@@ -1391,7 +1604,7 @@ mod tests {
         // records, which is DNS saying this domain publishes no DMARC record.
         let silent = nameserver(Vec::new()).await;
         let absent = Verifier::against(silent, "mx.tooling.ninja")
-            .check(probe(&body, "sender@x.test"))
+            .check(probe(&body, "sender@x.test"), Budget::of(AUTH_BUDGET))
             .await;
 
         assert_eq!(
@@ -1415,7 +1628,7 @@ mod tests {
         .await;
 
         let auth = Verifier::against(server, "mx.tooling.ninja")
-            .check(probe(&body, "forged@paypal.test"))
+            .check(probe(&body, "forged@paypal.test"), Budget::of(AUTH_BUDGET))
             .await;
 
         assert_eq!(auth.dmarc.result, DmarcVerdict::Fail);
@@ -1440,7 +1653,7 @@ mod tests {
         .await;
 
         let auth = Verifier::against(server, "mx.tooling.ninja")
-            .check(probe(&body, "forged@shop.test"))
+            .check(probe(&body, "forged@shop.test"), Budget::of(AUTH_BUDGET))
             .await;
 
         assert_eq!(auth.dmarc.result, DmarcVerdict::Fail);
@@ -1498,7 +1711,10 @@ mod tests {
 
         let server = nameserver(script.clone()).await;
         let auth = Verifier::against(server, "mx.tooling.ninja")
-            .check(probe(&signed, "sender@signed.test"))
+            .check(
+                probe(&signed, "sender@signed.test"),
+                Budget::of(AUTH_BUDGET),
+            )
             .await;
 
         assert_eq!(
@@ -1522,7 +1738,10 @@ mod tests {
 
         let server = nameserver(script).await;
         let auth = Verifier::against(server, "mx.tooling.ninja")
-            .check(probe(&tampered, "sender@signed.test"))
+            .check(
+                probe(&tampered, "sender@signed.test"),
+                Budget::of(AUTH_BUDGET),
+            )
             .await;
 
         assert_ne!(
@@ -1593,7 +1812,7 @@ mod tests {
 
         let server = nameserver(script.clone()).await;
         let auth = Verifier::against(server, "mx.tooling.ninja")
-            .check(probe(&signed, "sender@rsa.test"))
+            .check(probe(&signed, "sender@rsa.test"), Budget::of(AUTH_BUDGET))
             .await;
 
         assert_eq!(
@@ -1618,7 +1837,7 @@ mod tests {
 
         let server = nameserver(script).await;
         let auth = Verifier::against(server, "mx.tooling.ninja")
-            .check(probe(&tampered, "sender@rsa.test"))
+            .check(probe(&tampered, "sender@rsa.test"), Budget::of(AUTH_BUDGET))
             .await;
 
         assert_ne!(
@@ -1627,6 +1846,294 @@ mod tests {
             "a body that does not match the signature must not pass: {auth:?}"
         );
         assert_eq!(auth.dmarc.result, DmarcVerdict::Fail, "{auth:?}");
+    }
+
+    // ------------------------------------- the clocks, against a dead server
+
+    /// A budget short enough that these tests finish in under a second, and
+    /// long enough that a loopback nameserver answering instantly is never
+    /// the thing that runs out. Divided exactly as the real one is — the
+    /// shares are what is under test, not the seconds.
+    fn impatient() -> Budget {
+        Budget::of(std::time::Duration::from_millis(500))
+    }
+
+    /// The division itself, because every test below rests on it and because
+    /// the one number that matters is the one nobody looks at: what is left
+    /// for DMARC after the two stages the sender controls have taken all
+    /// they are allowed to.
+    #[test]
+    fn the_two_stages_a_sender_chooses_the_names_for_cannot_take_dmarcs_share() {
+        let full = Budget::of(AUTH_BUDGET);
+        assert_eq!(full.spf.as_secs(), 8);
+        assert_eq!(full.dkim.as_secs(), 6);
+        assert_eq!(full.dmarc.as_secs(), 6);
+        assert_eq!(full.total(), AUTH_BUDGET);
+
+        // A session with less to spare shortens every stage rather than
+        // dropping the last one. A tight budget that spent itself on SPF and
+        // DKIM would be the original hole with a smaller clock.
+        let half = Budget::of(AUTH_BUDGET / 2);
+        assert_eq!(half.spf.as_secs(), 4);
+        assert_eq!(half.dkim.as_secs(), 3);
+        assert_eq!(half.dmarc.as_secs(), 3);
+
+        // More than the ceiling is not more time: the sending server is
+        // holding its connection open on the final dot throughout.
+        assert_eq!(Budget::of(AUTH_BUDGET * 10), full);
+    }
+
+    /// The attack this whole milestone is about, end to end.
+    ///
+    /// `paypal.test` publishes `p=reject`. The attacker forges it in `From:`
+    /// and sends from `bait.test`, whose SPF record is served by a
+    /// nameserver that reads the question and says nothing — in the wild, a
+    /// handful of `include:`s pointing at hosts that swallow queries, here
+    /// one name doing the same job in one query. Under a single clock over
+    /// the whole check that burned the twenty seconds before `_dmarc.
+    /// paypal.test` was ever asked for, the verdict was "policy unknown",
+    /// and the narrow deferral rule forwards that — so the forgery left
+    /// here with our envelope on it and Gmail's refusal landed on our
+    /// reputation.
+    ///
+    /// With a clock per stage he spends his own and the policy is still
+    /// fetched. And what he spent it on does not even help him: `mail-auth`
+    /// only carries an SPF `temperror` into DMARC when the SPF identity is
+    /// *aligned* with the `From` domain, and forging somebody else's `From`
+    /// is exactly what being unaligned means. So his dead SPF leaves DMARC
+    /// with nothing that passes, which is a plain failure under `p=reject`.
+    #[tokio::test]
+    async fn a_forgery_whose_own_spf_never_answers_is_refused_rather_than_forwarded() {
+        let server = nameserver(vec![
+            ("bait.test", 16, Rr::Hang),
+            ("mail.bait.test", 16, Rr::Hang),
+            (
+                "_dmarc.paypal.test",
+                16,
+                Rr::Txt("v=DMARC1; p=reject; rua=mailto:d@paypal.test".into()),
+            ),
+        ])
+        .await;
+
+        let body = b"From: Billing <billing@paypal.test>\r\n\
+                     To: hi@example.com\r\n\
+                     Subject: your account\r\n\
+                     \r\n\
+                     body\r\n";
+
+        let started = std::time::Instant::now();
+        let auth = Verifier::against(server, "mx.tooling.ninja")
+            .check(
+                Probe {
+                    ip: "198.51.100.7".parse().unwrap(),
+                    helo: "mail.bait.test",
+                    mail_from: Some("bounce@bait.test"),
+                    body,
+                },
+                impatient(),
+            )
+            .await;
+        let took = started.elapsed();
+
+        // The assertion that fails if the three clocks are ever merged back
+        // into one. Under a single clock the hung SPF lookup spends all of
+        // it and the DMARC lookup never runs, so there is no policy in hand
+        // and the verdict below is unreachable — and the resolver's own
+        // timeout is a minute here, so nothing but our budget can have
+        // ended this.
+        assert!(
+            took < impatient().total() * 2,
+            "the check should end on the SPF stage's clock, not on the \
+             resolver's: {took:?}"
+        );
+
+        assert_eq!(auth.spf_mail, Spf::TempError, "{auth:?}");
+        assert_eq!(auth.spf_helo, Spf::TempError, "{auth:?}");
+        assert_eq!(
+            auth.dmarc.policy,
+            Some(Policy::Reject),
+            "the victim's policy has to be in hand despite the attacker \
+             having spent his own stage: that is the whole point of the \
+             split budget: {auth:?}"
+        );
+        assert_eq!(auth.dmarc.result, DmarcVerdict::Fail, "{auth:?}");
+        assert_eq!(
+            crate::policy::authentication_reply(&auth).map(|reply| reply.code),
+            Some(550),
+            "refused while the sending server still holds it, not forwarded \
+             with our envelope on it: {auth:?}"
+        );
+    }
+
+    /// The other half of the same rule, and the reason the fix is a budget
+    /// rather than a wider deferral rule.
+    ///
+    /// Here the dead name is the *sender's own*, and the sender is who he
+    /// says he is: an aligned identity whose SPF record cannot be fetched.
+    /// `mail-auth` carries that into DMARC as a `temperror` with the record
+    /// still in hand, which is the one shape that earns a `451` — a retry
+    /// can get a different answer, and this is the case where it is worth
+    /// asking for one. An attacker cannot arrange this: to make his expired
+    /// SPF *aligned* he would have to send from the domain he is forging,
+    /// and then it is that domain's nameserver he needs to hang, not his
+    /// own.
+    #[tokio::test]
+    async fn an_honest_senders_own_dead_spf_is_deferred_and_not_refused() {
+        let server = nameserver(vec![
+            ("slow.test", 16, Rr::Hang),
+            (
+                "_dmarc.slow.test",
+                16,
+                Rr::Txt("v=DMARC1; p=reject; rua=mailto:d@slow.test".into()),
+            ),
+        ])
+        .await;
+
+        let body = message("slow.test");
+        let auth = Verifier::against(server, "mx.tooling.ninja")
+            .check(
+                Probe {
+                    ip: "198.51.100.7".parse().unwrap(),
+                    helo: "slow.test",
+                    mail_from: Some("sender@slow.test"),
+                    body: &body,
+                },
+                impatient(),
+            )
+            .await;
+
+        assert_eq!(auth.spf_mail, Spf::TempError, "{auth:?}");
+        assert_eq!(auth.dmarc.policy, Some(Policy::Reject), "{auth:?}");
+        assert_eq!(auth.dmarc.result, DmarcVerdict::TempError, "{auth:?}");
+        assert_eq!(
+            crate::policy::authentication_reply(&auth).map(|reply| reply.code),
+            Some(451),
+            "a temporary error with the policy in hand is the one case worth \
+             a retry, and it must not have become a 550: {auth:?}"
+        );
+    }
+
+    /// A signed message whose key lookup hangs must not be refused.
+    ///
+    /// The DKIM stage running out hands DMARC an empty list of signatures,
+    /// which is byte-for-byte what an unsigned message hands it — and an
+    /// unsigned message failing `p=reject` is refused. So the two have to be
+    /// told apart after the fact, which is what `Auth::dkim_timed_out` is
+    /// for: the signature that would have cleared this message exists, and
+    /// the only reason it did not is that *our* lookup of somebody's key did
+    /// not come back. A `550` on that is permanent, and permanent is the one
+    /// thing it must not be.
+    ///
+    /// It is still a refusal. An attacker who hangs his own key lookup to
+    /// earn this has bought a `451` instead of a `550`, which is not the
+    /// delivery he came for.
+    #[tokio::test]
+    async fn a_signature_whose_key_never_arrives_is_deferred_and_not_refused() {
+        use mail_auth::crypto::Ed25519Key;
+        use mail_auth::dkim::DkimSigner;
+
+        let pair = mail_auth::dkim::generate::DkimKeyPair::generate_ed25519().expect("a key pair");
+        let key = Ed25519Key::from_pkcs8_der(pair.private_key()).expect("the signing key");
+
+        let body = message("stalled.test");
+        let signature = DkimSigner::from_key(key)
+            .domain("stalled.test")
+            .selector("mxhop1")
+            .headers(["From", "To", "Subject"])
+            .sign(&body)
+            .expect("a signature");
+
+        let mut signed = Vec::new();
+        signature.write(&mut signed, true);
+        signed.extend_from_slice(&body);
+
+        // The key is published, and the nameserver holding it will not say
+        // so. Everything else answers at once, so the only clock that can
+        // run out here is the DKIM one.
+        let server = nameserver(vec![
+            ("mxhop1._domainkey.stalled.test", 16, Rr::Hang),
+            (
+                "_dmarc.stalled.test",
+                16,
+                Rr::Txt("v=DMARC1; p=reject; rua=mailto:d@stalled.test".into()),
+            ),
+        ])
+        .await;
+
+        let auth = Verifier::against(server, "mx.tooling.ninja")
+            .check(probe(&signed, "sender@stalled.test"), impatient())
+            .await;
+
+        assert!(
+            auth.dkim_timed_out,
+            "the one fact the decision table needs, and the one nothing \
+             downstream could reconstruct: {auth:?}"
+        );
+        assert!(auth.dkim.is_empty(), "{auth:?}");
+        assert_eq!(auth.dmarc.policy, Some(Policy::Reject), "{auth:?}");
+        assert_eq!(
+            auth.dmarc.result,
+            DmarcVerdict::Fail,
+            "DMARC sees an unsigned message, because that is all an expired \
+             DKIM stage can hand it: {auth:?}"
+        );
+        assert_eq!(
+            crate::policy::authentication_reply(&auth).map(|reply| reply.code),
+            Some(451),
+            "and the flag is what keeps that from being a permanent refusal \
+             of a message that was signed all along: {auth:?}"
+        );
+    }
+
+    /// The same message, the same dead key, with enough time to fetch it.
+    ///
+    /// Without this the test above proves only that something went wrong,
+    /// not that the budget is what went wrong — a signature that could never
+    /// have verified would pass it just as well.
+    #[tokio::test]
+    async fn the_same_message_passes_when_its_key_is_answered() {
+        use mail_auth::crypto::Ed25519Key;
+        use mail_auth::dkim::DkimSigner;
+
+        let pair = mail_auth::dkim::generate::DkimKeyPair::generate_ed25519().expect("a key pair");
+        let key = Ed25519Key::from_pkcs8_der(pair.private_key()).expect("the signing key");
+
+        let body = message("stalled.test");
+        let signature = DkimSigner::from_key(key)
+            .domain("stalled.test")
+            .selector("mxhop1")
+            .headers(["From", "To", "Subject"])
+            .sign(&body)
+            .expect("a signature");
+
+        let mut signed = Vec::new();
+        signature.write(&mut signed, true);
+        signed.extend_from_slice(&body);
+
+        let server = nameserver(vec![
+            (
+                "mxhop1._domainkey.stalled.test",
+                16,
+                Rr::Txt(format!(
+                    "v=DKIM1; k=ed25519; p={}",
+                    pair.encoded_public_key()
+                )),
+            ),
+            (
+                "_dmarc.stalled.test",
+                16,
+                Rr::Txt("v=DMARC1; p=reject; rua=mailto:d@stalled.test".into()),
+            ),
+        ])
+        .await;
+
+        let auth = Verifier::against(server, "mx.tooling.ninja")
+            .check(probe(&signed, "sender@stalled.test"), impatient())
+            .await;
+
+        assert!(!auth.dkim_timed_out, "{auth:?}");
+        assert_eq!(auth.dmarc.result, DmarcVerdict::Pass, "{auth:?}");
+        assert_eq!(crate::policy::authentication_reply(&auth), None, "{auth:?}");
     }
 
     /// Two `From` domains have no single DMARC identity. `mail-auth` answers
@@ -1642,7 +2149,7 @@ mod tests {
         let server = nameserver(Vec::new()).await;
 
         let auth = Verifier::against(server, "mx.tooling.ninja")
-            .check(probe(body, "sender@one.test"))
+            .check(probe(body, "sender@one.test"), Budget::of(AUTH_BUDGET))
             .await;
 
         assert_eq!(auth.dmarc.result, DmarcVerdict::PermError);
