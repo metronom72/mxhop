@@ -333,6 +333,36 @@ mod tests {
     }
 
     #[test]
+    fn changing_a_mac_character_only_in_case_forges_nothing() {
+        let srs = Srs::new("srs.mx.test", vec![b"a-secret-of-some-length".to_vec()], 7);
+        let honest = srs
+            .rewrite(Some("victim@elsewhere.test"), 100)
+            .expect("an address");
+        let local = honest.rsplit_once('@').expect("a domain").0;
+
+        for at in 5..5 + MAC_CHARS {
+            let mut swapped: Vec<char> = local.chars().collect();
+            let c = swapped[at];
+            swapped[at] = if c.is_ascii_uppercase() {
+                c.to_ascii_lowercase()
+            } else if c.is_ascii_lowercase() {
+                c.to_ascii_uppercase()
+            } else {
+                continue;
+            };
+            let swapped: String = swapped.into_iter().collect();
+
+            assert_ne!(swapped, local, "the character really changed");
+            assert!(
+                srs.verify(&swapped, 100).is_ok(),
+                "a MAC that differs only in case is the same MAC, because a \
+                 receiver is allowed to change the case of a local part on its \
+                 way back: {swapped}"
+            );
+        }
+    }
+
+    #[test]
     fn verification_ignores_case_in_hash_and_timestamp() {
         let srs = srs();
         let wrapped = local_of(&srs.rewrite(Some("a@elsewhere.test"), 100).unwrap());
