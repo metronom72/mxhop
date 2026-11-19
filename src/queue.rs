@@ -134,6 +134,8 @@ pub struct Swept {
     pub deferred: usize,
     pub frozen: usize,
     pub held_back: usize,
+    pub reported: usize,
+    pub unreported: usize,
 }
 
 pub struct Runner<L> {
@@ -142,6 +144,7 @@ pub struct Runner<L> {
     srs: Option<Arc<Srs>>,
     schedule: Schedule,
     hosts: Hosts,
+    hostname: String,
 }
 
 impl<L> Runner<L>
@@ -153,6 +156,7 @@ where
         relay: Arc<L>,
         srs: Option<Arc<Srs>>,
         schedule: Schedule,
+        hostname: impl Into<String>,
     ) -> Self {
         Self {
             spool,
@@ -160,6 +164,43 @@ where
             srs,
             schedule,
             hosts: Hosts::default(),
+            hostname: hostname.into(),
+        }
+    }
+
+    async fn report(
+        &self,
+        envelope: &Envelope,
+        failures: &[(Mailbox, Reply)],
+        refused: crate::dsn::Refused,
+    ) -> bool {
+        match crate::dsn::send(
+            &self.spool,
+            &self.hostname,
+            envelope,
+            failures,
+            refused,
+            now_unix_ms(),
+        )
+        .await
+        {
+            Ok(id) => {
+                info!(
+                    id = %envelope.id,
+                    report = %id,
+                    to = envelope.from.as_deref().unwrap_or("<>"),
+                    "a delivery report for this message is in the queue"
+                );
+                true
+            }
+            Err(why) => {
+                warn!(
+                    id = %envelope.id,
+                    from = envelope.from.as_deref().unwrap_or("<>"),
+                    "no delivery report is being sent for this message: {why}"
+                );
+                false
+            }
         }
     }
 
@@ -200,10 +241,32 @@ where
                     days = self.schedule.lifetime.as_secs() / 86_400,
                     "giving up: this message has been in the queue longer than the \
                      retry lifetime and is being moved to frozen/, where it stays \
-                     readable; nobody is told, because mxhop cannot send a delivery \
-                     report yet: {}",
+                     readable: {}",
                     envelope.last_reply.as_deref().unwrap_or("no reason recorded")
                 );
+                let gave_up = Reply {
+                    code: 451,
+                    enhanced: Some("4.4.7".into()),
+                    text: envelope
+                        .last_reply
+                        .clone()
+                        .unwrap_or_else(|| "the destination did not accept it".into()),
+                    lines: Vec::new(),
+                };
+                let failures: Vec<(Mailbox, Reply)> = envelope
+                    .to
+                    .iter()
+                    .filter_map(|address| Mailbox::parse(address).ok())
+                    .map(|mailbox| (mailbox, gave_up.clone()))
+                    .collect();
+                if self
+                    .report(&envelope, &failures, crate::dsn::Refused::GaveUp)
+                    .await
+                {
+                    swept.reported += 1;
+                } else {
+                    swept.unreported += 1;
+                }
                 match self.spool.freeze(&envelope.id).await {
                     Ok(()) => swept.frozen += 1,
                     Err(e) => warn!(
@@ -325,6 +388,7 @@ where
         let body: Arc<[u8]> = body.into();
 
         let mut still_deferred: Vec<(Mailbox, Reply)> = Vec::new();
+        let mut permanent: Vec<(Mailbox, Reply)> = Vec::new();
         let mut delivered = 0usize;
         let mut refused = 0usize;
 
@@ -383,13 +447,18 @@ where
                             id = %envelope.id,
                             recipient = %result.mailbox,
                             host = outcome.host.as_deref().unwrap_or("unknown"),
-                            "this copy was permanently refused and is lost; mxhop \
-                             cannot send a bounce of its own yet: {reply}"
+                            "this copy was permanently refused: {reply}"
                         );
+                        permanent.push((result.mailbox, reply));
                     }
                     Verdict::Deferred(reply) => still_deferred.push((result.mailbox, reply)),
                 }
             }
+        }
+
+        if !permanent.is_empty() {
+            self.report(envelope, &permanent, crate::dsn::Refused::Permanently)
+                .await;
         }
 
         if still_deferred.is_empty() {
@@ -584,6 +653,7 @@ mod tests {
             attempts: 1,
             next_attempt_unix_ms: 0,
             via: Default::default(),
+            sender_authenticated: true,
         }
     }
 
@@ -610,7 +680,13 @@ mod tests {
             spool.store(envelope, BODY).await.unwrap();
         }
         let relay = Arc::new(relay);
-        let runner = Runner::new(Arc::clone(&spool), Arc::clone(&relay), None, schedule);
+        let runner = Runner::new(
+            Arc::clone(&spool),
+            Arc::clone(&relay),
+            None,
+            schedule,
+            "mx.test",
+        );
         (runner, spool, relay)
     }
 
@@ -745,6 +821,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_forged_envelope_gets_no_report_when_the_queue_gives_up() {
+        let envelope = Envelope {
+            received_at_unix_ms: now_unix_ms()
+                - (Schedule::default().lifetime.as_millis() as u64 + 1),
+            attempts: 40,
+            sender_authenticated: false,
+            from: Some("victim@paypal.test".into()),
+            ..held(&["hi@dest.test"])
+        };
+        let (runner, spool, _relay) = with(&envelope, Fake::accepting()).await;
+
+        let swept = runner.sweep().await;
+
+        assert_eq!(swept.frozen, 1);
+        assert_eq!(swept.reported, 0);
+        assert_eq!(swept.unreported, 1);
+        assert!(
+            spool.queued().await.unwrap().is_empty(),
+            "a report here would be mail sent to paypal.test on behalf of whoever \
+             forged it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_report_that_cannot_be_delivered_is_not_reported_on() {
+        let envelope = Envelope {
+            received_at_unix_ms: now_unix_ms()
+                - (Schedule::default().lifetime.as_millis() as u64 + 1),
+            attempts: 40,
+            from: None,
+            ..held(&["hi@dest.test"])
+        };
+        let (runner, spool, _relay) = with(&envelope, Fake::accepting()).await;
+
+        let swept = runner.sweep().await;
+
+        assert_eq!(swept.frozen, 1);
+        assert_eq!(swept.unreported, 1);
+        assert!(spool.queued().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_report_the_queue_writes_is_delivered_on_the_next_sweep() {
+        let envelope = held(&["hi@dest.test"]);
+        let (runner, spool, relay) = with(
+            &envelope,
+            Fake::answering(
+                "dest.test",
+                Verdict::Refused(theirs(550, "5.1.1", "no such user")),
+            ),
+        )
+        .await;
+
+        runner.sweep().await;
+        runner.sweep().await;
+
+        let sent = relay.deliveries();
+        let report = sent
+            .iter()
+            .find(|d| d.to[0].to_string() == "sender@elsewhere.test")
+            .expect("the report was delivered");
+        assert_eq!(report.from, None, "reports go out with the null sender");
+
+        let body = String::from_utf8(report.body.to_vec()).unwrap();
+        assert!(
+            body.contains("Final-Recipient: rfc822; hi@dest.test"),
+            "{body}"
+        );
+        assert!(
+            spool.queued().await.unwrap().is_empty(),
+            "and it leaves the queue once it has gone"
+        );
+    }
+
+    #[tokio::test]
     async fn a_permanent_refusal_on_a_retry_takes_the_message_out_of_the_queue() {
         let envelope = held(&["hi@dest.test"]);
         let (runner, spool, _relay) = with(
@@ -759,7 +910,10 @@ mod tests {
         let swept = runner.sweep().await;
 
         assert_eq!(swept.settled, 1);
-        assert!(spool.queued().await.unwrap().is_empty());
+        let left = spool.queued().await.unwrap();
+        assert_eq!(left.len(), 1, "the original is gone");
+        assert_eq!(left[0].from, None, "what is left is the delivery report");
+        assert_eq!(left[0].to, vec!["sender@elsewhere.test".to_string()]);
     }
 
     #[tokio::test]
@@ -910,7 +1064,11 @@ mod tests {
             "a message past its lifetime is not attempted once more on the way out"
         );
         assert!(relay.deliveries().is_empty());
-        assert!(spool.queued().await.unwrap().is_empty());
+        assert_eq!(swept.reported, 1);
+        let left = spool.queued().await.unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].from, None);
+        assert_eq!(left[0].to, vec!["sender@elsewhere.test".to_string()]);
         assert!(
             spool
                 .frozen_dir()
@@ -951,6 +1109,7 @@ mod tests {
             Arc::clone(&relay),
             Some(srs),
             Schedule::default(),
+            "mx.test",
         );
 
         runner.sweep().await;
@@ -981,6 +1140,7 @@ mod tests {
             Arc::clone(&relay),
             Some(srs),
             Schedule::default(),
+            "mx.test",
         );
 
         runner.sweep().await;
@@ -1209,6 +1369,7 @@ mod tests {
             Arc::new(Fake::accepting()),
             None,
             Schedule::default(),
+            "mx.test",
         );
 
         assert_eq!(runner.sweep().await, Swept::default());

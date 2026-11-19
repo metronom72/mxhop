@@ -30,6 +30,7 @@ been proved end to end. Do not point an MX record at it.
 | SRS and bounce decoding | done |
 | SPF/DKIM/DMARC and `Authentication-Results` | done |
 | Queue, retries, per-host backoff | done |
+| Delivery reports (DSN) | done |
 | DSNs for queued failures | planned |
 | Metrics, health, graceful shutdown — **0.2** | planned |
 | ARC sealing | planned |
@@ -306,11 +307,12 @@ bounces to is only valid for `srs.max_age_days` (seven by default), so a last
 attempt made after that provokes a report that comes back to an address mxhop
 no longer recognises — `mxhop check` refuses a lifetime that does not fit.
 
-Nothing is deleted. A frozen message is still somebody's mail, and mxhop
-**cannot yet tell its sender it was not delivered** — there is no DSN
-generator, which is the next task on the list above. Until there is, the only
-notice is a line at `error` level in the log and the files in `frozen/`; an
-operator who has fixed whatever was wrong can move them back:
+Nothing is deleted. A frozen message is still somebody's mail. Its sender is
+told, by a delivery report, if the envelope sender was proved — see
+[when mail cannot be delivered](#when-mail-cannot-be-delivered-who-is-told)
+for why that condition is there and what happens when it is not met. Either
+way the files stay in `frozen/`, and an operator who has fixed whatever was
+wrong can move them back:
 
 ```sh
 mv /var/lib/mxhop/spool/frozen/<id>.* /var/lib/mxhop/spool/queue/
@@ -369,6 +371,52 @@ tried again at once — and if the destination had already accepted it, that is
 a second copy. The window is one message wide, and closing it means recording
 an attempt before it is made rather than after, which is a change to what the
 envelope holds and not to the runner.
+
+## When mail cannot be delivered: who is told
+
+A message that was accepted and then finally failed gets a delivery report
+(RFC 3464) back to the envelope sender — but only when the envelope sender
+was proved to be who it says it is.
+
+| | |
+|---|---|
+| a copy permanently refused after mxhop answered `250` | report |
+| a copy permanently refused on a retry from the queue | report |
+| the queue's lifetime ran out and the message moved to `frozen/` | report |
+| the envelope sender is null (`<>`) | no report |
+| nothing proved the envelope sender | no report, a log line and a counter |
+
+The second-to-last row is not an edge case; it is the whole design. A report
+is a message mxhop sends, to an address somebody else chose, about a message
+somebody else wrote. Send one for every failure and a spammer forging
+`MAIL FROM:<victim@example.com>` has mxhop mailing the victim on his behalf.
+That is backscatter, and it is spam with your name on it.
+
+So the sender has to have been proved first, which means one of:
+
+- **SPF passed for the envelope sender.** That is the identity the report
+  would be sent to, so this is the test that actually answers the question.
+- **A DKIM signature passed and its `d=` is the envelope sender's domain, or
+  a parent of it.**
+
+The alignment in the second one is deliberate and is stricter than it may
+look. A DKIM pass proves the `From:` header's domain, which is routinely a
+different domain from the envelope sender — forwarded mail and mailing lists
+are nothing but that. An unaligned pass would say a newsletter's signature
+vouches for a bounce address at a domain the signer has never heard of, and
+a report sent on that basis is backscatter with extra steps. The issue this
+came from says "SPF or DKIM"; without the alignment it would not meet its own
+acceptance criterion.
+
+The report itself goes into the same queue as any other message, with the
+null sender, so it is retried and backed off like everything else — and when
+it cannot be delivered, the first row of the table above stops the loop:
+nothing is sent about a message sent from `<>`.
+
+Reports carry the original's `Received` and `Authentication-Results` and
+nothing else of the message. The body is not quoted back. A destination's
+own refusal text is copied into `Diagnostic-Code:` with control characters
+replaced, so a crafted reply cannot add a header to the report.
 
 ## What arriving mail is checked for
 

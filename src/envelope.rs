@@ -24,6 +24,8 @@ pub struct Envelope {
     pub next_attempt_unix_ms: u64,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub via: BTreeMap<String, String>,
+    #[serde(default)]
+    pub sender_authenticated: bool,
 }
 
 impl Envelope {
@@ -58,6 +60,7 @@ mod tests {
             attempts: 0,
             next_attempt_unix_ms: 0,
             via: BTreeMap::new(),
+            sender_authenticated: false,
         }
     }
 
