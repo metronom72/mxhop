@@ -29,7 +29,7 @@ been proved end to end. Do not point an MX record at it.
 | Synchronous relay, hop limit — **0.1** | done |
 | SRS and bounce decoding | done |
 | SPF/DKIM/DMARC and `Authentication-Results` | done |
-| Queue, retries, per-host backoff | planned |
+| Queue, retries, per-host backoff | done |
 | DSNs for queued failures | planned |
 | Metrics, health, graceful shutdown — **0.2** | planned |
 | ARC sealing | planned |
@@ -37,10 +37,13 @@ been proved end to end. Do not point an MX record at it.
 | systemd unit, compose | planned |
 | Docs and release — **1.0** | planned |
 
-What works today: it accepts mail. It does not yet forward it, so a message
-ends up in the spool directory and stays there. The queue is two files per
-message — `queue/<id>.eml` is exactly what arrived, `queue/<id>.json` is its
-envelope — so you can read what it took in with `cat`.
+What works today: it accepts mail, forwards it inside the session that
+brought it, and keeps whatever a destination deferred in a queue it retries.
+The queue is two files per message — `queue/<id>.eml` is exactly what
+arrived, `queue/<id>.json` is its envelope — so you can read what is stuck
+and why with `cat`. What is still missing before an MX record can point here
+is a delivery report: a copy mxhop finally gives up on is a copy whose sender
+is never told, and that is the next task.
 
 ```sh
 mxhop check --config mxhop.example.toml   # before anything else
@@ -49,10 +52,9 @@ mxhop run   --config mxhop.example.toml
 
 ## Running it
 
-`run` still does not forward: the outbound client exists and can deliver a
-message (see `send-test` below), but it is not yet wired into the inbound
-session, so a message that arrives is written to the spool and stays there.
-What follows is how to deploy that much.
+`run` accepts a message, hands it on while the sending server is still
+waiting, and queues what a destination deferred. What follows is how to
+deploy it.
 
 ### As a binary
 
@@ -217,6 +219,111 @@ it for at least `srs.max_age_days`: the first line signs and every line
 verifies, so bounces already in flight — carrying addresses signed with the
 retired key — still come home. Dropping the old key immediately destroys
 every delivery report that has not arrived yet.
+
+## The queue, and what happens to mail that cannot be delivered
+
+A message is forwarded inside the session that brought it: the sending server
+waits, hears what the destination said, and keeps the message itself if the
+answer was a deferral. That is the best place for mail to wait, because it is
+somebody else's disk and somebody else's retry schedule.
+
+What lands in `queue/` is what mxhop could not hand back: a message one of
+whose destinations took it while another deferred. The sender has been told
+`250` and will never send it again, so that copy is now the only one.
+
+mxhop reads `queue/` every `sweep_seconds` and tries whatever is due:
+
+| attempt | wait before it |
+|---|---|
+| 2nd | 1 minute |
+| 3rd | 5 minutes |
+| 4th | 15 minutes |
+| 5th | 1 hour |
+| 6th and after | 4 hours |
+
+One minute first, because what is usually being waited out is a greylist and
+a greylist clears in a minute; then longer, because what is left after the
+first few attempts is a destination with something properly wrong with it.
+The last interval repeats for as long as the message is queued.
+
+Only the recipients still deferring are retried — one that has its copy comes
+off the envelope, so nobody gets the message twice — and `last_reply` in the
+sidecar is the destination's own sentence about why, which is the thing worth
+reading:
+
+```sh
+cat /var/lib/mxhop/spool/queue/*.json | grep last_reply
+```
+
+After **48 hours** mxhop stops trying and moves both files to `frozen/`.
+It has to fit inside the SRS window: the rewritten sender a destination
+bounces to is only valid for `srs.max_age_days` (seven by default), so a last
+attempt made after that provokes a report that comes back to an address mxhop
+no longer recognises — `mxhop check` refuses a lifetime that does not fit.
+
+Nothing is deleted. A frozen message is still somebody's mail, and mxhop
+**cannot yet tell its sender it was not delivered** — there is no DSN
+generator, which is the next task on the list above. Until there is, the only
+notice is a line at `error` level in the log and the files in `frozen/`; an
+operator who has fixed whatever was wrong can move them back:
+
+```sh
+mv /var/lib/mxhop/spool/frozen/<id>.* /var/lib/mxhop/spool/queue/
+```
+
+The next sweep picks them up. The same goes for editing a recipient in an
+envelope by hand: the schedule lives in the file, nothing is cached, and
+`queue/` is the whole administration interface.
+
+### One failure stands in for the destination
+
+A destination that defers everything it is handed is not connected to again
+until its own wait is over, and every other message queued for it is skipped
+in the meantime — without costing those messages an attempt, and without
+touching their schedule. The wait doubles the same way a message's does, on
+the destination's own count of consecutive failures, and is forgotten the
+moment it answers for itself by taking a message or refusing one.
+
+Without that, a hundred messages queued for one dead host were a hundred
+connection attempts per sweep, every one of them waiting out the connect
+timeout, and mail for the destinations that *were* up waited behind them.
+With it, one connection per interval finds out whether the host is back, and
+the backlog goes out in the sweep that finds it.
+
+The count is in memory and lost on restart, which costs one connection per
+destination after one and is the right trade: it is a fact about a host right
+now, not about any message, and writing it into an envelope would put one
+message in charge of a decision it shares with others.
+
+A message whose recipients span two domains is skipped whole if either is
+backed off. That costs the healthy domain a wait of at most one ceiling and
+buys a rule with one clock in it; it is also nearly free in practice, since
+the recipients that were delivered came off the envelope when the message was
+first held.
+
+### Changing any of it
+
+The `[queue]` table, with these defaults:
+
+```toml
+[queue]
+retry_minutes = [1, 5, 15, 60, 240]   # the last one repeats
+lifetime_hours = 48
+sweep_seconds = 60
+```
+
+`mxhop check` refuses a `lifetime_hours` longer than `srs.max_age_days`, an
+empty `retry_minutes`, a zero or a value over a day inside it, and a zero
+anywhere else — zero means something different for each of them and all three
+meanings are a queue that has quietly stopped being one. It also prints the
+schedule it would run with, so the file does not have to be read back.
+
+One thing is still missing: a restart does not resume anything in flight. A
+message killed mid-delivery is in `queue/` with its old schedule, so it is
+tried again at once — and if the destination had already accepted it, that is
+a second copy. The window is one message wide, and closing it means recording
+an attempt before it is made rather than after, which is a change to what the
+envelope holds and not to the runner.
 
 ## What arriving mail is checked for
 

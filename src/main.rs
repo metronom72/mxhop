@@ -136,8 +136,30 @@ fn check(cli: &Cli) -> ExitCode {
     }
 
     let domains: Vec<&str> = config.router.domains().collect();
+    // What happens to a message a destination defers. Printed because the end
+    // of it — mxhop giving up — is the one outcome nobody is told about, so an
+    // operator should at least know when that is.
+    let retries = format!(
+        ", a deferred message retried after {} minutes and then every {}, given up on \
+         after {} hours",
+        config
+            .queue
+            .retries
+            .iter()
+            .map(|w| (w.as_secs() / 60).to_string())
+            .collect::<Vec<_>>()
+            .join(", "),
+        // The last interval is the one that repeats, so it is the one this
+        // sentence ends on.
+        match config.queue.retries.last().map_or(0, |w| w.as_secs() / 60) {
+            60 => "hour".to_string(),
+            minutes if minutes % 60 == 0 => format!("{} hours", minutes / 60),
+            minutes => format!("{minutes} minutes"),
+        },
+        config.queue.lifetime.as_secs() / 3_600,
+    );
     println!(
-        "{}: ok — {} on {}, {} {} for {}{}{}{}",
+        "{}: ok — {} on {}, {} {} for {}{}{}{}{}",
         cli.config.display(),
         config.hostname,
         config.listen,
@@ -183,6 +205,7 @@ fn check(cli: &Cli) -> ExitCode {
             (true, mxhop::policy::Enforce::Off) =>
                 ", SPF/DKIM/DMARC checked and stamped, never refused".to_string(),
         },
+        retries,
     );
     ExitCode::SUCCESS
 }
@@ -370,6 +393,20 @@ async fn run(cli: &Cli) -> ExitCode {
     } else {
         spawn_reload_on_hangup_without_tls();
     }
+
+    // The queue runner, beside the accept loop rather than inside it: a
+    // message is retried because it is on disk, not because another one
+    // arrives, and a host whose mail has stopped coming in is exactly when
+    // the queue has to keep draining.
+    tokio::spawn(
+        mxhop::queue::Runner::new(
+            Arc::clone(&spool),
+            Arc::clone(&relay),
+            srs.clone(),
+            config.queue.clone(),
+        )
+        .run(),
+    );
 
     accept_loop(listener, session_config, router, srs, spool, relay, tls).await;
     ExitCode::SUCCESS

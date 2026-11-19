@@ -2643,6 +2643,7 @@ mod tests {
             handshake_timeout: Duration::from_secs(5),
             ptr_timeout: Duration::from_secs(5),
             relay_budget: crate::smtp::session::RELAY_BUDGET,
+            queue: crate::queue::Schedule::default(),
             limits: crate::policy::Limits::default(),
             auth_enabled: true,
         };

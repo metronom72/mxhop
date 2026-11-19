@@ -12,6 +12,12 @@
 //! nothing or a complete message, never half of one. mxhop answers `250` only
 //! after that rename has returned: before it, the sending server still owns
 //! the message, which is exactly where responsibility belongs.
+//!
+//! There is a third directory, `frozen/`, and it is where a message goes when
+//! mxhop has stopped trying to deliver it — see [`Spool::freeze`]. Nothing in
+//! this file ever deletes a message that has not been delivered or refused
+//! for good: an accepted message is the only copy there is, and deleting it
+//! to say "we gave up" would say so to nobody.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -35,6 +41,7 @@ pub fn new_id() -> String {
 pub struct Spool {
     tmp: PathBuf,
     queue: PathBuf,
+    frozen: PathBuf,
 }
 
 impl Spool {
@@ -44,9 +51,14 @@ impl Spool {
         let spool = Self {
             tmp: root.join("tmp"),
             queue: root.join("queue"),
+            frozen: root.join("frozen"),
         };
         fs::create_dir_all(&spool.tmp).await?;
         fs::create_dir_all(&spool.queue).await?;
+        // Created empty rather than on first use, so that an operator who
+        // has never had a message given up on still sees the directory and
+        // knows where to look when one is.
+        fs::create_dir_all(&spool.frozen).await?;
         Ok(spool)
     }
 
@@ -173,12 +185,124 @@ impl Spool {
         fs::read(self.queue.join(format!("{id}.eml"))).await
     }
 
+    /// Replaces an envelope already in the queue — a new attempt count, a
+    /// new time to try again, the destination's latest words.
+    ///
+    /// Staged in `tmp/` and renamed over the old one, for the same reason
+    /// [`Spool::store`] does it that way: a reader of `queue/<id>.json` sees
+    /// either the envelope before this call or the one after it, never a
+    /// half-written file. The message itself is never touched — a retry has
+    /// to go out as the identical bytes, or the sender's DKIM signature
+    /// stops verifying on the second attempt.
+    pub async fn update(&self, envelope: &Envelope) -> io::Result<()> {
+        let sidecar = format!("{}.json", envelope.id);
+        let json = serde_json::to_vec_pretty(envelope).map_err(io::Error::other)?;
+        let staged = self.tmp.join(&sidecar);
+
+        if let Err(e) = durable_write(&staged, &json).await {
+            self.sweep(&staged).await;
+            return Err(e);
+        }
+        if let Err(e) = fs::rename(&staged, self.queue.join(&sidecar)).await {
+            self.sweep(&staged).await;
+            return Err(e);
+        }
+
+        // Same judgement as in `store`: the envelope *is* replaced, and
+        // saying otherwise would have the caller retry a message it has
+        // already rescheduled. What is in doubt is narrower — the old
+        // envelope may come back after a power cut in the next moment, which
+        // costs one duplicate attempt against a destination that deferred.
+        if let Err(e) = sync_dir(&self.queue).await {
+            warn!(
+                id = %envelope.id,
+                "the envelope is updated, but the queue directory could not be \
+                 flushed, so a power cut in the next moment could bring the previous \
+                 attempt count back: {e}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Forgets a message: it has been delivered, or there is nothing left
+    /// that could deliver it.
+    ///
+    /// The message goes first and the envelope second — the opposite of the
+    /// order a reader might expect, and the same order [`Spool::store`]
+    /// uses. If this fails half way, what is left is `queue/<id>.json`
+    /// without its message: visible to `queued()`, read by the next sweep,
+    /// and removed there. The other order leaves `queue/<id>.eml` alone,
+    /// which `queued()` never returns — a full copy of somebody's mail that
+    /// nothing will ever deliver, read or report.
+    pub async fn forget(&self, id: &str) -> io::Result<()> {
+        let mut failure = None;
+        for name in [format!("{id}.eml"), format!("{id}.json")] {
+            match fs::remove_file(self.queue.join(&name)).await {
+                Ok(()) => {}
+                // Already gone: `forget` says what the queue should not
+                // contain, so something else having removed it is success.
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => failure = Some(e),
+            }
+        }
+        match failure {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    /// Stops retrying a message without destroying it: both files move to
+    /// `frozen/`.
+    ///
+    /// This is what "we have given up" means on disk until mxhop can send a
+    /// delivery report of its own. Deleting the message would be the only
+    /// other way to stop an endless retry, and it would delete somebody's
+    /// mail to say so; `frozen/` keeps it where `ls` and `cat` find it, and
+    /// an operator who fixes whatever was wrong can move it back into
+    /// `queue/` by hand.
+    pub async fn freeze(&self, id: &str) -> io::Result<()> {
+        let message = format!("{id}.eml");
+        let sidecar = format!("{id}.json");
+
+        // The message first, so that the envelope — the thing delivery looks
+        // for — is the last to leave `queue/`: a failure in between is a
+        // message whose body the next sweep cannot read, which it reports and
+        // removes, rather than a copy of mail left in a directory nothing
+        // reads.
+        match fs::rename(self.queue.join(&message), self.frozen.join(&message)).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        fs::rename(self.queue.join(&sidecar), self.frozen.join(&sidecar)).await
+    }
+
+    /// Removes one file left in `tmp/`, naming it in the log if it cannot be
+    /// removed: everything in there is a staged copy nothing will ever read
+    /// again, so a spool that fails intermittently would otherwise fill the
+    /// disk with files an operator has no way to find.
+    async fn sweep(&self, path: &Path) {
+        match fs::remove_file(path).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => warn!(
+                path = %path.display(),
+                "a staged file could not be removed; nothing will ever read it and \
+                 nothing else will report it: {e}"
+            ),
+        }
+    }
+
     pub fn queue_dir(&self) -> &Path {
         &self.queue
     }
 
     pub fn tmp_dir(&self) -> &Path {
         &self.tmp
+    }
+
+    pub fn frozen_dir(&self) -> &Path {
+        &self.frozen
     }
 }
 
@@ -225,6 +349,8 @@ mod tests {
             received: String::new(),
             authentication_results: String::new(),
             last_reply: None,
+            attempts: 0,
+            next_attempt_unix_ms: 0,
         }
     }
 
@@ -442,6 +568,93 @@ mod tests {
         let queued = spool.queued().await.unwrap();
         assert_eq!(queued.len(), 1, "the good one still has to be delivered");
         assert_eq!(queued[0].id, "good");
+    }
+
+    #[tokio::test]
+    async fn an_updated_envelope_is_what_comes_back_and_the_message_is_untouched() {
+        let root = scratch("update");
+        let spool = Spool::open(&root).await.unwrap();
+        let body = b"Subject: hi\r\n\r\nbody\r\n";
+        spool
+            .store(&envelope("id-upd", body.len() as u64), body)
+            .await
+            .unwrap();
+
+        let rescheduled = Envelope {
+            attempts: 3,
+            next_attempt_unix_ms: 1_762_400_000_000,
+            last_reply: Some("hi@example.com: 451 4.3.0 try later".into()),
+            ..envelope("id-upd", body.len() as u64)
+        };
+        spool.update(&rescheduled).await.unwrap();
+
+        assert_eq!(spool.queued().await.unwrap(), vec![rescheduled]);
+        assert_eq!(
+            spool.body("id-upd").await.unwrap(),
+            body,
+            "a retry has to be the identical bytes, or the sender's DKIM signature \
+             stops verifying on the second attempt"
+        );
+        assert!(
+            names(spool.tmp_dir()).is_empty(),
+            "the staged envelope has to be gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_forgotten_message_leaves_nothing_behind() {
+        let root = scratch("forget");
+        let spool = Spool::open(&root).await.unwrap();
+        spool.store(&envelope("gone", 2), b"x\r\n").await.unwrap();
+
+        spool.forget("gone").await.unwrap();
+
+        assert_eq!(
+            names(spool.queue_dir()),
+            BTreeSet::new(),
+            "a delivered message that stays on disk is delivered again on the next sweep"
+        );
+    }
+
+    #[tokio::test]
+    async fn forgetting_a_message_that_is_already_gone_is_not_a_failure() {
+        // The sweep after a half-finished `forget` calls this on a message
+        // whose files are partly removed. Reporting an error there would have
+        // the runner log a failure for work that is done.
+        let root = scratch("forget-twice");
+        let spool = Spool::open(&root).await.unwrap();
+        spool.store(&envelope("twice", 2), b"x\r\n").await.unwrap();
+
+        spool.forget("twice").await.unwrap();
+        spool.forget("twice").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_frozen_message_is_out_of_the_queue_and_still_on_disk() {
+        let root = scratch("freeze");
+        let spool = Spool::open(&root).await.unwrap();
+        let body = b"Subject: hi\r\n\r\nbody\r\n";
+        spool
+            .store(&envelope("cold", body.len() as u64), body)
+            .await
+            .unwrap();
+
+        spool.freeze("cold").await.unwrap();
+
+        assert!(
+            spool.queued().await.unwrap().is_empty(),
+            "a frozen message is one nothing retries"
+        );
+        assert_eq!(
+            names(spool.frozen_dir()),
+            BTreeSet::from(["cold.eml".to_string(), "cold.json".to_string()]),
+            "and it is still somebody's mail: it has to be where `ls` finds it, \
+             envelope included, so an operator can put it back"
+        );
+        assert_eq!(
+            std::fs::read(spool.frozen_dir().join("cold.eml")).unwrap(),
+            body
+        );
     }
 
     #[test]

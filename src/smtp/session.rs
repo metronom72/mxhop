@@ -87,6 +87,11 @@ pub struct SessionConfig {
     /// strip runs in this file and would otherwise keep running. See where it
     /// is read for why that matters.
     pub auth_enabled: bool,
+    /// When the queue runner will try a held message again. The session
+    /// writes the first interval into the envelope it holds, so it has to be
+    /// the one the runner would have computed: two copies of that number
+    /// would mean a message scheduled by one and read by the other.
+    pub queue: crate::queue::Schedule,
 }
 
 impl SessionConfig {
@@ -106,6 +111,7 @@ impl SessionConfig {
                 ..Limits::default()
             },
             auth_enabled: config.auth.enabled,
+            queue: config.queue.clone(),
         }
     }
 }
@@ -570,8 +576,8 @@ where
 /// the deliveries, and whatever is left over.
 ///
 /// Nothing is stored before delivery is attempted. While the message is only
-/// on the wire the sending server still owns it, and that is the one place a
-/// message can wait that has a retry queue today.
+/// on the wire the sending server still owns it, and its retry queue is
+/// better than ours: it is somebody else's disk.
 #[allow(clippy::too_many_arguments)]
 async fn hand_on<L>(
     config: &SessionConfig,
@@ -674,6 +680,11 @@ where
         // Filled in below, once the check has run.
         authentication_results: String::new(),
         last_reply: None,
+        // Nothing has been attempted yet, and this envelope is only stored
+        // if part of the delivery below defers — the `held` copy at the foot
+        // of this function is where the schedule is set.
+        attempts: 0,
+        next_attempt_unix_ms: 0,
     };
 
     // The message's own trace, read before anything leaves: the loop that
@@ -945,6 +956,11 @@ where
     // recipients at two hosts are stuck for two different reasons, and an
     // operator reading the sidecar has to be able to tell which belongs to
     // which.
+    // The attempt that just deferred is the first one, so the wait before
+    // the second is `backoff(1)` and not `backoff(0)`: counting from zero
+    // would have the queue runner knock on the same destination twice inside
+    // five minutes, which is how a deferral becomes a rate limit.
+    let attempts = 1;
     let held = Envelope {
         to: verdict
             .hold
@@ -959,18 +975,21 @@ where
                 .collect::<Vec<_>>()
                 .join("; "),
         ),
+        attempts,
+        next_attempt_unix_ms: now_unix_ms() + config.queue.backoff(attempts).as_millis() as u64,
         ..envelope.clone()
     };
     match spool.store(&held, &body).await {
         // Error level because nothing collects these yet: until the
         // retry-queue milestone they sit in `queue/`, and an operator has to
         // be able to see that they are there.
-        Ok(()) => error!(
+        Ok(()) => warn!(
             %peer,
             id = %held.id,
             held = held.to.join(", "),
-            "part of the message was not delivered and is held in the queue with no \
-             retry: {}",
+            minutes = config.queue.backoff(attempts).as_secs() / 60,
+            "part of the message was not delivered and is held in the queue for the \
+             runner to retry: {}",
             held.last_reply.as_deref().unwrap_or("no reason recorded")
         ),
         // The sender is still told 250: the copies that did arrive have
@@ -1345,6 +1364,7 @@ mod tests {
             handshake_timeout: Duration::from_secs(10),
             ptr_timeout: Duration::from_secs(10),
             relay_budget: RELAY_BUDGET,
+            queue: crate::queue::Schedule::default(),
             auth_enabled,
             limits: Limits::default(),
         };
@@ -2386,6 +2406,7 @@ mod tests {
             handshake_timeout: Duration::from_millis(50),
             ptr_timeout: Duration::from_secs(10),
             relay_budget: RELAY_BUDGET,
+            queue: crate::queue::Schedule::default(),
             auth_enabled: true,
             limits: Limits::default(),
         };
@@ -2623,6 +2644,7 @@ mod tests {
             handshake_timeout: Duration::from_millis(200),
             ptr_timeout: Duration::from_secs(10),
             relay_budget: RELAY_BUDGET,
+            queue: crate::queue::Schedule::default(),
             auth_enabled: true,
             limits: Limits::default(),
         };

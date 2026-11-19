@@ -190,3 +190,41 @@ noreply = { reject = "550 5.1.1 this address does not accept mail" }
 # `enabled = false`: with no lookups there is no result to enforce, and the
 # pair reads like a setting without being one.
 # enforce = "dmarc"
+
+# When a message a destination deferred is tried again, and how long mxhop
+# keeps trying. The whole table is optional, and these are the defaults.
+#
+# What ends up in the queue is a message that was accepted — the sending
+# server was told 250 and will never send it again — so the copy on this disk
+# is the only one. mxhop reads `queue/` every `sweep_seconds` and tries
+# whatever is due; only the recipients still deferring are retried, so nobody
+# is sent a second copy of a message they already have.
+#
+# [queue]
+#
+# The wait before each attempt after the first, in minutes. The last interval
+# repeats for as long as the message is queued, so this list is a whole
+# schedule and not the start of one: one minute, five, fifteen, an hour, then
+# every four hours.
+#
+# One minute first because what is usually being waited out is a greylist,
+# and a greylist clears in a minute. Shorter than that for the later ones is
+# how a forwarder earns a rate limit of its own.
+# retry_minutes = [1, 5, 15, 60, 240]
+#
+# How long a message may stay in the queue. After this mxhop stops trying and
+# moves both files to `frozen/`, where they stay readable — nothing is
+# deleted, because an accepted message is somebody's mail and this is the only
+# copy of it, and mxhop cannot yet send a delivery report to say it gave up.
+#
+# It has to fit inside the SRS window: the rewritten sender a destination
+# bounces to is only valid for `srs.max_age_days`, so `mxhop check` refuses a
+# lifetime longer than that — a last attempt made after it has expired
+# provokes a bounce that comes back to an address mxhop no longer recognises,
+# and the report is lost.
+# lifetime_hours = 48
+#
+# How often the queue is read from disk. The schedule lives in the envelopes,
+# so this is only the resolution of the clock that reads them: there is no
+# gain in reading a queue of intervals measured in minutes every second.
+# sweep_seconds = 60
