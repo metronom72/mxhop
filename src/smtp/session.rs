@@ -518,6 +518,7 @@ where
         next_attempt_unix_ms: 0,
         via: BTreeMap::new(),
         sender_authenticated: false,
+        arc: String::new(),
     };
 
     let head = policy::Head::scan(&body, &config.hostname);
@@ -569,6 +570,7 @@ where
     };
     let envelope = Envelope {
         authentication_results: results.clone(),
+        arc: auth.arc.clone(),
         sender_authenticated: auth.checked
             && crate::dsn::proves_sender(&auth, envelope.from.as_deref()),
         ..envelope
@@ -633,7 +635,8 @@ where
 
     let body: std::sync::Arc<[u8]> = body.into();
 
-    let mut prepended = received.clone();
+    let mut prepended = envelope.arc.clone();
+    prepended.push_str(&received);
     prepended.push_str(&results);
 
     let mut outcomes = Vec::with_capacity(plan.groups.len());
@@ -1860,6 +1863,71 @@ mod tests {
         assert!(queued[0].via.is_empty(), "{:?}", queued[0].via);
     }
 
+    fn sealing(set: &str) -> Auth {
+        Auth {
+            arc: set.to_string(),
+            checked: true,
+            ..Auth::default()
+        }
+    }
+
+    const SET: &str = "ARC-Seal: i=1; cv=none; d=mx.test; s=arc1; b=AAAA\r\n\
+                       ARC-Message-Signature: i=1; d=mx.test; s=arc1; b=BBBB\r\n\
+                       ARC-Authentication-Results: i=1; mx.test; spf=pass\r\n";
+
+    #[tokio::test]
+    async fn the_seal_goes_on_the_wire_above_our_own_trace() {
+        let talk = talk_with(fake_with(sealing(SET)), 26_214_400, DELIVER).await;
+
+        let head = String::from_utf8(talk.relay.only().head).unwrap();
+        let seal = head.find("ARC-Seal:").expect("the seal is there");
+        let received = head.find("Received:").expect("the trace is there");
+        let results = head
+            .find("Authentication-Results: mx.test")
+            .expect("our results are there");
+
+        assert!(
+            seal < received && received < results,
+            "the newest hop's seal sits above the trace it covers: {head}"
+        );
+        assert!(
+            !talk.relay.only().body.windows(9).any(|w| w == b"ARC-Seal:"),
+            "the seal is prepended on the wire, never written into the stored message"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_held_copy_keeps_the_seal_so_the_retry_sends_the_same_bytes() {
+        let t = talk_with(
+            Fake {
+                auth: sealing(SET),
+                ..Fake::answering(
+                    "fastmail.test",
+                    client::Verdict::Deferred(theirs(451, "4.3.2", "Try again later")),
+                )
+            },
+            26_214_400,
+            "EHLO x.test\r\nMAIL FROM:<a@b.test>\r\nRCPT TO:<team@example.com>\r\n\
+             DATA\r\nbody\r\n.\r\nQUIT\r\n",
+        )
+        .await;
+
+        let queued = t.spool.queued().await.unwrap();
+        assert_eq!(
+            queued[0].arc, SET,
+            "a retry that re-sealed would seal twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_a_key_nothing_is_put_in_front_of_the_trace() {
+        let talk = talk_with(fake_with(sealing("")), 26_214_400, DELIVER).await;
+
+        let head = String::from_utf8(talk.relay.only().head).unwrap();
+        assert!(!head.contains("ARC-"), "{head}");
+        assert!(head.starts_with("Received:"), "{head}");
+    }
+
     #[tokio::test]
     async fn a_destinations_multi_line_refusal_is_refolded_for_the_sender() {
         let refusal = client::Reply {
@@ -2677,6 +2745,7 @@ mod tests {
             },
             checked: true,
             dkim_timed_out: false,
+            arc: String::new(),
         }
     }
 

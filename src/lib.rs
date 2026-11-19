@@ -1,4 +1,5 @@
 pub mod activation;
+pub mod arc;
 pub mod auth;
 pub mod config;
 pub mod dns;

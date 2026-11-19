@@ -26,6 +26,14 @@ pub struct Envelope {
     pub via: BTreeMap<String, String>,
     #[serde(default)]
     pub sender_authenticated: bool,
+    /// The ARC set mxhop sealed for this message, prepended on the wire above
+    /// `received` and never stored in the message file.
+    ///
+    /// Kept here for the reason `received` is: a seal covers bytes, and a
+    /// retry that sealed again would produce a different one for the same
+    /// hop. Empty when no ARC key is configured.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub arc: String,
 }
 
 impl Envelope {
@@ -61,6 +69,7 @@ mod tests {
             next_attempt_unix_ms: 0,
             via: BTreeMap::new(),
             sender_authenticated: false,
+            arc: String::new(),
         }
     }
 

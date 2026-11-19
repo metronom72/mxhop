@@ -28,6 +28,7 @@ pub struct Config {
     pub srs: Option<SrsSettings>,
     pub queue: Schedule,
     pub auth: AuthSettings,
+    pub arc: Option<ArcSettings>,
     pub observe: Option<SocketAddr>,
 }
 
@@ -44,6 +45,14 @@ impl Default for AuthSettings {
             enforce: Enforce::Dmarc,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArcSettings {
+    pub domain: String,
+    pub selector: String,
+    pub key_file: PathBuf,
+    pub line: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -196,6 +205,52 @@ pub fn load_str(src: &str) -> Result<Config, Vec<Problem>> {
             certificate: tls.certificate.get_ref().clone(),
             key: tls.key.get_ref().clone(),
             line: line_of_text(src, "[tls]"),
+        }
+    });
+
+    let arc = raw.arc.as_ref().map(|arc| {
+        let domain = arc.domain.get_ref().to_ascii_lowercase();
+        if !is_qualified(&domain) {
+            problems.push(at(
+                src,
+                arc.domain.span(),
+                format!(
+                    "arc.domain must be a fully qualified name, like example.com — \
+                     {:?} is not, and it is the domain whose DNS has to carry the \
+                     public key a receiver checks the seal against",
+                    arc.domain.get_ref()
+                ),
+            ));
+        }
+        let selector = arc.selector.get_ref().to_ascii_lowercase();
+        if !is_selector(&selector) {
+            problems.push(at(
+                src,
+                arc.selector.span(),
+                format!(
+                    "arc.selector must be letters, digits, hyphens or underscores — \
+                     {:?} is not, and it becomes a DNS label",
+                    arc.selector.get_ref()
+                ),
+            ));
+        }
+        if !arc.key_file.get_ref().is_absolute() {
+            problems.push(at(
+                src,
+                arc.key_file.span(),
+                format!(
+                    "arc.key_file must be an absolute path: {} depends on the working \
+                     directory, and a signing key read from the wrong file means every \
+                     seal this host writes is worthless",
+                    arc.key_file.get_ref().display()
+                ),
+            ));
+        }
+        ArcSettings {
+            domain,
+            selector,
+            key_file: arc.key_file.get_ref().clone(),
+            line: line_at(src, arc.domain.span().start).into(),
         }
     });
 
@@ -658,6 +713,7 @@ pub fn load_str(src: &str) -> Result<Config, Vec<Problem>> {
         srs,
         queue,
         auth,
+        arc,
         observe,
     })
 }
@@ -702,6 +758,13 @@ fn find_loop(router: &Router, domain: &str, local: &str) -> Option<Found> {
     }
 
     go(router, domain, local, &mut Vec::new())
+}
+
+fn is_selector(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 63
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 fn is_usable_local_part(s: &str) -> bool {
@@ -759,6 +822,7 @@ struct Raw {
     domains: BTreeMap<String, RawDomain>,
     tls: Option<RawTls>,
     srs: Option<RawSrs>,
+    arc: Option<RawArc>,
     auth: Option<RawAuth>,
     queue: Option<RawQueue>,
     observe: Option<RawObserve>,
@@ -784,6 +848,14 @@ struct RawSrs {
     domain: Spanned<String>,
     secret_file: Spanned<PathBuf>,
     max_age_days: Option<Spanned<u32>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawArc {
+    domain: Spanned<String>,
+    selector: Spanned<String>,
+    key_file: Spanned<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1230,6 +1302,76 @@ other = { to = "other@dorokhovich.ru", via = "aspmx.l.google.com" }
             "{found:#?}"
         );
         assert_eq!(problem_line(&found[0]), line_with(&src, "9090"));
+    }
+
+    #[test]
+    fn an_arc_block_is_optional_and_normalises_its_names() {
+        assert_eq!(load_str(MINIMAL).expect("loads").arc, None);
+
+        let src = format!(
+            "{MINIMAL}\n[arc]\ndomain = \"Example.COM\"\nselector = \"Arc1\"\n\
+             key_file = \"/etc/mxhop/arc.key\"\n"
+        );
+        let arc = load_str(&src).expect("loads").arc.expect("an arc block");
+
+        assert_eq!(arc.domain, "example.com");
+        assert_eq!(arc.selector, "arc1");
+        assert_eq!(arc.key_file, PathBuf::from("/etc/mxhop/arc.key"));
+    }
+
+    #[test]
+    fn an_arc_domain_that_is_not_qualified_is_reported_with_its_line() {
+        let src = format!(
+            "{MINIMAL}\n[arc]\ndomain = \"localhost\"\nselector = \"arc1\"\n\
+             key_file = \"/etc/mxhop/arc.key\"\n"
+        );
+        let found = problems(&src);
+
+        assert!(found.iter().any(|p| p.contains("arc.domain")), "{found:#?}");
+        assert_eq!(problem_line(&found[0]), line_with(&src, "localhost"));
+    }
+
+    #[test]
+    fn an_arc_selector_that_cannot_be_a_dns_label_is_refused() {
+        for bad in ["arc 1", "arc.1", "", "arc/1"] {
+            let src = format!(
+                "{MINIMAL}\n[arc]\ndomain = \"example.com\"\nselector = \"{bad}\"\n\
+                 key_file = \"/etc/mxhop/arc.key\"\n"
+            );
+            let found = problems(&src);
+            assert!(
+                found.iter().any(|p| p.contains("arc.selector")),
+                "a selector becomes a DNS label, so {bad:?} cannot be one: {found:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_arc_key_file_that_is_relative_is_refused() {
+        let src = format!(
+            "{MINIMAL}\n[arc]\ndomain = \"example.com\"\nselector = \"arc1\"\n\
+             key_file = \"arc.key\"\n"
+        );
+        let found = problems(&src);
+
+        assert!(
+            found.iter().any(|p| p.contains("absolute path")),
+            "{found:#?}"
+        );
+    }
+
+    #[test]
+    fn a_misspelled_arc_key_is_refused_rather_than_ignored() {
+        let src = format!(
+            "{MINIMAL}\n[arc]\ndomain = \"example.com\"\nselector = \"arc1\"\n\
+             key_file = \"/etc/mxhop/arc.key\"\nkeyfile = \"/etc/mxhop/other.key\"\n"
+        );
+        let found = problems(&src);
+
+        assert!(
+            !found.is_empty(),
+            "a key nothing reads must not pass silently"
+        );
     }
 
     #[test]

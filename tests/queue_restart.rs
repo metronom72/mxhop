@@ -37,6 +37,7 @@ fn held(id_hint: &str) -> Envelope {
         next_attempt_unix_ms: 0,
         via: Default::default(),
         sender_authenticated: true,
+        arc: String::new(),
     }
 }
 
@@ -137,8 +138,12 @@ async fn restart(root: &PathBuf, relay: Fake) -> (Runner<Fake>, Arc<Spool>, Arc<
 fn delivered_bytes(delivery: &Delivery, envelope: &Envelope) -> Vec<u8> {
     assert_eq!(
         String::from_utf8(delivery.head.clone()).unwrap(),
-        format!("{}{}", envelope.received, envelope.authentication_results),
-        "a retry has to carry the trace written when the message arrived"
+        format!(
+            "{}{}{}",
+            envelope.arc, envelope.received, envelope.authentication_results
+        ),
+        "a retry has to carry the trace and the seal written when the message \
+         arrived, in that order"
     );
     delivery.body.to_vec()
 }

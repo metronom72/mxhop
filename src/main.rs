@@ -98,6 +98,14 @@ async fn check(cli: &Cli) -> ExitCode {
         }
     };
 
+    let arc = match open_arc(&config) {
+        Ok(arc) => arc,
+        Err(problem) => {
+            report(cli, &[problem]);
+            return ExitCode::FAILURE;
+        }
+    };
+
     if let Some(settings) = config.srs.as_ref() {
         warn_about_secret_mode(&settings.secret_file);
     }
@@ -170,8 +178,12 @@ async fn check(cli: &Cli) -> ExitCode {
         Some(address) => format!(", /metrics and /healthz on {address}"),
         None => ", no metrics or health endpoint".to_string(),
     };
+    let sealing = match &arc {
+        Some(sealer) => format!(", ARC sealed as {}", sealer.domain()),
+        None => ", no ARC seal".to_string(),
+    };
     println!(
-        "{}: ok — {} on {}, {} {} for {}{}{}{}{}{}",
+        "{}: ok — {} on {}, {} {} for {}{}{}{}{}{}{}",
         cli.config.display(),
         config.hostname,
         config.listen,
@@ -206,8 +218,17 @@ async fn check(cli: &Cli) -> ExitCode {
                 ", SPF/DKIM/DMARC checked and stamped, never refused".to_string(),
         },
         retries,
+        sealing,
         observe,
     );
+
+    if let Some(sealer) = &arc {
+        println!(
+            "{}: publish the ARC public key as a TXT record at {}",
+            cli.config.display(),
+            sealer.record_name()
+        );
+    }
     ExitCode::SUCCESS
 }
 
@@ -247,6 +268,18 @@ fn warn_about_secret_mode(path: &std::path::Path) {
             );
         }
     }
+}
+
+fn open_arc(config: &Config) -> Result<Option<Arc<mxhop::arc::Sealer>>, Problem> {
+    let Some(settings) = config.arc.as_ref() else {
+        return Ok(None);
+    };
+    mxhop::arc::Sealer::open(&settings.domain, &settings.selector, &settings.key_file)
+        .map(|sealer| Some(Arc::new(sealer)))
+        .map_err(|e| Problem {
+            line: settings.line,
+            message: e.to_string(),
+        })
 }
 
 fn open_srs(config: &Config) -> Result<Option<Srs>, Problem> {
@@ -299,9 +332,25 @@ async fn run(cli: &Cli) -> ExitCode {
         }
     };
 
+    let arc = match open_arc(&config) {
+        Ok(arc) => arc,
+        Err(problem) => {
+            error!("{}", problem.message);
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Some(sealer) = &arc {
+        info!(
+            domain = sealer.domain(),
+            selector = sealer.selector(),
+            record = sealer.record_name(),
+            "sealing forwarded mail with ARC"
+        );
+    }
+
     let verifier = if config.auth.enabled {
         match mxhop::auth::Verifier::from_system(&config.hostname) {
-            Ok(verifier) => Some(verifier),
+            Ok(verifier) => Some(verifier.sealing_with(arc.clone())),
             Err(e) => {
                 error!("cannot build a resolver for SPF, DKIM and DMARC: {e}");
                 return ExitCode::FAILURE;

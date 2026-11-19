@@ -42,6 +42,7 @@ between.
 | `spool.rs` | `queue/`, `tmp/`, `frozen/`, and the write-then-rename |
 | `queue.rs` | the retry schedule and the per-host backoff |
 | `srs.rs` | sender rewriting, and accepting the bounces that come back |
+| `arc.rs` | the ARC signing key, and the record an operator publishes |
 | `dsn.rs` | delivery reports, and the rule that keeps them from being spam |
 | `observe.rs`, `metrics.rs` | `/healthz`, `/metrics` |
 | `shutdown.rs`, `activation.rs` | stopping without cutting a session; taking a socket from systemd |
