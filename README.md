@@ -31,6 +31,7 @@ been proved end to end. Do not point an MX record at it.
 | SPF/DKIM/DMARC and `Authentication-Results` | done |
 | Queue, retries, per-host backoff | done |
 | Delivery reports (DSN) | done |
+| Metrics, health, graceful stop | done |
 | DSNs for queued failures | planned |
 | Metrics, health, graceful shutdown — **0.2** | planned |
 | ARC sealing | planned |
@@ -371,6 +372,64 @@ tried again at once — and if the destination had already accepted it, that is
 a second copy. The window is one message wide, and closing it means recording
 an attempt before it is made rather than after, which is a change to what the
 envelope holds and not to the runner.
+
+## Watching it, and stopping it
+
+### `/metrics` and `/healthz`
+
+```toml
+[observe]
+listen = "127.0.0.1:9090"
+```
+
+Leave the block out and no HTTP listener is opened at all. Bind it to
+loopback or to a private interface: it is unauthenticated, and `check`
+refuses a port shared with SMTP.
+
+`/metrics` is the Prometheus text format: counters for sessions, messages,
+recipient outcomes, queue sweeps, freezes, reports and DMARC refusals; gauges
+for queue depth and open sessions; histograms for session and delivery
+duration. **No addresses, ever** — not in a value and not in a label. An
+address in a label publishes the mail log to whoever can read the endpoint,
+and blows the cardinality up besides. A test asserts the rendered output
+contains no `@`.
+
+`/healthz` is `200` or `503`, and says which part is unhappy:
+
+```
+ok
+listener: ok
+spool: ok
+queue: 3/100000
+resolver: ok
+```
+
+A `503` means one of: the SMTP listener is not accepting, the spool cannot be
+read or written, the queue is at its limit, or the resolver stopped
+answering.
+
+**A failed certificate reload is not one of them.** `SIGHUP` with a broken or
+unreadable certificate on disk logs a warning and keeps serving the pair
+already loaded — so the process is still delivering mail, and telling an
+orchestrator to kill it would turn a typo in a renewal hook into an outage.
+`a_failed_certificate_reload_does_not_take_healthz_down` pins that.
+
+### Stopping
+
+`SIGTERM` (or `SIGINT`):
+
+1. the listener stops accepting — a connection that arrives after this gets
+   nothing;
+2. a session **inside `DATA`** finishes: the message is taken, delivered or
+   queued, and answered normally. Half a message is never a message;
+3. a session waiting for its next command gets
+   `421 4.3.2 this server is shutting down`, which a sending server reads as
+   "come back", not as a failure;
+4. the process waits up to **25 seconds** for the rest and then exits anyway.
+
+Twenty-five rather than thirty so that the whole thing finishes inside a
+default `stop_grace_period: 30s` with room to spare — a deploy that reaches
+the `SIGKILL` is a deploy that cuts a session in half.
 
 ## When mail cannot be delivered: who is told
 

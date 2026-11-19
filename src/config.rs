@@ -28,6 +28,7 @@ pub struct Config {
     pub srs: Option<SrsSettings>,
     pub queue: Schedule,
     pub auth: AuthSettings,
+    pub observe: Option<SocketAddr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,6 +122,34 @@ pub fn load_str(src: &str) -> Result<Config, Vec<Problem>> {
                 raw.listen.get_ref()
             ),
         ));
+    }
+
+    let mut observe = None;
+    if let Some(raw_observe) = &raw.observe {
+        match raw_observe.listen.get_ref().parse::<SocketAddr>() {
+            Ok(address) => observe = Some(address),
+            Err(_) => problems.push(at(
+                src,
+                raw_observe.listen.span(),
+                format!(
+                    "observe.listen must be an address and a port, like 127.0.0.1:9090 \
+                     — {:?} is not",
+                    raw_observe.listen.get_ref()
+                ),
+            )),
+        }
+        if let Some(address) = observe
+            && Some(address) == listen
+        {
+            problems.push(at(
+                src,
+                raw_observe.listen.span(),
+                format!(
+                    "observe.listen is {address}, which is where SMTP listens; metrics \
+                     and health must not share a port with mail"
+                ),
+            ));
+        }
     }
 
     let spool_dir = raw.spool_dir.get_ref().clone();
@@ -629,6 +658,7 @@ pub fn load_str(src: &str) -> Result<Config, Vec<Problem>> {
         srs,
         queue,
         auth,
+        observe,
     })
 }
 
@@ -731,6 +761,13 @@ struct Raw {
     srs: Option<RawSrs>,
     auth: Option<RawAuth>,
     queue: Option<RawQueue>,
+    observe: Option<RawObserve>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawObserve {
+    listen: Spanned<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1158,6 +1195,41 @@ other = { to = "other@dorokhovich.ru", via = "aspmx.l.google.com" }
             hosts["aspmx.l.google.com"],
             vec!["mikhail@dorokhovich.com", "other@dorokhovich.com"]
         );
+    }
+
+    #[test]
+    fn an_observe_block_is_optional_and_parses_an_address() {
+        assert_eq!(load_str(MINIMAL).expect("loads").observe, None);
+
+        let src = format!("{MINIMAL}\n[observe]\nlisten = \"127.0.0.1:9090\"\n");
+        assert_eq!(
+            load_str(&src).expect("loads").observe,
+            Some("127.0.0.1:9090".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn an_observe_port_shared_with_smtp_is_refused() {
+        let src = format!("{MINIMAL}\n[observe]\nlisten = \"0.0.0.0:25\"\n");
+        let found = problems(&src);
+
+        assert!(
+            found.iter().any(|p| p.contains("where SMTP listens")),
+            "an unauthenticated metrics endpoint on the mail port would answer \
+             anyone who connects: {found:#?}"
+        );
+    }
+
+    #[test]
+    fn an_observe_listen_that_is_not_an_address_is_reported_with_its_line() {
+        let src = format!("{MINIMAL}\n[observe]\nlisten = \"9090\"\n");
+        let found = problems(&src);
+
+        assert!(
+            found.iter().any(|p| p.contains("observe.listen")),
+            "{found:#?}"
+        );
+        assert_eq!(problem_line(&found[0]), line_with(&src, "9090"));
     }
 
     #[test]

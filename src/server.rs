@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::net::TcpListener;
 use tracing::{info, warn};
@@ -19,11 +20,22 @@ pub async fn accept_loop<L>(
     spool: Arc<Spool>,
     relay: Arc<L>,
     tls: Option<Arc<Holder>>,
+    mut shutdown: crate::shutdown::Shutdown,
+    tracker: crate::shutdown::Tracker,
 ) where
     L: Relay + Send + Sync + 'static,
 {
     loop {
-        let (stream, peer) = match listener.accept().await {
+        let accepted = tokio::select! {
+            biased;
+            () = shutdown.wait() => {
+                info!("no longer accepting connections; open sessions are being let finish");
+                return;
+            }
+            accepted = listener.accept() => accepted,
+        };
+
+        let (stream, peer) = match accepted {
             Ok(accepted) => accepted,
             Err(e) => {
                 warn!("accept failed: {e}");
@@ -38,8 +50,15 @@ pub async fn accept_loop<L>(
         let srs = srs.clone();
         let spool = Arc::clone(&spool);
         let relay = Arc::clone(&relay);
+        let mut shutdown = shutdown.clone();
+        let tracker = tracker.clone();
         tokio::spawn(async move {
+            let _tracker = tracker;
             let peer = peer.to_string();
+            let started = std::time::Instant::now();
+            crate::metrics::SESSIONS.hit();
+            crate::metrics::SESSIONS_OPEN.set(OPEN.fetch_add(1, Ordering::Relaxed) + 1);
+            let _open = Closing;
             match session::serve(
                 stream,
                 peer.clone(),
@@ -49,18 +68,39 @@ pub async fn accept_loop<L>(
                 &spool,
                 relay.as_ref(),
                 acceptor,
+                &mut shutdown,
             )
             .await
             {
-                Ok(outcome) => info!(
-                    %peer,
-                    accepted = outcome.accepted,
-                    quit = outcome.quit,
-                    tls = outcome.tls,
-                    "session ended"
-                ),
-                Err(e) => warn!(%peer, "session failed: {e}"),
+                Ok(outcome) => {
+                    if outcome.tls {
+                        crate::metrics::SESSIONS_TLS.hit();
+                    }
+                    crate::metrics::SESSION_SECONDS.took(started.elapsed());
+                    info!(
+                        %peer,
+                        accepted = outcome.accepted,
+                        quit = outcome.quit,
+                        tls = outcome.tls,
+                        "session ended"
+                    )
+                }
+                Err(e) => {
+                    crate::metrics::SESSIONS_FAILED.hit();
+                    crate::metrics::SESSION_SECONDS.took(started.elapsed());
+                    warn!(%peer, "session failed: {e}")
+                }
             }
         });
+    }
+}
+
+static OPEN: AtomicU64 = AtomicU64::new(0);
+
+struct Closing;
+
+impl Drop for Closing {
+    fn drop(&mut self) {
+        crate::metrics::SESSIONS_OPEN.set(OPEN.fetch_sub(1, Ordering::Relaxed) - 1);
     }
 }

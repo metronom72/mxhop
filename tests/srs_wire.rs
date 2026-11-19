@@ -148,6 +148,7 @@ async fn serve_mxhop(srs: Srs, sink_port: u16) -> (u16, Spool) {
                     &spool,
                     relay.as_ref(),
                     None,
+                    &mut mxhop::shutdown::Shutdown::never(),
                 )
                 .await
                 .ok();

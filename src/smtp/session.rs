@@ -110,6 +110,7 @@ pub async fn serve<S, L>(
     spool: &Spool,
     relay: &L,
     tls: Option<TlsAcceptor>,
+    shutdown: &mut crate::shutdown::Shutdown,
 ) -> Result<Outcome, WireError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -134,6 +135,7 @@ where
         relay,
         &peer,
         &tls,
+        shutdown,
     )
     .await?
     {
@@ -184,6 +186,7 @@ where
         relay,
         &peer,
         &tls,
+        shutdown,
     )
     .await?;
 
@@ -205,13 +208,25 @@ async fn talk<S, L>(
     relay: &L,
     peer: &str,
     tls: &Option<TlsAcceptor>,
+    shutdown: &mut crate::shutdown::Shutdown,
 ) -> Result<Step, WireError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
     L: Relay,
 {
     loop {
-        let line = match timeout(config.command_timeout, wire::read_line(reader)).await {
+        let read = timeout(config.command_timeout, wire::read_line(reader));
+        let line = tokio::select! {
+            biased;
+            () = shutdown.wait() => {
+                say(
+                    reader.get_mut(),
+                    "421 4.3.2 this server is shutting down; please try again",
+                )
+                .await?;
+                return Ok(Step::Done);
+            }
+            read = read => match read {
             Err(_) => {
                 say(reader.get_mut(), "421 4.4.2 timeout waiting for a command").await?;
                 return Ok(Step::Done);
@@ -223,6 +238,7 @@ where
                 return Ok(Step::Done);
             }
             Ok(Err(e)) => return Err(e),
+            },
         };
 
         let command = match command::parse(&line) {
@@ -621,6 +637,7 @@ where
 
     let mut outcomes = Vec::with_capacity(plan.groups.len());
     for group in &plan.groups {
+        let started = std::time::Instant::now();
         outcomes.push(
             relay
                 .deliver(
@@ -635,10 +652,25 @@ where
                 )
                 .await,
         );
+        crate::metrics::DELIVERY_SECONDS.took(started.elapsed());
     }
 
     let verdict = policy::reply_for(&outcomes, &envelope.id);
     let delivered = (200..300).contains(&verdict.reply.code);
+    if delivered {
+        crate::metrics::MESSAGES_ACCEPTED.hit();
+    } else {
+        crate::metrics::MESSAGES_REFUSED.hit();
+    }
+    for outcome in &outcomes {
+        for result in &outcome.results {
+            match result.verdict {
+                client::Verdict::Accepted => crate::metrics::RECIPIENTS_DELIVERED.hit(),
+                client::Verdict::Deferred(_) => crate::metrics::RECIPIENTS_DEFERRED.hit(),
+                client::Verdict::Refused(_) => crate::metrics::RECIPIENTS_REFUSED.hit(),
+            }
+        }
+    }
 
     for (mailbox, reply) in &verdict.lost {
         error!(
@@ -661,18 +693,24 @@ where
         )
         .await
         {
-            Ok(id) => info!(
-                %peer,
-                id = %envelope.id,
-                report = %id,
-                "a delivery report for the refused copies is in the queue"
-            ),
-            Err(why) => warn!(
-                %peer,
-                id = %envelope.id,
-                from = envelope.from.as_deref().unwrap_or("<>"),
-                "no delivery report is being sent for the refused copies: {why}"
-            ),
+            Ok(id) => {
+                crate::metrics::REPORTS_SENT.hit();
+                info!(
+                    %peer,
+                    id = %envelope.id,
+                    report = %id,
+                    "a delivery report for the refused copies is in the queue"
+                )
+            }
+            Err(why) => {
+                crate::metrics::REPORTS_SUPPRESSED.hit();
+                warn!(
+                    %peer,
+                    id = %envelope.id,
+                    from = envelope.from.as_deref().unwrap_or("<>"),
+                    "no delivery report is being sent for the refused copies: {why}"
+                )
+            }
         }
     }
 
@@ -1058,6 +1096,7 @@ mod tests {
                 &spool_for_task,
                 &relay_for_task,
                 None,
+                &mut crate::shutdown::Shutdown::never(),
             )
             .await
         });
@@ -2036,6 +2075,7 @@ mod tests {
                 &spool,
                 &Fake::accepting(),
                 None,
+                &mut crate::shutdown::Shutdown::never(),
             )
             .await
         });
@@ -2260,6 +2300,7 @@ mod tests {
                 &spool_for_task,
                 &Fake::accepting(),
                 Some(acceptor),
+                &mut crate::shutdown::Shutdown::never(),
             )
             .await
         });

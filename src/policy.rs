@@ -266,7 +266,11 @@ fn check_authentication(auth: &Auth, enforce: Enforce) -> Option<Reply> {
         return None;
     }
 
-    authentication_reply(auth)
+    let reply = authentication_reply(auth);
+    if reply.is_some() {
+        crate::metrics::AUTH_REFUSALS.hit();
+    }
+    reply
 }
 
 pub(crate) fn authentication_reply(auth: &Auth) -> Option<Reply> {
