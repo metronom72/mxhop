@@ -360,6 +360,7 @@ async fn run(cli: &Cli) -> ExitCode {
             Arc::clone(&relay),
             srs.clone(),
             config.queue.clone(),
+            config.hostname.clone(),
         )
         .run(),
     );

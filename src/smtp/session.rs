@@ -500,6 +500,7 @@ where
         attempts: 0,
         next_attempt_unix_ms: 0,
         via: BTreeMap::new(),
+        sender_authenticated: false,
     };
 
     let head = policy::Head::scan(&body, &config.hostname);
@@ -551,6 +552,8 @@ where
     };
     let envelope = Envelope {
         authentication_results: results.clone(),
+        sender_authenticated: auth.checked
+            && crate::dsn::proves_sender(&auth, envelope.from.as_deref()),
         ..envelope
     };
 
@@ -642,10 +645,35 @@ where
             %peer,
             id = %envelope.id,
             recipient = %mailbox,
-            "this copy was permanently refused and is lost: part of the message was \
-             delivered, so the sending server was told 250 and will not send it again, \
-             and mxhop cannot send a bounce of its own yet: {reply}"
+            "this copy was permanently refused: part of the message was delivered, so \
+             the sending server was told 250 and will not send it again: {reply}"
         );
+    }
+
+    if !verdict.lost.is_empty() {
+        match crate::dsn::send(
+            spool,
+            &config.hostname,
+            &envelope,
+            &verdict.lost,
+            crate::dsn::Refused::Permanently,
+            now_unix_ms(),
+        )
+        .await
+        {
+            Ok(id) => info!(
+                %peer,
+                id = %envelope.id,
+                report = %id,
+                "a delivery report for the refused copies is in the queue"
+            ),
+            Err(why) => warn!(
+                %peer,
+                id = %envelope.id,
+                from = envelope.from.as_deref().unwrap_or("<>"),
+                "no delivery report is being sent for the refused copies: {why}"
+            ),
+        }
     }
 
     if verdict.hold.is_empty() {
@@ -2498,6 +2526,89 @@ mod tests {
             auth,
             ..Fake::accepting()
         }
+    }
+
+    fn spf_passing() -> Auth {
+        Auth {
+            spf_mail: Spf::Pass,
+            spf_helo: Spf::Pass,
+            mail_from: Some("sender@elsewhere.test".into()),
+            helo: Some("mail.elsewhere.test".into()),
+            checked: true,
+            ..Auth::default()
+        }
+    }
+
+    fn spf_failing() -> Auth {
+        Auth {
+            spf_mail: Spf::Fail,
+            checked: true,
+            ..spf_passing()
+        }
+    }
+
+    const LOST: &str = "EHLO mail.elsewhere.test\r\n\
+                        MAIL FROM:<sender@elsewhere.test>\r\n\
+                        RCPT TO:<team@example.com>\r\n\
+                        DATA\r\nbody\r\n.\r\nQUIT\r\n";
+
+    fn refusing(auth: Auth) -> Fake {
+        Fake {
+            auth,
+            ..Fake::answering(
+                "fastmail.test",
+                client::Verdict::Refused(theirs(550, "5.1.1", "no such user")),
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn a_copy_lost_after_a_250_is_reported_to_a_sender_that_proved_itself() {
+        let t = talk_with(refusing(spf_passing()), 26_214_400, LOST).await;
+
+        assert!(t.out.contains("250 2.0.0 delivered as "), "{}", t.out);
+        let queued = t.spool.queued().await.unwrap();
+        assert_eq!(queued.len(), 1, "the report, and nothing held");
+        assert_eq!(
+            queued[0].from, None,
+            "a report is sent from the null sender"
+        );
+        assert_eq!(queued[0].to, vec!["sender@elsewhere.test".to_string()]);
+
+        let body = String::from_utf8(t.spool.body(&queued[0].id).await.unwrap()).unwrap();
+        assert!(
+            body.contains("Final-Recipient: rfc822; b@fastmail.test"),
+            "{body}"
+        );
+        assert!(
+            body.contains("Diagnostic-Code: smtp; 550 5.1.1 no such user"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_copy_lost_for_a_sender_that_proved_nothing_is_only_logged() {
+        let t = talk_with(refusing(spf_failing()), 26_214_400, LOST).await;
+
+        assert!(t.out.contains("250 2.0.0 delivered as "), "{}", t.out);
+        assert!(
+            t.spool.queued().await.unwrap().is_empty(),
+            "a report here would be mail sent to whoever the envelope named, which \
+             is the backscatter this rule exists to stop"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bounce_that_cannot_be_delivered_is_not_bounced_again() {
+        let script = "EHLO mail.elsewhere.test\r\nMAIL FROM:<>\r\n\
+                      RCPT TO:<team@example.com>\r\nDATA\r\nbody\r\n.\r\nQUIT\r\n";
+        let t = talk_with(refusing(spf_passing()), 26_214_400, script).await;
+
+        assert!(
+            t.spool.queued().await.unwrap().is_empty(),
+            "the null sender has nowhere to send a report, and inventing one is how \
+             a mail loop starts"
+        );
     }
 
     fn verdict(from: &str, result: DmarcVerdict, policy: Option<DmarcPolicy>) -> Auth {

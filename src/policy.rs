@@ -578,6 +578,7 @@ mod tests {
             attempts: 0,
             next_attempt_unix_ms: 0,
             via: Default::default(),
+            sender_authenticated: true,
         }
     }
 

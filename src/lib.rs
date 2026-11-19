@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod config;
 pub mod dns;
+pub mod dsn;
 pub mod envelope;
 pub mod policy;
 pub mod queue;

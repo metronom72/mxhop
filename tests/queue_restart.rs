@@ -36,6 +36,7 @@ fn held(id_hint: &str) -> Envelope {
         attempts: 1,
         next_attempt_unix_ms: 0,
         via: Default::default(),
+        sender_authenticated: true,
     }
 }
 
@@ -123,7 +124,13 @@ fn greylisted() -> Verdict {
 async fn restart(root: &PathBuf, relay: Fake) -> (Runner<Fake>, Arc<Spool>, Arc<Fake>) {
     let spool = Arc::new(Spool::open(root).await.expect("reopen the spool"));
     let relay = Arc::new(relay);
-    let runner = Runner::new(Arc::clone(&spool), Arc::clone(&relay), None, impatient());
+    let runner = Runner::new(
+        Arc::clone(&spool),
+        Arc::clone(&relay),
+        None,
+        impatient(),
+        "mx.test",
+    );
     (runner, spool, relay)
 }
 
