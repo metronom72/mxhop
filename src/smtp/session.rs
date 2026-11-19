@@ -1164,9 +1164,17 @@ mod tests {
             "index 6 has to be inside the MAC of {honest}"
         );
         let mut forged: Vec<char> = honest.chars().collect();
-        forged[6] = if forged[6] == 'A' { 'B' } else { 'A' };
+        forged[6] = if forged[6].eq_ignore_ascii_case(&'A') {
+            'B'
+        } else {
+            'A'
+        };
         let forged: String = forged.into_iter().collect();
-        assert_ne!(forged, honest, "the test has to change something");
+        assert!(
+            !forged.eq_ignore_ascii_case(&honest),
+            "the MAC is compared ignoring case, so turning 'a' into 'A' forges \
+             nothing and this test would pass itself: {honest} -> {forged}"
+        );
 
         let talk = talk_srs(
             &srs,
