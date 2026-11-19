@@ -1,37 +1,17 @@
-//! Finding out where a domain's mail goes.
-//!
-//! Two lookups and one rule: the MX records of a domain, the addresses of a
-//! host, and the knowledge that an answer of "no MX records" is not the same
-//! as "this domain takes no mail". The first means the domain's own address
-//! is its mail exchanger (RFC 5321 §5.1); the second is said explicitly, with
-//! a single MX pointing at the root (RFC 7505), and it is permanent. Getting
-//! those two confused either strands mail that is deliverable or retries for
-//! five days against a domain that told us not to.
-
 use std::future::Future;
 use std::net::IpAddr;
 
 use std::fmt;
 
-/// One mail exchanger, as DNS gave it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Target {
-    /// The host name, lowercased and with the trailing dot removed.
     pub host: String,
-    /// The MX preference. Lower is tried first.
     pub pref: u16,
 }
 
-/// Why a lookup produced nothing.
-///
-/// The split is between an answer and the absence of one: `NotFound` is DNS
-/// saying this name has no such records, which is information. `Failed` is
-/// DNS not answering, which is not.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DnsError {
-    /// NXDOMAIN, or the name exists with no records of this type.
     NotFound,
-    /// A timeout, a SERVFAIL, a broken resolver.
     Failed(String),
 }
 
@@ -44,38 +24,20 @@ impl fmt::Display for DnsError {
     }
 }
 
-/// The two questions delivery asks of DNS. A trait so the tests can answer
-/// them from a table instead of the network.
 pub trait Resolve {
     fn mx(&self, domain: &str) -> impl Future<Output = Result<Vec<Target>, DnsError>> + Send;
     fn addrs(&self, host: &str) -> impl Future<Output = Result<Vec<IpAddr>, DnsError>> + Send;
-    /// The name an address claims, for the `Received` header of an inbound
-    /// session. One name: a trace records what the peer looked like, and a
-    /// list of every PTR record is not a fact about this connection.
-    ///
-    /// Unverified on purpose — the forward lookup that would confirm it is
-    /// another two queries while a sending server waits on us, and nothing is
-    /// decided on the strength of this name. It is written down, and the
-    /// address beside it in the same header is the part that cannot be
-    /// claimed.
     fn ptr(&self, ip: IpAddr) -> impl Future<Output = Result<String, DnsError>> + Send;
 }
 
-/// Why a domain cannot be delivered to at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NoRoute {
-    /// RFC 7505: a single MX pointing at the root. The domain is saying, in
-    /// the only way DNS has of saying it, that it accepts no mail. Retrying
-    /// is pointless, so this is permanent.
     NullMx,
-    /// The domain does not exist, or exists with neither MX nor address.
     NoSuchDomain,
-    /// DNS did not answer. Nothing is known yet, so nothing is decided.
     Unresolvable(String),
 }
 
 impl NoRoute {
-    /// Whether the sender should be told to give up rather than retry.
     pub fn is_permanent(&self) -> bool {
         matches!(self, NoRoute::NullMx | NoRoute::NoSuchDomain)
     }
@@ -91,11 +53,6 @@ impl fmt::Display for NoRoute {
     }
 }
 
-/// The hosts to try for a domain, best first.
-///
-/// Equal preferences are shuffled rather than returned in the order DNS
-/// happened to list them: that is what spreads load across a pair of equal
-/// mail exchangers, and DNS servers do not all rotate the set for us.
 pub async fn targets<R: Resolve>(resolver: &R, domain: &str) -> Result<Vec<Target>, NoRoute> {
     let found = match resolver.mx(domain).await {
         Ok(found) => found,
@@ -108,10 +65,6 @@ pub async fn targets<R: Resolve>(resolver: &R, domain: &str) -> Result<Vec<Targe
     }
 
     if found.is_empty() {
-        // RFC 5321 §5.1: no MX at all means the domain is its own mail
-        // exchanger. Whether it has an address is answered by the connect
-        // loop, which has to resolve the host anyway — asking here would be a
-        // second lookup for the same answer.
         return Ok(vec![Target {
             host: normalise(domain),
             pref: 0,
@@ -120,15 +73,10 @@ pub async fn targets<R: Resolve>(resolver: &R, domain: &str) -> Result<Vec<Targe
 
     let mut found = found;
     shuffle(&mut found);
-    // A stable sort after the shuffle keeps preference authoritative and
-    // leaves the shuffled order inside each tie.
     found.sort_by_key(|t| t.pref);
     Ok(found)
 }
 
-/// RFC 7505: exactly one MX, and its target is the root. Anything else that
-/// merely *contains* a root target is a misconfiguration rather than a
-/// statement, and the other records are still worth trying.
 fn is_null_mx(found: &[Target]) -> bool {
     found.len() == 1 && (found[0].host.is_empty() || found[0].host == ".")
 }
@@ -137,25 +85,16 @@ fn normalise(host: &str) -> String {
     host.trim_end_matches('.').to_ascii_lowercase()
 }
 
-/// A shuffle that needs no dependency and no cryptographic quality: the only
-/// thing asked of it is that two mail exchangers of equal preference do not
-/// always get tried in the same order.
 fn shuffle<T>(items: &mut [T]) {
     if items.len() < 2 {
         return;
     }
-    // The counter is what makes two calls in the same millisecond differ.
-    // Without it the seed is constant for as long as the clock reads the same,
-    // and every message in a burst picks the same exchanger — which is the
-    // thing the shuffle exists to prevent.
     static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let nth = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut state = crate::envelope::now_unix_ms()
         ^ ((std::process::id() as u64) << 32)
         ^ nth.wrapping_mul(0x9e37_79b9_7f4a_7c15);
     for i in (1..items.len()).rev() {
-        // xorshift64; good enough to break a tie, and nothing else rests on
-        // it.
         state ^= state << 13;
         state ^= state >> 7;
         state ^= state << 17;
@@ -163,17 +102,11 @@ fn shuffle<T>(items: &mut [T]) {
     }
 }
 
-// ------------------------------------------------------------------ the real one
-
-/// The resolver the service uses: the system's, through hickory.
 pub struct Hickory {
     inner: hickory_resolver::TokioResolver,
 }
 
 impl Hickory {
-    /// Builds a resolver from the system's own configuration. A forwarder
-    /// that invented its own resolver list would stop agreeing with the host
-    /// it runs on, which is the first thing an operator checks with `dig`.
     pub fn from_system() -> Result<Self, DnsError> {
         let inner = hickory_resolver::Resolver::builder_tokio()
             .map_err(|e| DnsError::Failed(e.to_string()))?
@@ -182,9 +115,6 @@ impl Hickory {
         Ok(Self { inner })
     }
 
-    /// A resolver that asks exactly one nameserver, for the tests. The two
-    /// kinds of A-lookup failure can only be told apart by what a nameserver
-    /// actually answers, so the test needs one it can make answer SERVFAIL.
     #[cfg(test)]
     fn against(server: std::net::SocketAddr) -> Self {
         use hickory_resolver::config::{ConnectionConfig, NameServerConfig, ResolverConfig};
@@ -204,8 +134,6 @@ impl Hickory {
             config,
             hickory_resolver::net::runtime::TokioRuntimeProvider::default(),
         );
-        // One question, one answer: no retries, no fallback to TCP and no
-        // cache, so the test reads back exactly what it scripted.
         builder.options_mut().attempts = 0;
         builder.options_mut().try_tcp_on_error = false;
         builder.options_mut().cache_size = 0;
@@ -223,9 +151,6 @@ impl Resolve for Hickory {
                 .iter()
                 .filter_map(|record| match &record.data {
                     hickory_resolver::proto::rr::RData::MX(mx) => Some(mx),
-                    // A CNAME or anything else in the answer section is not a
-                    // mail exchanger, and an MX query can come back with
-                    // company.
                     _ => None,
                 })
                 .map(|mx| Target {
@@ -233,31 +158,14 @@ impl Resolve for Hickory {
                     pref: mx.preference,
                 })
                 .collect()),
-            // "this name has no MX records" is an answer, and a different one
-            // from "the resolver did not reply".
             Err(e) if e.is_no_records_found() => Err(DnsError::NotFound),
             Err(e) => Err(DnsError::Failed(e.to_string())),
         }
     }
 
-    /// The A records first and the AAAA records after them, with the two
-    /// kinds of A failure kept apart.
-    ///
-    /// Not `lookup_ip`: its `Ipv4thenIpv6` strategy falls through to AAAA on
-    /// *any* A error, SERVFAIL and timeout included. The caller then sees a
-    /// host with IPv6 addresses and no IPv4 ones, which is indistinguishable
-    /// from a host that publishes only AAAA — and a host that publishes only
-    /// AAAA is dialled over IPv6 even with `ipv6 = false`, because the
-    /// alternative would be not delivering at all. On a VPS with no matching
-    /// IPv6 PTR that earns Gmail's `550-5.7.25`, which is read as a permanent
-    /// refusal and relayed to the sender. A transient resolver hiccup must
-    /// not be able to bounce somebody's mail, so an A lookup that failed is
-    /// reported as a failure and the AAAA query is not used to paper over it.
     async fn addrs(&self, host: &str) -> Result<Vec<IpAddr>, DnsError> {
         let v4 = match self.inner.ipv4_lookup(host).await {
             Ok(answer) => Some(v4_of(&answer)),
-            // "this name has no A records" is an answer, and the only one
-            // that justifies asking for AAAA instead.
             Err(e) if e.is_no_records_found() => None,
             Err(e) => return Err(DnsError::Failed(e.to_string())),
         };
@@ -270,8 +178,6 @@ impl Resolve for Hickory {
             };
         };
 
-        // There is a route either way now, so an AAAA lookup that fails costs
-        // nothing but the addresses it would have added.
         let v6 = self
             .inner
             .ipv6_lookup(host)
@@ -290,11 +196,6 @@ impl Resolve for Hickory {
                     hickory_resolver::proto::rr::RData::PTR(ptr) => Some(ptr),
                     _ => None,
                 })
-                // `to_ascii`, not `to_utf8`: the punycode form is the one
-                // that belongs in a `Received` header, and the one
-                // `routing::is_qualified` accepts. `to_utf8` decodes an
-                // `xn--` label back to Unicode, and the header writer then
-                // reports the peer's real reverse DNS as `unknown`.
                 .map(|ptr| normalise(&ptr.0.to_ascii()))
                 .next()
                 .ok_or(DnsError::NotFound),
@@ -304,8 +205,6 @@ impl Resolve for Hickory {
     }
 }
 
-/// The A records of an answer. An A lookup's answer section can carry a
-/// CNAME chain as well, which is not an address.
 fn v4_of(answer: &hickory_resolver::lookup::Lookup) -> Vec<IpAddr> {
     answer
         .answers()
@@ -328,11 +227,6 @@ fn v6_of(answer: &hickory_resolver::lookup::Lookup) -> Vec<IpAddr> {
         .collect()
 }
 
-// ------------------------------------------------------------ the one for tests
-
-/// A resolver with the answers written down. Everything delivery does with
-/// DNS is decided by what comes back from these two calls, so a table is
-/// enough to drive all of it.
 #[derive(Debug, Clone, Default)]
 pub struct Table {
     mx: std::collections::BTreeMap<String, Result<Vec<Target>, DnsError>>,
@@ -341,7 +235,6 @@ pub struct Table {
 }
 
 impl Table {
-    /// `hosts` is `(preference, host)` pairs in the order DNS would list them.
     pub fn mx(mut self, domain: &str, hosts: &[(u16, &str)]) -> Self {
         self.mx.insert(
             normalise(domain),
@@ -371,7 +264,6 @@ impl Table {
         self
     }
 
-    /// The name an address reverse-resolves to.
     pub fn ptr(mut self, ip: IpAddr, name: &str) -> Self {
         self.ptrs.insert(ip, Ok(normalise(name)));
         self
@@ -408,24 +300,13 @@ impl Resolve for Table {
 
 #[cfg(test)]
 mod tests {
-    // ------------------------------------------ a nameserver that can be rude
-
-    /// What the fake nameserver does with one question.
     #[derive(Clone, Copy)]
     enum Answer {
-        /// One address record of the matching type.
         Address,
-        /// NOERROR with nothing in it: this name has no records of this type.
         Empty,
-        /// SERVFAIL — the resolver did not answer the question.
         ServFail,
     }
 
-    /// A nameserver that answers A and AAAA separately and however it is
-    /// told. The whole point of the `addrs` rewrite is which *kind* of A
-    /// failure is allowed to fall through to AAAA, and only a real
-    /// nameserver's rcode can tell a SERVFAIL from an empty answer — a table
-    /// of addresses cannot express the difference at all.
     async fn nameserver(a: Answer, aaaa: Answer) -> std::net::SocketAddr {
         let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
             .await
@@ -441,7 +322,6 @@ mod tests {
                 if n < 12 {
                     continue;
                 }
-                // Walk the single question: labels, then qtype and qclass.
                 let mut at = 12;
                 while at < n && buf[at] != 0 {
                     at += 1 + buf[at] as usize;
@@ -460,30 +340,29 @@ mod tests {
                 };
 
                 let mut out = Vec::with_capacity(64);
-                out.extend_from_slice(&buf[..2]); // the query's id
-                // QR, recursion desired and available, and the rcode.
+                out.extend_from_slice(&buf[..2]);
                 let rcode: u16 = if matches!(reply, Answer::ServFail) {
                     2
                 } else {
                     0
                 };
                 out.extend_from_slice(&(0x8180 | rcode).to_be_bytes());
-                out.extend_from_slice(&1u16.to_be_bytes()); // one question
+                out.extend_from_slice(&1u16.to_be_bytes());
                 let answers: u16 = if matches!(reply, Answer::Address) {
                     1
                 } else {
                     0
                 };
                 out.extend_from_slice(&answers.to_be_bytes());
-                out.extend_from_slice(&0u16.to_be_bytes()); // no authorities
-                out.extend_from_slice(&0u16.to_be_bytes()); // no additionals
+                out.extend_from_slice(&0u16.to_be_bytes());
+                out.extend_from_slice(&0u16.to_be_bytes());
                 out.extend_from_slice(question);
 
                 if matches!(reply, Answer::Address) {
-                    out.extend_from_slice(&0xc00cu16.to_be_bytes()); // the question's name
+                    out.extend_from_slice(&0xc00cu16.to_be_bytes());
                     out.extend_from_slice(&qtype.to_be_bytes());
-                    out.extend_from_slice(&1u16.to_be_bytes()); // IN
-                    out.extend_from_slice(&60u32.to_be_bytes()); // ttl
+                    out.extend_from_slice(&1u16.to_be_bytes());
+                    out.extend_from_slice(&60u32.to_be_bytes());
                     if qtype == 1 {
                         out.extend_from_slice(&4u16.to_be_bytes());
                         out.extend_from_slice(&[203, 0, 113, 4]);
@@ -501,10 +380,6 @@ mod tests {
         addr
     }
 
-    /// A nameserver that answers one PTR question with one name, so that the
-    /// *form* the name comes back in can be asserted on. A table of names
-    /// cannot express this: the difference is made by the decoding hickory
-    /// does on the wire format, not by what was asked for.
     async fn ptr_nameserver(name: &'static str) -> std::net::SocketAddr {
         let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
             .await
@@ -531,8 +406,6 @@ mod tests {
                 let qtype = u16::from_be_bytes([buf[at + 1], buf[at + 2]]);
                 let question = &buf[12..end];
 
-                // The answer's name, in DNS wire form: each label with its
-                // length in front, and a zero byte for the root.
                 let mut encoded = Vec::new();
                 for label in name.split('.') {
                     encoded.push(label.len() as u8);
@@ -552,8 +425,8 @@ mod tests {
 
                 if answers == 1 {
                     out.extend_from_slice(&0xc00cu16.to_be_bytes());
-                    out.extend_from_slice(&12u16.to_be_bytes()); // PTR
-                    out.extend_from_slice(&1u16.to_be_bytes()); // IN
+                    out.extend_from_slice(&12u16.to_be_bytes());
+                    out.extend_from_slice(&1u16.to_be_bytes());
                     out.extend_from_slice(&60u32.to_be_bytes());
                     out.extend_from_slice(&(encoded.len() as u16).to_be_bytes());
                     out.extend_from_slice(&encoded);
@@ -566,12 +439,6 @@ mod tests {
         addr
     }
 
-    /// A reverse lookup that lands on an internationalised name has to come
-    /// back in its punycode form. `to_utf8` decodes `xn--` back to Unicode,
-    /// and `policy::name_or_unknown` then throws the whole name away —
-    /// `is_qualified` allows only ASCII — so the peer's real reverse DNS was
-    /// reported as `unknown` in the `Received` header. The ASCII form is also
-    /// the only one that belongs in a header: RFC 5321 names are ASCII.
     #[tokio::test]
     async fn a_reverse_lookup_keeps_an_idna_name_in_its_ascii_form() {
         let server = ptr_nameserver("xn--mller-kva.example.com").await;
@@ -590,15 +457,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_servfail_on_the_a_record_is_a_failure_and_not_an_ipv6_only_host() {
-        // `lookup_ip`'s default `Ipv4thenIpv6` strategy queries AAAA on *any*
-        // A error, SERVFAIL and timeout included. The caller then sees a host
-        // with AAAA records and no A records, which is indistinguishable from
-        // a host that publishes only AAAA — and such a host is dialled over
-        // IPv6 even with `ipv6 = false`, because the alternative is not
-        // delivering at all. From a VPS with no matching IPv6 PTR Gmail
-        // answers `550-5.7.25`, which is read as permanent and bounced back
-        // to the sender. A transient resolver hiccup must not be able to do
-        // that.
         let server = nameserver(Answer::ServFail, Answer::Address).await;
 
         let found = Hickory::against(server).addrs("mx.example.com").await;
@@ -612,8 +470,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_name_with_no_a_record_falls_through_to_its_aaaa_records() {
-        // The one A failure that *is* an answer. A destination that publishes
-        // only AAAA would otherwise be undeliverable.
         let server = nameserver(Answer::Empty, Answer::Address).await;
 
         let found = Hickory::against(server)
@@ -626,10 +482,6 @@ mod tests {
 
     #[tokio::test]
     async fn the_a_records_come_first_and_a_broken_aaaa_lookup_costs_nothing() {
-        // There is a route either way once the A lookup has answered, so an
-        // AAAA query that fails must not take the delivery down with it — and
-        // IPv4 has to stay in front, which is the preference the whole of
-        // `usable` rests on.
         let server = nameserver(Answer::Address, Answer::ServFail).await;
 
         let found = Hickory::against(server)
@@ -662,8 +514,6 @@ mod tests {
 
     #[tokio::test]
     async fn mx_records_come_back_in_preference_order() {
-        // DNS lists them however it likes; delivery has to try the lowest
-        // preference first or it ignores the domain's own ranking.
         let table = Table::default().mx(
             "example.com",
             &[(30, "third.example.com"), (10, "first.example.com")],
@@ -727,8 +577,6 @@ mod tests {
 
     #[tokio::test]
     async fn the_trailing_dot_and_the_case_of_a_record_are_normalised() {
-        // hickory hands back fully qualified names with the root dot on, and
-        // the host name is used both for the TLS name and for logging.
         let table = Table::default().mx("Example.COM.", &[(10, "MX1.Example.COM.")]);
 
         let found = targets(&table, "example.com").await.unwrap();
@@ -737,15 +585,11 @@ mod tests {
 
     #[tokio::test]
     async fn equal_preferences_do_not_always_come_back_in_the_same_order() {
-        // Without a shuffle every message in the queue hits the same one of a
-        // pair of equal exchangers.
         let table = Table::default().mx(
             "example.com",
             &[(10, "a.example.com"), (10, "b.example.com")],
         );
 
-        // Twenty tries, all inside one millisecond: a seed that only moves
-        // with the clock would give the same order for every one of them.
         let mut seen = std::collections::BTreeSet::new();
         for _ in 0..20 {
             let found = targets(&table, "example.com").await.unwrap();

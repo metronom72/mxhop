@@ -1,23 +1,3 @@
-//! The retry queue: what happens to a message a destination deferred.
-//!
-//! A message reaches `queue/` only when it has already been accepted — the
-//! sending server has been told `250` and will never send it again, so from
-//! that moment the copy on this disk is the only one. Everything here follows
-//! from that: nothing is deleted until a destination has either taken the
-//! message or refused it for good, and when mxhop does give up it moves the
-//! files to `frozen/` rather than removing them.
-//!
-//! The runner is a single task reading the queue from disk every
-//! [`SWEEP_INTERVAL`]. From disk, and not from a list in memory, because
-//! `queue/` is also the administration interface: an operator who moves an
-//! envelope back out of `frozen/`, or edits a recipient in one, gets what
-//! they asked for on the next sweep without restarting the service.
-//!
-//! One attempt at a time, in arrival order. A forwarder that opens a
-//! connection per queued message is an amplifier pointed at whichever
-//! destination is currently broken, and the queue is almost always backed up
-//! for exactly one such destination.
-
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -31,70 +11,24 @@ use crate::smtp::client::{Delivery, Relay, Reply, Verdict};
 use crate::spool::Spool;
 use crate::srs::Srs;
 
-/// The wait before each attempt after the first, in minutes: one minute,
-/// then five, fifteen, an hour, and every four hours after that.
-///
-/// The last entry repeats for as long as the message is in the queue, which
-/// is what makes this a complete schedule rather than a prefix of one. The
-/// first interval is deliberately short — a destination that answered "not
-/// now" is usually a greylist, and a greylist clears in a minute.
 pub const DEFAULT_RETRY_MINUTES: [u64; 5] = [1, 5, 15, 60, 240];
 
-/// How long a message may stay in the queue before mxhop stops trying.
-///
-/// Two days. It has to fit inside the SRS window: a forwarded message leaves
-/// with a rewritten sender whose signature is only valid for
-/// `srs.max_age_days` — seven by default — so a bounce provoked by the last
-/// attempt has to arrive while that address still decodes, and `check`
-/// refuses a lifetime that does not fit.
 pub const DEFAULT_LIFETIME_HOURS: u64 = 48;
 
-/// How often the queue is read from disk. The schedule lives in the
-/// envelopes, so this is only the resolution of the clock that reads them.
 pub const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
-/// The longest `queue.lifetime_hours` mxhop will accept. A month of attempts
-/// is a month in which nobody has been told anything, and every sender's
-/// postmaster gave up waiting long before it.
 pub const MAX_LIFETIME_HOURS: u64 = 30 * 24;
 
-/// The longest interval `queue.retry_minutes` may state: a day between
-/// attempts, inside a lifetime measured in hours, is a schedule that retries
-/// almost nothing.
 pub const MAX_RETRY_MINUTES: u64 = 24 * 60;
 
-/// The most intervals `queue.retry_minutes` may state. The last one repeats,
-/// so a list this long is already a schedule nobody is reading.
 pub const MAX_RETRY_STEPS: usize = 32;
 
-/// The longest `queue.sweep_seconds` mxhop will accept. The schedule lives in
-/// the envelopes, so this is only how often they are read; an hour between
-/// reads would make every interval above an hour long in practice.
 pub const MAX_SWEEP_SECONDS: u64 = 60 * 60;
 
-/// When the runner tries things, as the configuration states it.
-///
-/// Carried as one value rather than three arguments because the inbound
-/// session needs it too: the first wait is written into an envelope at the
-/// moment it is held, and it has to be the same wait the runner would
-/// compute.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Schedule {
-    /// The wait before each attempt after the first, the last entry
-    /// repeating for ever. See [`DEFAULT_RETRY_MINUTES`].
-    ///
-    /// A list rather than a first interval and a doubling rule, because the
-    /// shape that is actually wanted — short, short, longer, then settle
-    /// down — is not a geometric series, and writing it as one made the
-    /// early intervals either too long or the late ones too short.
-    ///
-    /// Never empty: [`Schedule::backoff`] falls back to the first default
-    /// interval if it somehow is, and `config` refuses an empty list.
     pub retries: Vec<Duration>,
-    /// How long a message may stay in the queue. See
-    /// [`DEFAULT_LIFETIME_HOURS`].
     pub lifetime: Duration,
-    /// How often the queue is read from disk. See [`SWEEP_INTERVAL`].
     pub sweep_interval: Duration,
 }
 
@@ -112,35 +46,15 @@ impl Default for Schedule {
 }
 
 impl Schedule {
-    /// How long to wait before trying a message that has already been tried
-    /// `attempts` times.
-    ///
-    /// A function of nothing but the count and this list, so that the
-    /// envelope on disk is the whole schedule: the runner can be restarted,
-    /// or the machine rebooted, without losing where a message was in it.
     pub fn backoff(&self, attempts: u32) -> Duration {
-        // `attempts` is what has already been spent, so one attempt earns
-        // the first interval. Zero means the same thing as one here — an
-        // envelope written before this field existed — and gets it too.
         let step = attempts.max(1) as usize - 1;
         self.retries
             .get(step)
-            // Past the end of the list, the last interval repeats: that is
-            // what "and every four hours after that" means, and it is also
-            // what stops a long-stuck message from waiting for ever.
             .or_else(|| self.retries.last())
             .copied()
-            // Unreachable: `config` refuses an empty list and `Default`
-            // fills one in. A panic here would be a queue that stops on a
-            // configuration nothing can produce.
             .unwrap_or(Duration::from_secs(DEFAULT_RETRY_MINUTES[0] * 60))
     }
 
-    /// The longest interval in the schedule — the one that repeats.
-    ///
-    /// Used as "long enough that nothing is still happening": a host nothing
-    /// has retried for this long is one whose failure count has stopped
-    /// being evidence.
     pub fn longest(&self) -> Duration {
         self.retries
             .iter()
@@ -149,42 +63,21 @@ impl Schedule {
             .unwrap_or(Duration::from_secs(DEFAULT_RETRY_MINUTES[0] * 60))
     }
 
-    /// Whether a message has been in the queue longer than mxhop keeps
-    /// trying.
-    ///
-    /// Measured from arrival rather than from the first deferral, because
-    /// what the sender's postmaster is owed an answer about is how long ago
-    /// they sent it — and because a clock that starts on the first failure
-    /// can be restarted by one.
     pub fn expired(&self, envelope: &Envelope, now_unix_ms: u64) -> bool {
         now_unix_ms.saturating_sub(envelope.received_at_unix_ms) > self.lifetime.as_millis() as u64
     }
 }
 
-/// What each destination has been doing lately.
-///
-/// A hundred messages queued for one host that is refusing connections are a
-/// hundred connection attempts per sweep without this, every one of them
-/// timing out, and the sweep takes so long that mail for the destinations
-/// that *are* up waits behind it. One failure therefore stands in for the
-/// domain: the next message for it is skipped until the backoff expires.
-///
-/// In memory, and lost on restart, deliberately. It is a statement about what
-/// is true right now rather than about any message, and writing it to disk
-/// would mean a message carrying a fact about a host it shares with others.
-/// The cost of losing it is one connection per domain after a restart.
 #[derive(Debug, Default)]
 struct Hosts(Mutex<BTreeMap<String, Backoff>>);
 
 #[derive(Debug)]
 struct Backoff {
-    /// Consecutive failures, which is what the wait doubles from.
     failures: u32,
     not_before_unix_ms: u64,
 }
 
 impl Hosts {
-    /// `Some(millis)` if this domain must not be connected to yet.
     fn held_until(&self, domain: &str, now_unix_ms: u64) -> Option<u64> {
         self.0
             .lock()
@@ -194,8 +87,6 @@ impl Hosts {
             .filter(|not_before| *not_before > now_unix_ms)
     }
 
-    /// Nobody answered, or everybody deferred. Returns the wait this earns,
-    /// for the log line.
     fn failed(&self, domain: &str, now_unix_ms: u64, schedule: &Schedule) -> Duration {
         let mut table = self
             .0
@@ -211,8 +102,6 @@ impl Hosts {
         wait
     }
 
-    /// The destination answered for itself — it took the message, or refused
-    /// it, which are both answers. Whatever was wrong with it is over.
     fn answered(&self, domain: &str) -> bool {
         self.0
             .lock()
@@ -221,13 +110,6 @@ impl Hosts {
             .is_some()
     }
 
-    /// Forgets domains nothing has tried for a whole longest-interval's worth
-    /// of time.
-    ///
-    /// Without this the table keeps an entry per domain that has ever failed,
-    /// and the queue of a busy forwarder names a great many domains. A
-    /// failure count nothing has added to for that long is also not evidence
-    /// about the host as it is now.
     fn prune(&self, now_unix_ms: u64, schedule: &Schedule) {
         let stale = schedule.longest().as_millis() as u64;
         self.0
@@ -237,38 +119,23 @@ impl Hosts {
     }
 }
 
-/// What one attempt came to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Attempted {
-    /// Out of the queue: delivered, refused for good, or undeliverable.
     Settled,
-    /// Still ours, rescheduled.
     Deferred,
-    /// Not tried at all: a destination it needs is backed off.
     HeldBack,
 }
 
-/// What one sweep did, for the log and for a test to assert on.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Swept {
-    /// Messages whose next attempt is still in the future.
     pub waiting: usize,
-    /// Messages attempted in this sweep.
     pub attempted: usize,
-    /// Messages that left the queue because every remaining recipient was
-    /// settled — delivered, or refused for good.
     pub settled: usize,
-    /// Messages rescheduled: somebody is still deferring them.
     pub deferred: usize,
-    /// Messages given up on and moved to `frozen/`.
     pub frozen: usize,
-    /// Messages due, but for a destination that is currently backed off:
-    /// skipped without a connection and without costing them an attempt.
     pub held_back: usize,
 }
 
-/// The queue runner: the spool, somewhere to deliver to, the sender rewriter
-/// if the deployment has one, and when to try things.
 pub struct Runner<L> {
     spool: Arc<Spool>,
     relay: Arc<L>,
@@ -296,7 +163,6 @@ where
         }
     }
 
-    /// Sweeps for as long as the process runs.
     pub async fn run(self) {
         loop {
             self.sweep().await;
@@ -304,13 +170,9 @@ where
         }
     }
 
-    /// One pass over the queue.
     pub async fn sweep(&self) -> Swept {
         let queued = match self.spool.queued().await {
             Ok(queued) => queued,
-            // The queue directory has gone or cannot be read. Nothing here
-            // can fix that, and giving up on the whole runner would mean a
-            // mount that comes back to a service that has stopped looking.
             Err(e) => {
                 warn!(
                     path = %self.spool.queue_dir().display(),
@@ -323,9 +185,6 @@ where
 
         let mut swept = Swept::default();
         for envelope in queued {
-            // Read inside the loop: one attempt can take minutes, and a
-            // message that became due while an earlier one was being
-            // delivered should go out in this sweep rather than the next.
             let now = now_unix_ms();
 
             if envelope.next_attempt_unix_ms > now {
@@ -334,10 +193,6 @@ where
             }
 
             if self.schedule.expired(&envelope, now) {
-                // Error level, not warning: this is mail that was accepted
-                // and will not be delivered, and until mxhop can send a
-                // delivery report of its own this line is the only notice
-                // anybody gets.
                 error!(
                     id = %envelope.id,
                     to = envelope.to.join(", "),
@@ -373,8 +228,6 @@ where
             }
         }
 
-        // After the pass rather than before it, so that a domain this sweep
-        // backed off is never pruned in the same breath.
         self.hosts.prune(now_unix_ms(), &self.schedule);
 
         if swept != Swept::default() {
@@ -391,14 +244,9 @@ where
         swept
     }
 
-    /// One attempt at one message.
     async fn attempt(&self, envelope: &Envelope) -> Attempted {
         let body = match self.spool.body(&envelope.id).await {
             Ok(body) => body,
-            // An envelope whose message is gone can never be delivered, so
-            // retrying it for ever would be a line in the log every minute
-            // and nothing else. It is reported once and removed — which is
-            // also what cleans up after a `forget` that failed half way.
             Err(e) => {
                 error!(
                     id = %envelope.id,
@@ -413,19 +261,10 @@ where
             }
         };
 
-        // The recipients on a held envelope are destinations, not the
-        // addresses the sending server asked for: the alias table was
-        // consulted before the message was ever stored, and consulting it
-        // again here would re-expand an address that has since been pointed
-        // somewhere else — delivering the message to somebody who was never
-        // its recipient.
         let mut recipients = Vec::with_capacity(envelope.to.len());
         for address in &envelope.to {
             match Mailbox::parse(address) {
                 Ok(mailbox) => recipients.push(mailbox),
-                // Only reachable if somebody edited the envelope by hand,
-                // which is a supported thing to do: the rest of the message
-                // still goes.
                 Err(e) => error!(
                     id = %envelope.id,
                     recipient = %address,
@@ -448,17 +287,6 @@ where
 
         let groups = policy::group_by_domain(recipients);
 
-        // A destination that has just failed is not asked again until its
-        // backoff expires, and a message needing one is skipped whole — not
-        // partly delivered, even when its other destinations are up.
-        //
-        // That costs the healthy domain a wait of up to one ceiling, and buys
-        // a rule with no second schedule in it: a part-delivered attempt
-        // would have to leave the skipped recipients on the envelope without
-        // counting an attempt against them, which is two clocks on one
-        // message. It is also nearly free in practice — a message is only
-        // here because a destination deferred, and the recipients that were
-        // delivered came off the envelope then.
         let now = now_unix_ms();
         if let Some((domain, not_before)) = groups
             .iter()
@@ -480,19 +308,8 @@ where
             return Attempted::HeldBack;
         }
 
-        // The sender the destination checks SPF against, rewritten with
-        // today's date rather than the one the message arrived on: an SRS
-        // address carries its own expiry, and a four-day-old one minted at
-        // arrival would stop decoding while the message was still being
-        // retried. Mirrors `session::hand_on`, quietly: everything it warns
-        // about there was decided while the sending server still held the
-        // message, and has been decided already by the time a message is
-        // here.
         let sender = match (&self.srs, envelope.from.as_deref()) {
             (None, _) => envelope.from.clone(),
-            // A bounce has nothing to rewrite and must acquire nothing: an
-            // address in a bounce's envelope is an address that bounce can
-            // itself be bounced to.
             (Some(_), None) => None,
             (Some(srs), Some(from)) => Some(
                 srs.rewrite(Some(from), crate::srs::today())
@@ -500,11 +317,6 @@ where
             ),
         };
 
-        // The trace as it was written when the message arrived, and the
-        // findings as they were then. Both are kept on the envelope for this
-        // moment: re-deriving them would claim a time the message did not
-        // arrive at, and would mean asking DNS again — days later, about a
-        // message whose sender's records may have changed since.
         let mut head = envelope.received.clone();
         head.push_str(&envelope.authentication_results);
         let body: Arc<[u8]> = body.into();
@@ -514,10 +326,6 @@ where
         let mut refused = 0usize;
 
         for group in groups {
-            // One fresh budget per domain, unlike the inbound session, which
-            // divides one budget between its groups: there nothing could be
-            // allowed to outlast the sending server's patience, and here
-            // there is no sending server waiting.
             let outcome = self
                 .relay
                 .deliver(Delivery::new(
@@ -528,12 +336,6 @@ where
                 ))
                 .await;
 
-            // Every recipient deferred means the destination said nothing
-            // about any of them: it did not answer, or it answered "not
-            // now" to the lot. Either way the next message for this domain
-            // would learn the same thing at the cost of another connection.
-            // One recipient settled is a destination that is working, so
-            // whatever was wrong with it is over.
             if outcome
                 .results
                 .iter()
@@ -569,12 +371,6 @@ where
                             "delivered from the queue"
                         );
                     }
-                    // Nobody is told. The sending server was answered `250`
-                    // days ago, and there is no delivery report generator
-                    // yet, so this line is the only record this copy existed
-                    // — one per recipient rather than a count, because the
-                    // question an operator is answering is "did my mail to
-                    // b@ arrive?" and they will grep for `b@`.
                     Verdict::Refused(reply) => {
                         refused += 1;
                         error!(
@@ -599,11 +395,6 @@ where
                 "out of the queue"
             );
             if let Err(e) = self.spool.forget(&envelope.id).await {
-                // The message is still in `queue/` and will be delivered
-                // again on the next sweep — a duplicate, which is the one
-                // thing worse than a deferral. Worth a loud line, because
-                // the cause is the disk and the symptom will be somebody
-                // receiving the same mail every minute.
                 error!(
                     id = %envelope.id,
                     "this message has been delivered but could not be removed from the \
@@ -617,8 +408,6 @@ where
         let attempts = envelope.attempts + 1;
         let wait = self.schedule.backoff(attempts);
         let rescheduled = Envelope {
-            // Only the recipients still waiting. One that has been delivered
-            // and stays on the envelope is a second copy on the next sweep.
             to: still_deferred
                 .iter()
                 .map(|(mailbox, _)| mailbox.to_string())
@@ -644,11 +433,6 @@ where
                 "still deferred, will try again: {}",
                 rescheduled.last_reply.as_deref().unwrap_or("no reason recorded")
             ),
-            // The old envelope is still there, so the message is tried again
-            // — immediately, because its old `next_attempt` is in the past.
-            // That is a tight loop against a destination that is deferring,
-            // so it is reported at error level with the reason the schedule
-            // could not be written.
             Err(e) => error!(
                 id = %rescheduled.id,
                 held = rescheduled.to.join(", "),
@@ -678,16 +462,9 @@ mod tests {
         dir
     }
 
-    /// A destination that answers whatever the test told it to, per domain,
-    /// and keeps every delivery it was handed so the test can read the bytes
-    /// that went out.
     #[derive(Default)]
     struct Fake {
-        /// Behind a lock because the tests about a destination coming back
-        /// change the answer between two sweeps.
         answers: Mutex<BTreeMap<String, Verdict>>,
-        /// Per recipient, which beats per domain when the test is about one
-        /// of two recipients at the same host coming unstuck.
         per_recipient: BTreeMap<String, Verdict>,
         seen: Mutex<Vec<Delivery>>,
     }
@@ -776,7 +553,6 @@ mod tests {
         }
     }
 
-    /// A message as the session leaves it in the queue: tried once, due now.
     fn held(to: &[&str]) -> Envelope {
         Envelope {
             id: new_id(),
@@ -796,13 +572,10 @@ mod tests {
 
     const BODY: &[u8] = b"Subject: hi\r\n\r\nbody\r\n";
 
-    /// A runner over a fresh spool holding one message, on the schedule the
-    /// defaults give.
     async fn with(envelope: &Envelope, relay: Fake) -> (Runner<Fake>, Arc<Spool>, Arc<Fake>) {
         with_many(std::slice::from_ref(envelope), relay).await
     }
 
-    /// The same, for the tests about one destination and several messages.
     async fn with_many(
         envelopes: &[Envelope],
         relay: Fake,
@@ -810,9 +583,6 @@ mod tests {
         with_schedule(envelopes, relay, Schedule::default()).await
     }
 
-    /// The same again, on a schedule of the test's own: the tests about a
-    /// destination coming back have to get past a wait, and a millisecond is
-    /// a wait.
     async fn with_schedule(
         envelopes: &[Envelope],
         relay: Fake,
@@ -827,15 +597,6 @@ mod tests {
         (runner, spool, relay)
     }
 
-    /// A schedule whose waits are a fraction of a second, so that a test can
-    /// sleep through one instead of through five minutes.
-    ///
-    /// Long enough that one sweep cannot outlast it, which is the bug the
-    /// first two versions of this helper had: a sweep writes an envelope per
-    /// deferred message and waits for the platter each time, which on a real
-    /// filesystem is tens of milliseconds, so a wait of one or fifty had
-    /// already expired by the time the sweep reached the second message —
-    /// and the test passed for the wrong reason.
     fn impatient() -> Schedule {
         Schedule {
             retries: vec![Duration::from_millis(400)],
@@ -843,8 +604,6 @@ mod tests {
         }
     }
 
-    /// One minute, five, fifteen, an hour, then every four hours — the
-    /// schedule this queue was specified with, read off the default.
     #[test]
     fn the_waits_are_one_five_fifteen_sixty_and_then_every_four_hours() {
         let schedule = Schedule::default();
@@ -867,9 +626,6 @@ mod tests {
         );
     }
 
-    /// Two days of attempts on that schedule, which is what the lifetime has
-    /// to be long enough to contain and short enough to fit inside the SRS
-    /// window.
     #[test]
     fn the_default_lifetime_is_forty_eight_hours() {
         assert_eq!(
@@ -878,8 +634,6 @@ mod tests {
         );
     }
 
-    /// A schedule shorter than the number of attempts a message gets must
-    /// not run off the end of its own list.
     #[test]
     fn a_schedule_of_one_interval_repeats_it() {
         let schedule = Schedule {
@@ -891,20 +645,12 @@ mod tests {
         assert_eq!(schedule.backoff(99), Duration::from_secs(90));
     }
 
-    /// Intervals are kept as `Duration`, so a schedule stated in less than
-    /// whole seconds is the schedule it says. An earlier version computed the
-    /// wait in whole seconds and floored a 400 ms interval to zero, which is
-    /// a configuration with no waits in it at all — and the first test that
-    /// wanted one passed for the wrong reason.
     #[test]
     fn an_interval_shorter_than_a_second_is_not_floored_to_nothing() {
         assert_eq!(impatient().backoff(1), Duration::from_millis(400));
         assert_eq!(impatient().backoff(9), Duration::from_millis(400));
     }
 
-    /// An envelope from a build that had no schedule in it says `attempts: 0`,
-    /// and must not be treated as never tried: the message it belongs to was
-    /// delivered to once already, in the session that accepted it.
     #[test]
     fn a_message_with_no_recorded_attempt_still_waits_the_first_interval() {
         let schedule = Schedule::default();
@@ -928,11 +674,6 @@ mod tests {
         assert_eq!(relay.only().to[0].to_string(), "hi@dest.test");
     }
 
-    /// The whole point of the stored `received` and `authentication_results`
-    /// fields: a retry goes out as the bytes that arrived, under the trace
-    /// written when they arrived. Rebuilding either would claim a time the
-    /// message did not arrive at, and would break the sender's DKIM
-    /// signature if it covered the body.
     #[tokio::test]
     async fn the_retry_carries_the_stored_trace_and_the_stored_message() {
         let envelope = held(&["hi@dest.test"]);
@@ -976,7 +717,6 @@ mod tests {
             queued[0].last_reply
         );
 
-        // Due in ten minutes, not now: the second sweep must leave it alone.
         let swept = runner.sweep().await;
         assert_eq!(swept.waiting, 1);
         assert_eq!(swept.attempted, 0);
@@ -987,9 +727,6 @@ mod tests {
         );
     }
 
-    /// A permanent refusal is nobody's to retry. The copy is lost — there is
-    /// no delivery report generator yet — but it must not keep the message in
-    /// the queue for four days.
     #[tokio::test]
     async fn a_permanent_refusal_on_a_retry_takes_the_message_out_of_the_queue() {
         let envelope = held(&["hi@dest.test"]);
@@ -1030,9 +767,6 @@ mod tests {
         );
     }
 
-    /// Two recipients at two different hosts are two connections, because one
-    /// SMTP connection serves one domain — and the grouping is shared with
-    /// the inbound session rather than written twice.
     #[tokio::test]
     async fn recipients_at_different_domains_are_delivered_one_connection_each() {
         let envelope = held(&["one@first.test", "two@second.test"]);
@@ -1069,10 +803,6 @@ mod tests {
         assert_eq!(spool.queued().await.unwrap().len(), 1);
     }
 
-    /// Four days of a destination refusing to take a message is the end of
-    /// it. The files must survive that — somebody's mail is in them, and
-    /// mxhop cannot tell its sender it was not delivered — so they move to
-    /// `frozen/` instead of being removed.
     #[tokio::test]
     async fn a_message_older_than_the_lifetime_is_frozen_rather_than_retried_for_ever() {
         let envelope = Envelope {
@@ -1101,9 +831,6 @@ mod tests {
         );
     }
 
-    /// An envelope whose message has gone — a `forget` that failed half way,
-    /// or an operator who removed the wrong file — can never be delivered.
-    /// Retrying it would be a line in the log every minute for four days.
     #[tokio::test]
     async fn an_envelope_whose_message_is_gone_leaves_the_queue() {
         let envelope = held(&["hi@dest.test"]);
@@ -1119,10 +846,6 @@ mod tests {
         );
     }
 
-    /// The envelope sender is rewritten on every attempt, with today's date —
-    /// not stored rewritten at arrival. An SRS address carries its own
-    /// expiry, and one minted four days ago would be close to the end of the
-    /// window a bounce has to come back through.
     #[tokio::test]
     async fn the_retry_leaves_with_an_srs_rewritten_sender() {
         let envelope = held(&["hi@dest.test"]);
@@ -1150,9 +873,6 @@ mod tests {
         );
     }
 
-    /// A bounce arrives with the null sender and must leave with it: an
-    /// address in a bounce's envelope is an address that bounce can itself be
-    /// bounced to.
     #[tokio::test]
     async fn a_bounce_is_retried_with_the_null_sender() {
         let envelope = Envelope {
@@ -1179,9 +899,6 @@ mod tests {
         assert_eq!(relay.only().from, None);
     }
 
-    /// The queue is the administration interface, so a hand-edited envelope
-    /// has to be survivable: one unusable recipient costs that copy and
-    /// nothing else.
     #[tokio::test]
     async fn an_unparseable_recipient_does_not_stop_the_rest_of_the_message() {
         let envelope = held(&["not an address", "hi@dest.test"]);
@@ -1211,12 +928,6 @@ mod tests {
         );
     }
 
-    // --------------------------------------------- one failure, one domain
-
-    /// The reason per-host backoff exists. A dead destination with a hundred
-    /// messages queued for it was a hundred connections per sweep, every one
-    /// of them waiting out the connect timeout, and the sweep took so long
-    /// that mail for destinations that *were* up waited behind it.
     #[tokio::test]
     async fn a_destination_that_has_just_failed_is_tried_for_one_message_not_all_of_them() {
         let queued: Vec<Envelope> = (0..3).map(|_| held(&["hi@dest.test"])).collect();
@@ -1240,9 +951,6 @@ mod tests {
         assert_eq!(swept.held_back, 2);
     }
 
-    /// Being skipped is not being tried: a message held back for somebody
-    /// else's failure must not age out of the queue faster than one that was
-    /// actually attempted, and its own schedule must not move.
     #[tokio::test]
     async fn a_message_held_back_for_another_is_not_charged_an_attempt() {
         let first = held(&["hi@dest.test"]);
@@ -1272,10 +980,6 @@ mod tests {
         );
     }
 
-    /// A destination that answers for itself — by taking the message or by
-    /// refusing it — is a working destination, and the next message for it
-    /// must go out in the same sweep rather than waiting out a backoff
-    /// earned before it came back.
     #[tokio::test]
     async fn a_destination_that_answers_again_stops_holding_the_rest_back() {
         let queued: Vec<Envelope> = (0..3).map(|_| held(&["hi@dest.test"])).collect();
@@ -1297,8 +1001,6 @@ mod tests {
              not asked to learn it again"
         );
 
-        // The destination comes back, and its backoff — a millisecond on
-        // this schedule — expires.
         relay.now_accepting("dest.test");
         tokio::time::sleep(Duration::from_millis(600)).await;
         let swept = runner.sweep().await;
@@ -1316,10 +1018,6 @@ mod tests {
         assert_eq!(relay.deliveries().len(), 4, "one failed probe, then three");
     }
 
-    /// While a destination is backed off, nothing probes it — including the
-    /// message that earned the backoff. The probe is the next attempt after
-    /// the wait, and that is the whole saving: one connection per interval
-    /// instead of one per message per sweep.
     #[tokio::test]
     async fn nothing_touches_a_backed_off_destination_until_its_wait_is_over() {
         let queued: Vec<Envelope> = (0..3).map(|_| held(&["hi@dest.test"])).collect();
@@ -1344,9 +1042,6 @@ mod tests {
         assert_eq!(relay.deliveries().len(), 1);
     }
 
-    /// The backoff is per destination and not a pause on the queue: mail for
-    /// a host that is up must not wait behind a host that is down, which is
-    /// the failure this feature exists to prevent rather than cause.
     #[tokio::test]
     async fn a_destination_that_is_up_is_delivered_to_while_another_is_backed_off() {
         let broken = held(&["hi@broken.test"]);
@@ -1375,10 +1070,6 @@ mod tests {
         );
     }
 
-    /// A host that fails repeatedly waits longer each time, on the same
-    /// schedule a message does — and the count is the host's, so the second
-    /// failure's wait is the second interval even though each message that
-    /// provoked it was on its first attempt.
     #[test]
     fn a_hosts_wait_lengthens_with_its_own_failures() {
         let schedule = Schedule::default();
@@ -1407,8 +1098,6 @@ mod tests {
 
     #[test]
     fn a_host_nothing_has_tried_for_a_whole_ceiling_is_forgotten() {
-        // Otherwise the table keeps an entry per domain that has ever
-        // failed, and the queue of a busy forwarder names a great many.
         let schedule = Schedule::default();
         let hosts = Hosts::default();
         hosts.failed("dest.test", 0, &schedule);

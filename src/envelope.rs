@@ -1,64 +1,24 @@
-//! What the SMTP session agreed to, separate from the message itself.
-//!
-//! The envelope is what delivery acts on: who the sender told us it is from,
-//! who it is for, and what mxhop knows about the connection. None of it comes
-//! from the message's own headers, which are the sender's claims rather than
-//! the session's facts.
-
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Envelope {
-    /// The queue id, which is also the file name.
     pub id: String,
-    /// `MAIL FROM`. `None` is the null sender, `<>`: a bounce, which must
-    /// never be bounced again.
     pub from: Option<String>,
-    /// `RCPT TO`, as given — resolving aliases is delivery's job.
     pub to: Vec<String>,
-    /// What the client said in EHLO/HELO. A claim, kept for the trace.
     pub helo: String,
-    /// Where the connection came from.
     pub peer: String,
     pub received_at_unix_ms: u64,
-    /// The size of the stored message in bytes.
     pub size: u64,
-    /// The `Received` header mxhop built for this hop, which is prepended on
-    /// the wire and never stored in the message file. A held copy has to be
-    /// retried with the identical bytes — a second attempt that re-derives
-    /// the header would claim a time the message did not arrive at, and a
-    /// different trace would break the only thread an operator can follow
-    /// through two logs.
     #[serde(default)]
     pub received: String,
-    /// The `Authentication-Results` header mxhop built for this hop, which
-    /// goes on the wire directly under `received` and is likewise never
-    /// stored in the message file. Empty when the check is switched off.
-    ///
-    /// Kept for the same reason `received` is: a held copy has to be retried
-    /// with the identical bytes, and re-deriving this one would mean repeating
-    /// every lookup — possibly getting different answers, and certainly
-    /// losing the record of what was true when the message arrived.
     #[serde(default)]
     pub authentication_results: String,
-    /// What the destination last said about this message, for the operator
-    /// reading `queue/` — and the reason the next attempt is being made.
     #[serde(default)]
     pub last_reply: Option<String>,
-    /// How many delivery attempts this copy has already cost. A message
-    /// reaches the queue having been tried once already, in the session that
-    /// accepted it, so a held envelope is written with `1`: the wait before
-    /// the next attempt is a function of this number, and starting it at
-    /// zero would try the same destination twice in five minutes.
     #[serde(default)]
     pub attempts: u32,
-    /// The earliest moment the queue runner may try again, in unix
-    /// milliseconds. `0` — the default, and therefore what an envelope
-    /// written before this field existed says — means "now", which is the
-    /// right reading: a message that was held under an older build has been
-    /// waiting since that build stopped running.
     #[serde(default)]
     pub next_attempt_unix_ms: u64,
 }
@@ -115,12 +75,6 @@ mod tests {
         assert!(serde_json::from_str::<Envelope>(&json).unwrap().is_bounce());
     }
 
-    /// An envelope written by a build that had no retry queue still has to
-    /// be readable, and it has to come back as a message that is *due*: the
-    /// fields it lacks mean "try it now". Refusing to read it, or reading it
-    /// as scheduled for the epoch plus a backoff, would leave a message in
-    /// `queue/` that nothing ever delivers — which is the state this whole
-    /// milestone exists to end.
     #[test]
     fn an_envelope_from_before_the_retry_queue_is_due_immediately() {
         let json = r#"{

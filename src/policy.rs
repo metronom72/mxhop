@@ -1,12 +1,3 @@
-//! Who gets a copy, and what the sending server is told.
-//!
-//! Everything here is a pure function: an envelope, the alias table and what
-//! the message's own first header block says go in, a decision comes out.
-//! There is no clock, no socket and no disk in this file on purpose — every
-//! rule about who a message is copied to, and every rule about which reply a
-//! stranger's mail server reads, is then decided by something a test can call
-//! directly instead of by something a test has to simulate a network for.
-
 use std::collections::BTreeSet;
 
 use tracing::{info, warn};
@@ -16,79 +7,32 @@ use crate::envelope::Envelope;
 use crate::routing::{Mailbox, Route, Router, is_qualified};
 use crate::smtp::client::{self, Outcome, Reply};
 
-/// What mxhop does about a message whose own domain says it is a forgery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Enforce {
-    /// Refuse a DMARC failure whose domain publishes `p=reject`, and defer
-    /// where a definite answer could have refused. Everything else is
-    /// forwarded with the header saying what was found.
     #[default]
     Dmarc,
-    /// Evaluate and stamp the header, never refuse and never defer.
     Off,
 }
 
-/// The bounds mxhop puts on a message's trace, and on its own alias table.
 #[derive(Debug, Clone)]
 pub struct Limits {
-    /// How many `Received` headers a message may already carry.
     pub max_received: usize,
-    /// How many of those may name this host.
     pub max_by_us: usize,
-    /// How deep an alias may point at another of our own domains.
     pub max_internal_depth: usize,
-    /// What a DMARC failure is worth. Here rather than in its own argument
-    /// because `Limits` is already "what counts as refusable", and this is one
-    /// more entry on that list.
     pub enforce: Enforce,
 }
 
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            // Postfix allows 50 and Exim 25. 25 is the right one for a
-            // forwarder: a forwarder's own job adds a hop to somebody else's
-            // path, so the loop it is likeliest to be part of is short and
-            // fast (us → Gmail → a filter → us), and the cost of stopping one
-            // hop early is one unusual message refused with an explanation
-            // rather than a mail storm between two hosts. This was a
-            // judgement call, not a specified number.
             max_received: 25,
-            // Three, not one: a message legitimately passing through this
-            // host twice is conceivable (a list that expands to a second of
-            // our aliases), and a third pass cannot be.
-            //
-            // Three sightings is not three passes. The match is deliberately
-            // loose about where our name sits in the header, so a round trip
-            // through Gmail leaves two: the `by` clause of the header we
-            // wrote, and the `from` clause of the header Gmail wrote about
-            // us. A bound of three therefore stops the loop on its second
-            // return, not its third — which is the behaviour wanted, and
-            // worth stating because the number on its own reads as a count of
-            // passes.
             max_by_us: 3,
-            // `config::check` already refuses a table with a loop in it, so
-            // this bound should never be reached. It exists because the table
-            // may be reloadable at runtime later, and a bound is cheaper than
-            // trusting that whatever installed the table had validated it.
             max_internal_depth: 8,
-            // On by default, and the argument for that is the whole of
-            // `check_authentication` below: it refuses only mail whose own
-            // domain asked every receiver to refuse it, defers only where a
-            // missing answer could have been that refusal, and forwards
-            // everything else. Nothing it does is silent — every refusal
-            // names the domain and the policy it came from, in a sentence the
-            // sending server reads while it still holds the message.
             enforce: Enforce::Dmarc,
         }
     }
 }
 
-/// What the message's own first header block says about where it has been.
-///
-/// Headers are the sender's claims rather than facts, which is why this is a
-/// separate input: the rules below are about what the trace *claims*, and a
-/// forged claim can only make mxhop more cautious, never less.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Head {
     pub received_count: usize,
@@ -96,11 +40,6 @@ pub struct Head {
 }
 
 impl Head {
-    /// Reads the first header block of a message as it arrived.
-    ///
-    /// Stops at the blank line that ends the headers: a `Received:` line in
-    /// the body belongs to a forwarded copy somebody pasted, and counting it
-    /// would refuse mail for a quotation.
     pub fn scan(message: &[u8], hostname: &str) -> Head {
         let mut head = Head::default();
         let hostname = hostname.to_ascii_lowercase();
@@ -111,14 +50,6 @@ impl Head {
                 continue;
             }
             head.received_count += 1;
-            // Deliberately loose about *where*: anywhere in the header, not
-            // only after `by`. A sender can forge a mention of us, but
-            // forging one can only get its own message refused.
-            //
-            // Not loose about *what*, though. A bare `contains` also matches
-            // `backup-mx.tooling.ninja` and `mx.tooling.ninja.example`,
-            // neither of which is this host, so the name has to be bounded by
-            // something that cannot be part of a hostname at either end.
             if names_host(&line, &hostname) {
                 head.by_us_count += 1;
             }
@@ -127,14 +58,6 @@ impl Head {
     }
 }
 
-/// Whether `line` names exactly `hostname`, rather than merely containing it.
-///
-/// A hostname is made of letters, digits, hyphens and dots, so a sighting is
-/// only ours when the characters on both sides of it are none of those: a
-/// hyphen before it makes `backup-mx.tooling.ninja`, and a dot after it makes
-/// `mx.tooling.ninja.example`. Both are other people's hosts, and counting
-/// either one is how a message that has never been here gets refused as a
-/// loop. Both arguments are already lowercase.
 fn names_host(line: &str, hostname: &str) -> bool {
     if hostname.is_empty() {
         return false;
@@ -149,7 +72,6 @@ fn names_host(line: &str, hostname: &str) -> bool {
     })
 }
 
-/// The header block, one unfolded header per item.
 struct HeaderLines<'a> {
     rest: &'a [u8],
     done: bool,
@@ -192,20 +114,10 @@ impl Iterator for HeaderLines<'_> {
                 break;
             };
             if line.is_empty() && header.is_empty() {
-                // The blank line that ends the header block.
                 self.done = true;
                 return None;
             }
             header.push_str(&String::from_utf8_lossy(line));
-            // Folded continuations belong to the header above them, so they
-            // are joined rather than counted: a `Received` header spread over
-            // four lines is one hop, not four. The peek has to come *after*
-            // the line has been consumed, because what makes a line a
-            // continuation of this header is that the line below it begins
-            // with whitespace — peeking before `next_line` tested the line
-            // about to be read instead, which glued every fold onto the
-            // following header and let a folded last header swallow the blank
-            // line that ends the block.
             if !matches!(self.rest.first(), Some(b' ' | b'\t')) {
                 break;
             }
@@ -219,34 +131,24 @@ impl Iterator for HeaderLines<'_> {
     }
 }
 
-/// One domain's worth of recipients: one connection serves all of them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Group {
     pub domain: String,
     pub recipients: Vec<Mailbox>,
 }
 
-/// Where this message goes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Plan {
     pub groups: Vec<Group>,
-    /// The envelope sender as it arrived, unchanged.
-    ///
-    /// SRS rewrites this before it reaches the wire, but not here: the
-    /// rewrite needs today's date, and this file deliberately has no clock in
-    /// it. The session applies `srs::Srs::rewrite` to this value on the way
-    /// to the delivery.
     pub sender: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
-    /// Say this to the sending server and store nothing.
     Refuse(Reply),
     Deliver(Plan),
 }
 
-/// Turns one accepted envelope into the deliveries it means.
 pub fn decide(
     envelope: &Envelope,
     router: &Router,
@@ -254,36 +156,16 @@ pub fn decide(
     limits: &Limits,
     auth: &Auth,
 ) -> Decision {
-    // The trace is checked before the table, because a message in a loop is
-    // not one whose recipients are interesting. The session calls this first
-    // too, before it spends any DNS budget — see `check_trace`.
     if let Some(reply) = check_trace(head, limits) {
         return Decision::Refuse(reply);
     }
 
-    // What the `From` domain itself says about this message, before the alias
-    // table is consulted: a forgery's recipients are no more interesting than
-    // a loop's.
     if let Some(reply) = check_authentication(auth, limits.enforce) {
         return Decision::Refuse(reply);
     }
 
     let mut flat = Vec::new();
     for recipient in &envelope.to {
-        // Every recipient here was accepted at RCPT time, so it parses; one
-        // that does not is dropped rather than refusing the whole message for
-        // the others.
-        //
-        // Dropped, but not silently. A judgement call on where the word goes:
-        // carrying these out of `decide` would put them in the reply, and the
-        // reply is the wrong place — the sending server cannot act on a
-        // recipient we accepted and then could not read, and telling it about
-        // one would refuse or qualify mail the other recipients are getting.
-        // What this is is a bug in us: RCPT accepted something `decide`
-        // cannot parse, and the two are meant to agree. So it stays a
-        // delivery decision, and the record of it goes to the operator, who
-        // is the only one who can fix the disagreement. `decide` has no
-        // clock, socket or disk and still has none; a log line is not state.
         let Ok(mailbox) = Mailbox::parse(recipient) else {
             warn!(
                 recipient,
@@ -304,8 +186,6 @@ pub fn decide(
         }
     }
 
-    // One copy per mailbox. Two aliases on one envelope that lead to the same
-    // address are two routes to one person, not two messages.
     let mut seen = BTreeSet::new();
     flat.retain(|mailbox| seen.insert(mailbox.clone()));
 
@@ -320,20 +200,10 @@ pub fn decide(
 
     Decision::Deliver(Plan {
         groups: group_by_domain(flat),
-        // As it arrived. The session rewrites it into the SRS domain on the
-        // way out, where the clock is; the null sender stays null either way
-        // — a bounce that acquired a sender could be bounced again.
         sender: envelope.from.clone(),
     })
 }
 
-/// Recipients grouped by domain, in the order the domains were first seen.
-///
-/// One connection serves one domain, so this is the shape delivery wants; the
-/// order is the order they arrived in, which keeps it reproducible for a test
-/// to assert on. Shared with the queue runner, which groups the recipients
-/// that are still deferred — the rule that one connection serves one domain
-/// is not the inbound session's rule, it is SMTP's.
 pub fn group_by_domain(recipients: Vec<Mailbox>) -> Vec<Group> {
     let mut groups: Vec<Group> = Vec::new();
     for mailbox in recipients {
@@ -348,18 +218,6 @@ pub fn group_by_domain(recipients: Vec<Mailbox>) -> Vec<Group> {
     groups
 }
 
-/// The loop rules, on the trace alone, or `None` if this message is not in
-/// one.
-///
-/// Split out of [`decide`] so that the session can ask them *before* it
-/// spends anything. [`Head::scan`] is pure and costs no lookups, while the
-/// authentication check that used to run ahead of it can spend the whole DNS
-/// budget — so a looping message paid twenty seconds of resolver time on
-/// every hop before being refused for the loop. That is the one refusal which
-/// is certain in advance and needs nothing from the network, and the sending
-/// server waiting for it is this host in another incarnation.
-///
-/// `decide` still calls this, so the rule holds for any caller that does not.
 pub fn check_trace(head: &Head, limits: &Limits) -> Option<Reply> {
     if head.received_count >= limits.max_received {
         return Some(Reply {
@@ -376,10 +234,6 @@ pub fn check_trace(head: &Head, limits: &Limits) -> Option<Reply> {
         return Some(Reply {
             code: 554,
             enhanced: Some("5.4.6".into()),
-            // The host is not named here because this function is given no
-            // hostname: the `Received` header this hop would have added names
-            // it, and the sender's own trace shows it. Keeping the signature
-            // free of configuration is worth more than the name in the text.
             text: "this message has already passed through this host".into(),
             lines: Vec::new(),
         });
@@ -387,29 +241,11 @@ pub fn check_trace(head: &Head, limits: &Limits) -> Option<Reply> {
     None
 }
 
-/// The reply a message's own authentication earns it, or `None` to forward.
-///
-/// **Defer only where a definite answer could have refused.** That one
-/// sentence is the whole of this function, and every arm below is it applied
-/// to a case.
-///
-/// Nothing is decided at `MAIL FROM` or `RCPT TO`, and nothing is decided on
-/// SPF alone. An SPF hard failure with an aligned DKIM pass is a DMARC *pass*,
-/// and that is exactly what mail forwarded by somebody else looks like:
-/// refusing on the SPF result would refuse every message another forwarder
-/// relays to us. DMARC is the only identity a domain owner has actually made a
-/// request about, so DMARC is the only thing acted on.
 fn check_authentication(auth: &Auth, enforce: Enforce) -> Option<Reply> {
     if !auth.checked {
         return None;
     }
 
-    // `enforce = "off"` is sold as the setting for watching what enforcement
-    // *would* do for a week before turning it on, and the rollout plan is to
-    // use it exactly that way. Returning here without a word made that week
-    // blind: the only trace of a would-be refusal was the header, at the
-    // destination, in somebody else's mailbox. So the verdict is computed
-    // either way and the reply is logged instead of sent.
     if enforce == Enforce::Off {
         if let Some(reply) = authentication_reply(auth) {
             info!(
@@ -428,26 +264,9 @@ fn check_authentication(auth: &Auth, enforce: Enforce) -> Option<Reply> {
     authentication_reply(auth)
 }
 
-/// The reply the DMARC verdict earns, with no regard to whether `enforce`
-/// will let it be sent. Split out from [`check_authentication`] so that
-/// `enforce = "off"` can log the very same sentence it is declining to send:
-/// a second copy of this table, written for the log, is a second table to get
-/// wrong.
 pub(crate) fn authentication_reply(auth: &Auth) -> Option<Reply> {
     let domain = &auth.dmarc.from_domain;
     match (auth.dmarc.result, auth.dmarc.policy) {
-        // A failure under `p=reject` that *might* have been a pass if the
-        // DKIM stage had finished. Deferring rather than refusing, because a
-        // `550` is permanent and the evidence that would have cleared this
-        // message — an aligned signature — was never fetched: a key lookup
-        // that hung is our problem to retry, not the sender's to be bounced
-        // over. See `crate::auth::Auth::dkim_timed_out`.
-        //
-        // This is not a way through. The message is still refused; only the
-        // code changes, and the attacker who hangs his own key lookup to earn
-        // it has bought a deferral rather than the delivery he wanted. What
-        // it buys the honest sender is the retry during which his nameserver
-        // comes back.
         (DmarcVerdict::Fail, Some(AuthPolicy::Reject)) if auth.dkim_timed_out => Some(Reply {
             code: 451,
             enhanced: Some("4.7.1".into()),
@@ -459,10 +278,6 @@ pub(crate) fn authentication_reply(auth: &Auth) -> Option<Reply> {
             lines: Vec::new(),
         }),
 
-        // The central rule. The domain published `p=reject`, the message
-        // failed, and the refusal happens while the sending server still holds
-        // the message — the one moment it costs nobody anything. See
-        // `crate::auth` for why forwarding it instead is worse than it looks.
         (DmarcVerdict::Fail, Some(AuthPolicy::Reject)) => Some(Reply {
             code: 550,
             enhanced: Some("5.7.1".into()),
@@ -473,43 +288,9 @@ pub(crate) fn authentication_reply(auth: &Auth) -> Option<Reply> {
             lines: Vec::new(),
         }),
 
-        // A definite answer could have been the refusal above, so neither 250
-        // nor 550 can be given honestly: the record is in hand, it says
-        // `reject`, and only the alignment lookup failed. A retry can get a
-        // different answer, and this is the one case where it is worth
-        // asking for one.
-        //
-        // **Why a `temperror` with no policy in hand is *not* here.** It
-        // reads like the same unknown — a policy nobody could fetch could
-        // have been `reject` — but `mail-auth` makes that reading far wider
-        // than it looks. Its DMARC tree walk aborts the *whole* walk on the
-        // first non-NXDOMAIN failure at any level, including after it has
-        // already read the record at the `From` domain, and discards the
-        // record as it does (`dmarc/verify.rs`: the output comes back with
-        // no policy and a `TempError`). So "no policy" is produced not only
-        // by a lame `_dmarc` delegation at the sender, but by a REFUSED
-        // answer, a flaky authoritative server or a DNSSEC-bogus zone
-        // anywhere in that domain's `_dmarc` ancestry — none of which
-        // affected delivery here before, because inbound mail never needed
-        // the sender's DNS. `Auth::timed_out` reports the same shape, so our
-        // own expired DNS budget landed here too, and one dead `include:` in
-        // an ordinary sender's SPF record can spend it.
-        //
-        // A retry gets the same answer, so deferring meant bouncing after
-        // the sender's retry window — with nothing but a `451` in the
-        // journal and the correspondent left to report the loss. What the
-        // narrow rule gives up is small and not the attacker's to arrange: a
-        // forgery of a `p=reject` domain gets through only while *that
-        // domain's own* `_dmarc` is unanswerable, and the destination then
-        // evaluates DMARC with its own resolver anyway. Accept and stamp on
-        // temperror is what OpenDMARC, rspamd and Gmail all do.
         (DmarcVerdict::TempError, Some(AuthPolicy::Reject)) => Some(Reply {
             code: 451,
             enhanced: Some("4.7.1".into()),
-            // The policy is named as well as the domain: this arm now always
-            // has `p=reject` in hand, and the house rule is that an operator
-            // reading a refusal can tell what was being enforced without
-            // going back to DNS.
             text: format!(
                 "could not finish checking DMARC for {domain}, which asks for \
                  failures to be rejected (p=reject); try again"
@@ -517,34 +298,12 @@ pub(crate) fn authentication_reply(auth: &Auth) -> Option<Reply> {
             lines: Vec::new(),
         }),
 
-        // Everything else is forwarded, and the header says what was found.
-        //
-        // `p=quarantine` with a failure, because mxhop has no spam folder and
-        // the destination does — the policy goes into the header instead.
-        // `p=none` with a failure, because that domain asked to be told, not
-        // to be protected. No record or a `permerror`, because there is
-        // nothing to enforce (RFC 7489 §6.6.3 reads a permanent error as no
-        // record). A `temperror` under a policy that is known not to be
-        // `reject`, because nothing would have been refused anyway — and a
-        // `temperror` with *no* policy in hand, for the reasons argued on
-        // the arm above. And zero
-        // or several `From` domains, which arrive here as a `permerror`: RFC
-        // 7489 §6.6.1 would prefer a refusal, and refusing a shape of message
-        // that is merely unusual is how a forwarder loses mail, so the
-        // destination — which recomputes all of this — gets to decide.
         _ => None,
     }
 }
 
-/// Hit when an alias chain is deeper than [`Limits::max_internal_depth`].
 struct TooDeep;
 
-/// Resolves one mailbox to the addresses mail actually leaves for.
-///
-/// An alias whose destination is one of our own domains is resolved here
-/// rather than handed to our own MX record: delivering it would send the
-/// message to this process, which would expand it on the next hop and spend a
-/// `Received` header to do what a table lookup does.
 fn expand(
     router: &Router,
     mailbox: Mailbox,
@@ -566,18 +325,7 @@ fn expand(
             }
             Ok(())
         }
-        // A refusal is a refusal however it is reached: this branch of the
-        // expansion is dropped, and the others still go. That one was asked
-        // for, so it is not worth a word.
         Some((_, Route::Reject(_))) => Ok(()),
-        // This one was not. An alias pointed at a local part of one of our
-        // own domains that the table has no route for, so the copy goes
-        // nowhere and nobody is told: `check` forbids it in a static
-        // configuration, but the configuration is reloadable and the table
-        // that passed `check` is not necessarily the table that is running.
-        // Named here rather than carried out of `decide` for the same reason
-        // as an unparseable recipient: it is our table that is wrong, and the
-        // stranger whose mail this is cannot do anything about it.
         None => {
             warn!(
                 recipient = %mailbox,
@@ -590,38 +338,13 @@ fn expand(
     }
 }
 
-/// What one delivery attempt's results mean for the inbound session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Verdict {
-    /// The single reply the sending server reads.
     pub reply: Reply,
-    /// The recipients whose copy has not been delivered and has not been
-    /// refused either, so the message has to be kept for them — each with
-    /// what its own destination said, for the operator reading `queue/` and
-    /// for the envelope's own record. Nothing acts on it: there is no retry
-    /// queue yet.
-    ///
-    /// One reply per recipient rather than one for the batch: two held
-    /// recipients at two hosts are stuck for two different reasons, and the
-    /// operator looking at one of them needs that one's answer.
     pub hold: Vec<(Mailbox, Reply)>,
-    /// The recipients whose copy is being thrown away: permanently refused in
-    /// a mixed outcome, where the sending server has already been told 250
-    /// and cannot be told otherwise. Each with the destination's own reply,
-    /// because that sentence is the only record this copy will ever have.
-    ///
-    /// Held in neither sense of the word — `hold` is for copies somebody may
-    /// still deliver. These are gone; the caller's job is to say so loudly
-    /// enough that the loss is findable afterwards.
     pub lost: Vec<(Mailbox, Reply)>,
 }
 
-/// Collapses every destination's answer into the one reply SMTP allows.
-///
-/// `id` is the queue id, which goes into the acceptance so that the sending
-/// server's log line and ours can be joined. The plan wrote this function as
-/// `reply_for(&[Outcome])`; the id is the one thing it needs that the
-/// outcomes do not carry.
 pub fn reply_for(outcomes: &[Outcome], id: &str) -> Verdict {
     let mut accepted = 0usize;
     let mut deferred: Vec<(Option<&str>, &Reply, &Mailbox)> = Vec::new();
@@ -639,26 +362,6 @@ pub fn reply_for(outcomes: &[Outcome], id: &str) -> Verdict {
     }
 
     if accepted > 0 {
-        // Something arrived. The sending server must not be asked to send it
-        // again, so the answer is 250 whatever happened to the rest.
-        //
-        // Deferred recipients are held here and are visible in `queue/` until
-        // the retry-queue milestone picks them up. Permanently refused ones
-        // are a known hole: the sender has been told 250 and cannot be told
-        // otherwise, and only a DSN of our own could report the failure.
-        // There is no DSN generator yet, so those copies are lost — but they
-        // come back in `lost` so the caller can name each one at error level,
-        // rather than being dropped on the floor here and not papered over by
-        // pretending a 550 is retryable either.
-        //
-        // A judgement call: the alternative was to put them in `queue/` with
-        // their 550 in `last_reply`, which would make the loss visible to
-        // `ls` instead of only to a log. It was not taken because `queue/`
-        // has no way to mark an entry as not-to-be-retried, so the
-        // retry-queue milestone — which exists to drain that directory —
-        // would pick these up and retry a permanent refusal for ever. A
-        // directory whose entries mean two opposite things is worse than a
-        // log line, and the loss stays findable either way.
         return Verdict {
             reply: Reply {
                 code: 250,
@@ -677,27 +380,13 @@ pub fn reply_for(outcomes: &[Outcome], id: &str) -> Verdict {
         };
     }
 
-    // Nothing arrived, so nothing is stored: the sending server still holds
-    // the message and is the right place for it to wait.
     let worth = |(_, reply, _): &(Option<&str>, &Reply, &Mailbox)| -> u8 {
-        // Mirrors `client::Fail::worth`: the sentence worth relaying is the
-        // destination's own, and a reply mxhop wrote for itself — which is
-        // what the `mxhop:` marker means — says the least.
         match (reply.code >= 500, reply.text.starts_with("mxhop: ")) {
             (true, _) => 3,
             (false, false) => 2,
             (false, true) => 1,
         }
     };
-    // When nothing is undecided the code follows the sentence, so the most
-    // informative reply of all of them is the right one. When something *is*
-    // undecided the code is forced down to 4xx (below), and then only a
-    // deferral's sentence can agree with it: a 451 quoting `no such user`
-    // tells the sender to retry something that will never be accepted. The
-    // permanent sentence is dropped rather than added as a second line
-    // because it belongs to a recipient the sender cannot help by retrying,
-    // which is the only thing a 4xx asks them to do; the copy it belongs to
-    // is reported through `lost` instead.
     let best = if deferred.is_empty() {
         refused.iter().max_by_key(|entry| worth(entry))
     } else {
@@ -706,19 +395,12 @@ pub fn reply_for(outcomes: &[Outcome], id: &str) -> Verdict {
 
     let reply = match best {
         None => Reply {
-            // No recipients at all. Not reachable from the session — a plan
-            // with no groups is refused by `decide` — but a 451 is the safe
-            // answer to "we do not know what happened".
             code: 451,
             enhanced: Some("4.4.1".into()),
             text: "mxhop: nothing was delivered and nothing said why".into(),
             lines: Vec::new(),
         },
         Some((host, reply, _)) => {
-            // The destination's own words, attributed, and still as the lines
-            // they arrived on: re-folded on the way out they keep the
-            // enhanced code at the front of each line where the sender
-            // expects it, instead of stranded in the middle of one long one.
             let relayed = match host {
                 Some(host) if !reply.text.starts_with("mxhop: ") => {
                     (*reply).clone().attributed_to(host)
@@ -728,10 +410,6 @@ pub fn reply_for(outcomes: &[Outcome], id: &str) -> Verdict {
             if deferred.is_empty() {
                 relayed
             } else {
-                // One recipient still undecided makes the whole message
-                // retryable, even when the informative sentence came from a
-                // permanent refusal — so the code is 4xx and the enhanced
-                // code must not stay 5.x.x and contradict it.
                 let enhanced = match &reply.enhanced {
                     Some(enhanced) if enhanced.starts_with('4') => enhanced.clone(),
                     _ => "4.4.1".to_string(),
@@ -752,52 +430,27 @@ pub fn reply_for(outcomes: &[Outcome], id: &str) -> Verdict {
     }
 }
 
-/// The facts of one hop, which become one `Received` header.
 #[derive(Debug, Clone)]
 pub struct Trace {
-    /// What the client said in EHLO/HELO. A claim, and sanitised as one.
     pub helo: String,
-    /// The peer's reverse DNS, when it has one.
     pub ptr: Option<String>,
-    /// The peer's address, without a port.
     pub ip: String,
-    /// This host's name.
     pub by: String,
-    /// The queue id, which is how this hop is found in two logs at once.
     pub id: String,
-    /// Whether the client said EHLO (`ESMTP`/`ESMTPS`) rather than HELO
-    /// (`SMTP`).
     pub esmtp: bool,
-    /// Whether the session was inside TLS when the message arrived, which is
-    /// the difference between `ESMTP` and `ESMTPS`.
     pub tls: bool,
-    /// Every envelope recipient. The `for` clause is written only when there
-    /// is exactly one.
     pub recipients: Vec<String>,
     pub at_unix_ms: u64,
 }
 
 impl Trace {
-    /// The header, CRLF-terminated, ready to be written in front of the
-    /// stored message.
     pub fn header(&self) -> String {
-        // Every piece of this that came from the other end of the connection
-        // is either domain-shaped or replaced. A HELO name is whatever the
-        // client typed, and a name with a CRLF in it copied in verbatim would
-        // end this header and begin one of the client's own — a forged
-        // `Received`, or an `Authentication-Results` the destination trusts.
-        // That is the one security bug this header can carry.
         let helo = name_or_unknown(Some(&self.helo));
         let ptr = name_or_unknown(self.ptr.as_deref());
         let ip = match self.ip.parse::<std::net::IpAddr>() {
             Ok(ip) => ip.to_string(),
             Err(_) => "unknown".to_string(),
         };
-        // RFC 3848 names four protocols, and the one for an ESMTP session
-        // carried inside TLS is `ESMTPS`. Not cosmetic: this field is what
-        // Gmail reads to decide whether to show the recipient that the hop
-        // was encrypted, so writing `ESMTP` for a TLS session reports our own
-        // link as plaintext.
         let proto = match (self.esmtp, self.tls) {
             (true, true) => "ESMTPS",
             (true, false) => "ESMTP",
@@ -806,37 +459,23 @@ impl Trace {
 
         let mut parts = vec![
             format!("Received: from {helo} ({ptr} [{ip}])"),
-            // `(mxhop)` is the product, which is what an operator grepping a
-            // destination's headers for our mail actually searches for.
             format!("by {} (mxhop) with {proto} id {}", self.by, self.id),
         ];
-        // RFC 5321 §4.4 allows one `for`, and with several recipients each
-        // copy would tell its reader who else received it — a disclosure the
-        // sender never asked for.
         if let [only] = &self.recipients[..]
             && is_safe_address(only)
         {
             parts.push(format!("for <{only}>"));
         }
-        // The `;` belongs immediately before the date, wherever the clauses
-        // ended.
         let last = parts.len() - 1;
         parts[last].push(';');
         parts.push(email_date(self.at_unix_ms));
 
-        // Folded with CRLF and whitespace: one logical header, however long.
         let mut header = parts.join("\r\n        ");
         header.push_str("\r\n");
         header
     }
 }
 
-/// A name fit to print in a trace, or `unknown`.
-///
-/// Anything that is not domain-shaped — an address literal, a bare
-/// `localhost`, a name with a control character in it — becomes `unknown`
-/// rather than being quoted: a reader of this header cannot tell a sanitised
-/// name from a real one, so the only safe report is that there was none.
 pub(crate) fn name_or_unknown(name: Option<&str>) -> String {
     match name {
         Some(name) if is_qualified(name) => name.to_string(),
@@ -844,7 +483,6 @@ pub(crate) fn name_or_unknown(name: Option<&str>) -> String {
     }
 }
 
-/// Whether an envelope recipient can be written into a header as it stands.
 pub(crate) fn is_safe_address(address: &str) -> bool {
     !address.is_empty()
         && address.len() <= 320
@@ -853,11 +491,6 @@ pub(crate) fn is_safe_address(address: &str) -> bool {
             .any(|c| c.is_control() || c.is_whitespace() || c == '<' || c == '>')
 }
 
-/// An RFC 5322 date in UTC.
-///
-/// Written out rather than pulled in with a date crate: this is the only date
-/// mxhop formats, and the arithmetic is Howard Hinnant's `civil_from_days`,
-/// which is exact for every day in the range a clock can hold.
 pub fn email_date(unix_ms: u64) -> String {
     const DAY: u64 = 86_400;
     let secs = unix_ms / 1_000;
@@ -867,12 +500,9 @@ pub fn email_date(unix_ms: u64) -> String {
         (rest / 3_600, (rest % 3_600) / 60, rest % 60)
     };
 
-    // 1970-01-01 was a Thursday, which is where the weekday comes from.
     const WEEKDAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
     let weekday = WEEKDAYS[(days.rem_euclid(7)) as usize];
 
-    // Shift the epoch to 0000-03-01 so that a leap day is the last day of the
-    // year instead of one in the middle of it.
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = z - era * 146_097;
@@ -905,7 +535,6 @@ mod tests {
             "team",
             forward(&["a@gmail.test", "b@fast.test"]),
         );
-        // An internal hop: this alias points back at one of our own domains.
         r.insert("example.com", "staff", forward(&["team@example.com"]));
         r.insert(
             "example.com",
@@ -956,10 +585,6 @@ mod tests {
             .collect()
     }
 
-    /// Two aliases on one envelope that both lead to the same mailbox used to
-    /// mean two connections and two copies in that mailbox — the recipient
-    /// sees the duplicate, and there is no way for them to tell it was the
-    /// alias table rather than the sender.
     #[test]
     fn one_recipient_two_aliases_gets_one_copy() {
         let plan = plan(decide(
@@ -977,9 +602,6 @@ mod tests {
         );
     }
 
-    /// Without expansion the message is handed to our own MX record, arrives
-    /// back at this process, and either loops until the hop limit stops it or
-    /// is refused as a relay.
     #[test]
     fn an_internal_hop_is_expanded_before_leaving() {
         let plan = plan(decide(
@@ -997,9 +619,6 @@ mod tests {
         );
     }
 
-    /// One connection per domain. Two recipients at the same destination sent
-    /// over two connections double the destination's rate-limit accounting
-    /// against us for no reason.
     #[test]
     fn recipients_are_grouped_by_destination_domain() {
         let plan = plan(decide(
@@ -1026,9 +645,6 @@ mod tests {
         );
     }
 
-    /// A bounce is sent with `MAIL FROM:<>` so that it cannot itself be
-    /// bounced. Giving it a sender on the way out means a bounce loop between
-    /// two mail servers with us in the middle.
     #[test]
     fn the_null_sender_stays_null() {
         let bounce = Envelope {
@@ -1049,9 +665,6 @@ mod tests {
         );
     }
 
-    /// The loop the alias table cannot see: our alias forwards to Gmail, and
-    /// a filter there forwards back to another of our aliases. Nothing in the
-    /// table is wrong, and the message goes round until something counts.
     #[test]
     fn a_received_count_over_the_limit_is_refused_554() {
         let head = Head {
@@ -1076,8 +689,6 @@ mod tests {
         }
     }
 
-    /// The same loop seen from the other side, and the one that catches it
-    /// sooner: our own name in the trace three times means we are the loop.
     #[test]
     fn our_own_hostname_three_times_is_a_loop() {
         let head = Head {
@@ -1105,14 +716,6 @@ mod tests {
         }
     }
 
-    /// A trace that does not mention us is counted but not blamed on us: a
-    /// `by_us` test that matched any hostname would refuse ordinary mail.
-    ///
-    /// The `by` clause is on the *folded* line on purpose. Before the fold
-    /// was attributed to the header above it this test passed for the wrong
-    /// reason — the continuation was glued onto `Subject:`, so the hostname
-    /// was never looked at in a `Received` header at all, and a version that
-    /// did name us would have passed just as happily.
     #[test]
     fn a_trace_naming_somebody_else_is_not_us() {
         let message = b"Received: from a.test (a.test [10.0.0.1])\r\n\
@@ -1129,12 +732,6 @@ mod tests {
         assert_eq!(head.by_us_count, 0);
     }
 
-    /// Every real `Received` header is folded, Gmail's included: the `by`
-    /// clause is almost never on the first line. A scanner that attributed a
-    /// continuation to the header *below* it never saw our own name in a
-    /// `by` clause, which left both loop rules dead in production — the loop
-    /// that actually bites a forwarder (our alias → Gmail → a Gmail filter
-    /// forwards back to us) would have gone round for ever.
     #[test]
     fn our_own_name_in_a_folded_by_clause_is_still_us() {
         let message = b"Received: from mail-ed1-f54.google.test (mail-ed1-f54.google.test\r\n\
@@ -1154,9 +751,6 @@ mod tests {
         );
     }
 
-    /// A realistic block: four folded hops, two of them ours. Counting the
-    /// first line of each fold only — or gluing a fold onto the next header —
-    /// turns 4/2 into 1/0, and 1/0 is relayed.
     #[test]
     fn four_folded_hops_count_as_four() {
         let message = b"Received: from a.test (a.test [10.0.0.1])\r\n\
@@ -1184,12 +778,6 @@ mod tests {
         );
     }
 
-    /// The same bug in the other direction, and this one destroys legitimate
-    /// mail. `Content-Type: multipart/...;` with the boundary on a folded
-    /// line is the commonest last header there is; a scanner that let the
-    /// fold swallow the blank line read the whole body as headers, so a
-    /// forwarded bounce quoting a trace scanned 4/3 and was refused
-    /// `554 5.4.6` as a loop.
     #[test]
     fn a_folded_last_header_does_not_let_the_body_count_as_a_trace() {
         let message = b"Received: from a.test by mx.elsewhere.test with ESMTP id 1\r\n\
@@ -1213,9 +801,6 @@ mod tests {
         );
     }
 
-    /// `contains` is not a hostname match. A backup MX and a lookalike
-    /// subdomain both contain our name, and neither is us; counting them is
-    /// how a sighting of somebody else's host becomes a loop refusal.
     #[test]
     fn a_hostname_that_merely_contains_ours_is_not_ours() {
         let message = b"Received: from a.test\r\n\
@@ -1256,9 +841,6 @@ mod tests {
         }
     }
 
-    /// RFC 5321 §4.4 allows one `for`, and listing several recipients tells
-    /// everyone who gets a copy who else did — a privacy leak the sender
-    /// never asked for and cannot see.
     #[test]
     fn received_has_for_only_with_one_recipient() {
         let one = trace("mail.elsewhere.test", &["hi@example.com"]).header();
@@ -1276,10 +858,6 @@ mod tests {
         assert!(two.contains("ESMTP id"), "{two}");
     }
 
-    /// The one security bug this header can carry. A HELO name is whatever
-    /// the client typed; typed with a CRLF in it and copied in verbatim, it
-    /// ends our header and starts one of its own — a forged `Received`, or
-    /// worse an `Authentication-Results` the destination believes.
     #[test]
     fn a_helo_with_a_newline_cannot_forge_a_header() {
         let header = trace(
@@ -1294,7 +872,6 @@ mod tests {
                 .contains("authentication-results"),
             "a crafted HELO must not reach the header at all: {header:?}"
         );
-        // Every line of the header is either the first one or a fold.
         for line in header.trim_end_matches("\r\n").split("\r\n").skip(1) {
             assert!(
                 line.starts_with(' ') || line.starts_with('\t'),
@@ -1307,10 +884,6 @@ mod tests {
         );
     }
 
-    /// RFC 3848's keyword for an ESMTP session inside TLS is `ESMTPS`, and
-    /// Gmail's security indicator reads exactly this field: a header that
-    /// says `ESMTP` for an encrypted hop reports our own link as plaintext
-    /// to the recipient.
     #[test]
     fn a_session_inside_tls_says_esmtps() {
         let encrypted = Trace {
@@ -1357,9 +930,6 @@ mod tests {
         );
     }
 
-    /// The date is the one part of the header a human reads against their own
-    /// clock, and an off-by-one in the civil-date arithmetic is invisible
-    /// until somebody tries to order two messages by it.
     #[test]
     fn the_date_is_rfc_5322_in_utc() {
         assert_eq!(
@@ -1420,10 +990,6 @@ mod tests {
         assert!(verdict.hold.is_empty());
     }
 
-    /// The whole point of a synchronous forwarder. If the sender reads our
-    /// own words instead of Gmail's, the person who has mistyped an address
-    /// is told "delivery failed" by a host they have never heard of, and
-    /// Gmail's actual sentence — which says what to do — is lost.
     #[test]
     fn all_refused_carries_the_destinations_text() {
         let verdict = reply_for(
@@ -1451,9 +1017,6 @@ mod tests {
         assert!(verdict.hold.is_empty(), "a refusal is nobody's to retry");
     }
 
-    /// Deferred means nothing is known yet, and the sending server is still
-    /// holding the message. Answering 250 and keeping it ourselves moves the
-    /// retry responsibility onto a forwarder that has no retry queue yet.
     #[test]
     fn all_deferred_is_451_and_nothing_is_held() {
         let verdict = reply_for(
@@ -1475,9 +1038,6 @@ mod tests {
         );
     }
 
-    /// The case with no honest single answer. One of two recipients got the
-    /// message, so the sender must not retransmit — which means 250 — and the
-    /// other one's copy is ours to keep.
     #[test]
     fn mixed_is_250_and_holds_the_rest() {
         let verdict = reply_for(
@@ -1508,11 +1068,6 @@ mod tests {
         );
     }
 
-    /// Two held recipients at two different hosts have two different
-    /// reasons, and the operator reading `queue/` needs the one belonging to
-    /// the recipient in front of them. Keeping only the first deferral's
-    /// reply meant the second host's answer never reached the envelope, so a
-    /// message stuck for two unrelated causes looked stuck for one.
     #[test]
     fn each_held_recipient_keeps_its_own_reason() {
         let verdict = reply_for(
@@ -1552,12 +1107,6 @@ mod tests {
         );
     }
 
-    /// A permanent refusal in a mixed outcome is the known hole: the sender
-    /// has been told 250, so only a DSN of our own could report it, and there
-    /// is no DSN generator yet. It must not be held — retrying a 550 forever
-    /// is worse — but the copy that is thrown away has to be *named*, with
-    /// the destination's own sentence, or the loss leaves no trace anywhere
-    /// and there is nothing for anyone to find afterwards.
     #[test]
     fn a_refusal_in_a_mixed_outcome_is_named_as_lost() {
         let verdict = reply_for(
@@ -1594,14 +1143,6 @@ mod tests {
         );
     }
 
-    /// When several destinations refuse, the sender gets one sentence. The
-    /// one worth sending is the one that says something: a destination's own
-    /// refusal beats a deferral mxhop wrote for itself when nothing answered.
-    ///
-    /// Both recipients are refused, so there is nothing undecided and the
-    /// code is free to follow the sentence. Written with one of them deferred
-    /// this test demanded the contradiction `a_downgraded_code_does_not_carry_
-    /// a_permanent_sentence` exists to forbid.
     #[test]
     fn the_most_informative_refusal_is_the_one_relayed() {
         let verdict = reply_for(
@@ -1637,12 +1178,6 @@ mod tests {
         );
     }
 
-    /// A 451 must not carry a sentence that says never. When the code is
-    /// forced down to 4xx by an undecided recipient, the sender's only
-    /// possible action is to retry, and relaying a permanent refusal's words
-    /// under it tells them to retry something that will never be accepted —
-    /// `451 4.4.1 ... said: no such user` reads as a contradiction and
-    /// Postfix's own log line repeats it to the postmaster that way.
     #[test]
     fn a_downgraded_code_does_not_carry_a_permanent_sentence() {
         let verdict = reply_for(
@@ -1682,8 +1217,6 @@ mod tests {
     #[test]
     fn a_plan_that_expands_to_nothing_is_refused_rather_than_silently_dropped() {
         let mut r = Router::default();
-        // An alias pointing at one of our own local parts that has no route:
-        // `config::check` catches this, and a reloaded table might not.
         r.insert("example.com", "hi", forward(&["ghost@example.com"]));
 
         match decide(
@@ -1701,8 +1234,6 @@ mod tests {
     #[test]
     fn an_internal_hop_deeper_than_the_bound_is_refused() {
         let mut r = Router::default();
-        // A cycle the table check would have refused. The bound is what keeps
-        // this from being an infinite expansion in a long-running process.
         r.insert("example.com", "a", forward(&["b@example.com"]));
         r.insert("example.com", "b", forward(&["a@example.com"]));
 
@@ -1718,9 +1249,6 @@ mod tests {
         }
     }
 
-    /// An internal hop onto an address the table refuses has to drop that
-    /// branch, not deliver it: `Route::Reject` is a refusal wherever it is
-    /// reached from.
     #[test]
     fn an_internal_hop_onto_a_rejected_address_is_dropped() {
         let mut r = Router::default();
@@ -1745,12 +1273,8 @@ mod tests {
         assert_eq!(mailboxes(&plan), vec!["a@gmail.test"]);
     }
 
-    // ------------------------------------------------ the decision table of §2
-
     use crate::auth::{Dkim, DkimVerdict, Dmarc, DmarcVerdict, Policy, Spf};
 
-    /// A verdict for a message whose `From` domain published `policy` and
-    /// whose DMARC evaluation came out as `result`.
     fn verdict(from: &str, result: DmarcVerdict, policy: Option<Policy>) -> Auth {
         Auth {
             spf_mail: Spf::Fail,
@@ -1785,14 +1309,6 @@ mod tests {
         }
     }
 
-    /// The central rule, and the laundering it stops. After SRS every message
-    /// mxhop forwards passes SPF at the destination, so a forged
-    /// `From: paypal.test` is handed to Gmail with a clean envelope and our
-    /// address on it. Gmail refuses it and counts the refusal against us; with
-    /// two destinations the lax one accepts, we answer 250, and Gmail's
-    /// refusal becomes a copy lost with no delivery report. The domain owner
-    /// asked every receiver to reject this message, and the only moment the
-    /// refusal is free is while the sending server still holds it.
     #[test]
     fn a_forged_from_of_a_reject_policy_domain_is_refused_550() {
         let reply = refusal(decided(&verdict(
@@ -1813,12 +1329,6 @@ mod tests {
         );
     }
 
-    /// The outage that bounces. A `_dmarc` lookup that did not come back is
-    /// not a failure and must not be answered 550 — a permanent refusal for a
-    /// resolver hiccup destroys mail nobody forged. It is not a pass either:
-    /// the answer that did not arrive could have said `p=reject`, which is
-    /// exactly the case this file exists for. 451 is the only honest code, and
-    /// a real sending server retries it.
     #[test]
     fn a_dmarc_answer_that_never_came_defers_rather_than_refusing_or_accepting() {
         let reply = refusal(decided(&verdict(
@@ -1838,31 +1348,6 @@ mod tests {
         );
     }
 
-    /// **The resolver stall that must not become a bounce.** This is the
-    /// mistake the old version of this test enforced: it required a 451 for a
-    /// `temperror` with no policy in hand, on the theory that an unknown `p`
-    /// could have been `reject`.
-    ///
-    /// `mail-auth` makes that theory expensive. Its DMARC tree walk aborts
-    /// the *whole* walk with a `TempError` on the first non-NXDOMAIN failure
-    /// at any level — including after it has already read the record at the
-    /// `From` domain — and throws the record away as it does
-    /// (`dmarc/verify.rs`). So "no policy in hand" is not only a lame
-    /// `_dmarc` delegation at the sender: it is also a REFUSED answer, a
-    /// flaky authoritative server or a DNSSEC-bogus zone anywhere in the
-    /// `_dmarc` ancestry of an ordinary `p=none` domain. And
-    /// `Auth::timed_out` reports exactly this shape, so our own expired DNS
-    /// budget landed here too — reachable through one dead `include:` in a
-    /// sender's SPF record.
-    ///
-    /// A retry gets the same answer, so a 451 here is a bounce after the
-    /// sender's retry window, with nothing in the journal but `451` and the
-    /// correspondent left to report it. What the narrow rule gives up is a
-    /// forgery of a `p=reject` domain getting through only while *that
-    /// domain's own* `_dmarc` is unanswerable — which the forger does not
-    /// control — and the destination then evaluates DMARC with its own
-    /// resolver anyway. Accept and stamp is what OpenDMARC, rspamd and Gmail
-    /// all do.
     #[test]
     fn a_temperror_with_no_policy_in_hand_is_forwarded_with_temperror_in_the_header() {
         let auth = verdict("lame.test", DmarcVerdict::TempError, None);
@@ -1882,9 +1367,6 @@ mod tests {
         );
     }
 
-    /// NXDOMAIN on `_dmarc` is an answer: this domain publishes no policy, so
-    /// there is nothing to enforce and the message is ordinary mail. Confusing
-    /// it with a temporary error defers most of the mail on the internet.
     #[test]
     fn a_domain_with_no_dmarc_record_is_forwarded() {
         let decision = decided(&verdict("elsewhere.test", DmarcVerdict::None, None));
@@ -1895,9 +1377,6 @@ mod tests {
         );
     }
 
-    /// RFC 7489 §6.6.3: a record that cannot be parsed is treated as if there
-    /// were none. Refusing on a permanent error would punish a domain for a
-    /// typo in its own DNS, and the destination recomputes all of this anyway.
     #[test]
     fn a_dmarc_record_that_cannot_be_read_is_forwarded() {
         let decision = decided(&verdict(
@@ -1909,10 +1388,6 @@ mod tests {
         assert!(matches!(decision, Decision::Deliver(_)), "{decision:?}");
     }
 
-    /// `p=quarantine` is a request to treat the message as suspicious, not to
-    /// refuse it. mxhop has no spam folder and the destination does, so the
-    /// copy goes on with the policy written into the header. Refusing here
-    /// would destroy mail the domain owner did not ask anyone to destroy.
     #[test]
     fn a_quarantine_failure_is_forwarded_rather_than_refused() {
         let auth = verdict("shop.test", DmarcVerdict::Fail, Some(Policy::Quarantine));
@@ -1927,9 +1402,6 @@ mod tests {
         );
     }
 
-    /// Monitoring only. A `p=none` domain has asked to be told about failures,
-    /// not to have them stopped — and this is the commonest DMARC record there
-    /// is, so refusing on it would refuse an enormous amount of real mail.
     #[test]
     fn a_failure_under_p_none_is_forwarded() {
         let decision = decided(&verdict(
@@ -1941,12 +1413,6 @@ mod tests {
         assert!(matches!(decision, Decision::Deliver(_)), "{decision:?}");
     }
 
-    /// What mail forwarded by somebody else looks like: SPF hard-fails,
-    /// because the message is being relayed by a host its domain never
-    /// authorised, and an aligned DKIM signature still passes — which is a
-    /// DMARC pass. Refusing on the SPF failure alone would refuse every
-    /// message another forwarder sends us, which is why nothing is decided at
-    /// MAIL FROM and SPF alone decides nothing here either.
     #[test]
     fn an_spf_hardfail_with_an_aligned_dkim_pass_is_forwarded() {
         let auth = Auth {
@@ -1966,8 +1432,6 @@ mod tests {
         );
     }
 
-    /// `~all` means "do not reject" in the words of the domain that published
-    /// it. With no DMARC record on top of it there is nothing to enforce.
     #[test]
     fn an_spf_softfail_on_its_own_is_forwarded() {
         let auth = Auth {
@@ -1978,10 +1442,6 @@ mod tests {
         assert!(matches!(decided(&auth), Decision::Deliver(_)));
     }
 
-    /// `-all` is wrong often enough — every mailing list and every forwarder
-    /// trips it — that refusing on it alone would lose the owner's mail, which
-    /// is the worse of the two errors. The header records it and the message
-    /// goes on.
     #[test]
     fn an_spf_hardfail_with_no_dmarc_record_is_forwarded_and_recorded() {
         let auth = Auth {
@@ -1997,18 +1457,6 @@ mod tests {
         );
     }
 
-    /// The two messages that reach this table looking identical, and must
-    /// not leave it that way.
-    ///
-    /// Both fail DMARC under `p=reject` with an empty list of signatures.
-    /// One was never signed, and the owner of the forged domain asked for
-    /// exactly that to be rejected. The other was signed, and the only
-    /// reason its signature is not here is that mxhop's own lookup of the
-    /// key did not come back inside the DKIM stage's budget — so a `550`
-    /// would be a permanent refusal issued over a question nobody finished
-    /// asking. `Auth::dkim_timed_out` is the only thing that tells them
-    /// apart by the time the decision is made, which is why it is carried on
-    /// the verdict rather than inferred here.
     #[test]
     fn an_unchecked_signature_is_deferred_where_a_missing_one_is_refused() {
         let unsigned = verdict("paypal.test", DmarcVerdict::Fail, Some(Policy::Reject));
@@ -2027,14 +1475,9 @@ mod tests {
             "a retry can fetch the key; a bounce cannot be taken back"
         );
 
-        // Still a refusal, though. The attacker who hangs his own key lookup
-        // to earn the softer code has bought a deferral, not delivery.
         assert!(matches!(decided(&stalled), Decision::Refuse(_)));
     }
 
-    /// A temporary error where the policy is known not to be `reject` could
-    /// not have led to a refusal whatever it turned into, so deferring would
-    /// hold up mail for no possible gain.
     #[test]
     fn a_temperror_under_p_none_is_forwarded() {
         let decision = decided(&verdict(
@@ -2046,10 +1489,6 @@ mod tests {
         assert!(matches!(decision, Decision::Deliver(_)), "{decision:?}");
     }
 
-    /// The switch has to do both halves of its job: forward what enforcement
-    /// would have refused, and still tell the truth about it. A switch that
-    /// also silenced the header would leave an operator evaluating
-    /// enforcement with nothing to evaluate.
     #[test]
     fn enforce_off_forwards_a_reject_failure_and_the_header_still_says_fail() {
         let auth = verdict("paypal.test", DmarcVerdict::Fail, Some(Policy::Reject));
@@ -2072,9 +1511,6 @@ mod tests {
         );
     }
 
-    /// A check that was never run cannot have found a failure. `not_checked`
-    /// is all defaults, and a table that read a default as a verdict would
-    /// refuse on the strength of a lookup nobody made.
     #[test]
     fn a_verdict_that_was_never_checked_refuses_nothing() {
         let decision = decided(&Auth::not_checked());
@@ -2082,11 +1518,6 @@ mod tests {
         assert!(matches!(decision, Decision::Deliver(_)), "{decision:?}");
     }
 
-    /// Two different `From` domains have no single DMARC identity, so there is
-    /// nothing to align against and nothing to enforce. The destination
-    /// recomputes all of it, and RFC 7489 §6.6.1 would prefer a refusal —
-    /// which is noted, and not taken: refusing a shape of message that is
-    /// merely unusual is how a forwarder loses mail it should have passed on.
     #[test]
     fn a_message_with_two_from_domains_is_forwarded_as_a_permerror() {
         let decision = decided(&verdict("", DmarcVerdict::PermError, None));

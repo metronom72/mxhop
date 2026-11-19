@@ -1,10 +1,6 @@
-//! The alias table, and the lookup the SMTP session performs for every
-//! recipient.
-
 use std::collections::BTreeMap;
 use std::fmt;
 
-/// An address mail can be handed to: a local part and a domain.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Mailbox {
     local: String,
@@ -12,17 +8,10 @@ pub struct Mailbox {
 }
 
 impl Mailbox {
-    /// Parses `local@domain`.
-    ///
-    /// Deliberately narrower than RFC 5321: no quoted local parts, no address
-    /// literals, no source routes. They exist, but not in anyone's alias
-    /// table, and refusing them here keeps the surface honest.
     pub fn parse(s: &str) -> Result<Self, MailboxError> {
         if s.chars().any(|c| c.is_whitespace() || c.is_control()) {
             return Err(MailboxError::IllegalCharacter);
         }
-        // RFC 5321 reads the separator from the right: the local part may hold
-        // an `@`, the domain may not.
         let (local, domain) = s.rsplit_once('@').ok_or(MailboxError::NoAt)?;
         if local.is_empty() {
             return Err(MailboxError::EmptyLocal);
@@ -39,13 +28,10 @@ impl Mailbox {
         })
     }
 
-    /// The local part, with its case preserved — the destination mailbox is
-    /// entitled to care about it.
     pub fn local(&self) -> &str {
         &self.local
     }
 
-    /// The domain, always lowercase.
     pub fn domain(&self) -> &str {
         &self.domain
     }
@@ -79,12 +65,6 @@ impl fmt::Display for MailboxError {
     }
 }
 
-/// Whether a name can be looked up in DNS as written: at least two labels,
-/// none of them empty, nothing in them that cannot be in a host name.
-///
-/// A bare `localhost` fails, which is the point — both the HELO name mxhop
-/// announces and every destination domain have to be resolvable from the
-/// outside, or the MX lookup is meaningless.
 pub fn is_qualified(name: &str) -> bool {
     if name.is_empty() || name.len() > 253 {
         return false;
@@ -102,29 +82,23 @@ pub fn is_qualified(name: &str) -> bool {
         })
 }
 
-/// What to do with mail for one local part.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Route {
-    /// Hand the message to these mailboxes.
     Forward(Vec<Mailbox>),
-    /// Refuse it during the SMTP session, with this reply.
     Reject(String),
 }
 
-/// The alias table of a single domain.
 #[derive(Debug, Clone, Default)]
 struct DomainRoutes {
     exact: BTreeMap<String, Route>,
     catch_all: Option<Route>,
 }
 
-/// Every domain mxhop accepts mail for.
 #[derive(Debug, Clone, Default)]
 pub struct Router {
     domains: BTreeMap<String, DomainRoutes>,
 }
 
-/// The local part that stands for "everything else in this domain".
 pub const CATCH_ALL: &str = "*";
 
 impl Router {
@@ -137,16 +111,10 @@ impl Router {
         }
     }
 
-    /// Looks up one recipient. `None` means mxhop does not handle it, and the
-    /// session has to answer 550.
     pub fn route(&self, domain: &str, local: &str) -> Option<&Route> {
         self.resolve(domain, local).map(|(_, route)| route)
     }
 
-    /// Like [`Router::route`], and also says *which* alias answered — the
-    /// local part itself, or [`CATCH_ALL`]. The session logs it, and the
-    /// configuration check needs it to tell a catch-all loop from an ordinary
-    /// hop.
     pub fn resolve(&self, domain: &str, local: &str) -> Option<(&str, &Route)> {
         let domain = self.domains.get(&domain.to_ascii_lowercase())?;
         if let Some((name, route)) = domain.exact.get_key_value(&local.to_ascii_lowercase()) {

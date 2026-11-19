@@ -1,19 +1,8 @@
-//! Logging. One decision only: what gets logged and what never does.
-//!
-//! mxhop logs the envelope (sender, recipients), sizes, `Message-ID`,
-//! authentication verdicts, queue ids and the destination's reply. It does not
-//! log the subject, the body, or any other header — forwarding someone's mail
-//! does not entitle you to read it, and a log file is the easiest place for
-//! that line to be crossed by accident.
-
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt;
 
-/// What to log when nothing says otherwise.
 pub const DEFAULT_FILTER: &str = "info";
 
-/// Builds the filter, falling back to [`DEFAULT_FILTER`] when the spec is
-/// nonsense. A mistyped log level must not keep mail from flowing.
 pub fn filter(spec: Option<&str>) -> EnvFilter {
     match spec {
         Some(spec) => EnvFilter::try_new(spec).unwrap_or_else(|_| {
@@ -24,8 +13,6 @@ pub fn filter(spec: Option<&str>) -> EnvFilter {
     }
 }
 
-/// Installs the subscriber. `json` is for a log collector; the human form is
-/// the default because the first reader is usually a person with a terminal.
 pub fn init(spec: Option<&str>, json: bool) {
     let filter = filter(spec);
     if json {

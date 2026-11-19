@@ -17,21 +17,17 @@ use mxhop::srs::{self, Srs};
 use mxhop::telemetry;
 use mxhop::tls::Holder;
 
-/// Where the file lives when nobody says otherwise.
 const DEFAULT_CONFIG: &str = "/etc/mxhop/mxhop.toml";
 
 #[derive(Debug, Parser)]
 #[command(name = "mxhop", version, about = "A headless SMTP forwarder", long_about = None)]
 struct Cli {
-    /// Path to the configuration file.
     #[arg(long, short, global = true, env = "MXHOP_CONFIG", default_value = DEFAULT_CONFIG)]
     config: PathBuf,
 
-    /// Log filter, in the `tracing` form: `info`, `mxhop::spool=debug`, …
     #[arg(long, global = true, env = "MXHOP_LOG")]
     log: Option<String>,
 
-    /// Log as JSON lines instead of for a human reader.
     #[arg(long, global = true, env = "MXHOP_LOG_JSON")]
     log_json: bool,
 
@@ -41,27 +37,12 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Check the configuration and say what is wrong with it, without
-    /// starting anything. Exits non-zero if anything is wrong, so CI can run
-    /// it.
     Check,
-    /// Accept mail.
     Run,
-    /// Hand one message to a real address and print what the destination
-    /// said, word for word.
-    ///
-    /// Hidden because it is not part of running a forwarder: it exists so
-    /// that a deployment can be verified from the host it runs on, where the
-    /// things that go wrong are reverse DNS, the outbound port and the
-    /// destination's opinion of us — none of which a unit test can reach.
     #[command(hide = true)]
     SendTest {
-        /// The address to deliver to.
         to: String,
-        /// The body, as one line.
         body: String,
-        /// The envelope sender. Defaults to postmaster at the configured
-        /// hostname, which is the address a bounce should come back to.
         #[arg(long)]
         from: Option<String>,
     },
@@ -78,8 +59,6 @@ async fn main() -> ExitCode {
     }
 }
 
-/// Loads the configuration, printing every problem the way an editor can
-/// follow.
 fn load(cli: &Cli) -> Option<Config> {
     let shown = cli.config.display();
     match config::load_file(&cli.config) {
@@ -101,9 +80,6 @@ fn check(cli: &Cli) -> ExitCode {
         return ExitCode::FAILURE;
     };
 
-    // `check` answers "would `run` start?", and `run` refuses to start on a
-    // certificate it cannot read — so the files are read here too, not just
-    // their paths inspected.
     let tls = match open_tls(&config) {
         Ok(tls) => tls,
         Err(problem) => {
@@ -112,10 +88,6 @@ fn check(cli: &Cli) -> ExitCode {
         }
     };
 
-    // The same reason the certificate is read here: `run` refuses to start
-    // without a signing key, and a `check` that only looked at the path would
-    // pass a configuration whose every forwarded message then goes out with
-    // the original sender and fails SPF at the destination.
     let srs = match open_srs(&config) {
         Ok(srs) => srs,
         Err(problem) => {
@@ -124,21 +96,11 @@ fn check(cli: &Cli) -> ExitCode {
         }
     };
 
-    // A key anyone on the box can read is a key anyone on the box can forge
-    // with, and forging one is the whole of being an open relay. `check` is
-    // the only moment an operator looks at this file, so it is where the mode
-    // gets mentioned — a warning rather than a refusal, because a group-
-    // readable key is a real risk on a shared host and none at all on a
-    // single-purpose VPS, and `check` refusing to pass over it would teach
-    // people to stop running `check`.
     if let Some(settings) = config.srs.as_ref() {
         warn_about_secret_mode(&settings.secret_file);
     }
 
     let domains: Vec<&str> = config.router.domains().collect();
-    // What happens to a message a destination defers. Printed because the end
-    // of it — mxhop giving up — is the one outcome nobody is told about, so an
-    // operator should at least know when that is.
     let retries = format!(
         ", a deferred message retried after {} minutes and then every {}, given up on \
          after {} hours",
@@ -149,8 +111,6 @@ fn check(cli: &Cli) -> ExitCode {
             .map(|w| (w.as_secs() / 60).to_string())
             .collect::<Vec<_>>()
             .join(", "),
-        // The last interval is the one that repeats, so it is the one this
-        // sentence ends on.
         match config.queue.retries.last().map_or(0, |w| w.as_secs() / 60) {
             60 => "hour".to_string(),
             minutes if minutes % 60 == 0 => format!("{} hours", minutes / 60),
@@ -167,10 +127,6 @@ fn check(cli: &Cli) -> ExitCode {
         plural(config.router.alias_count(), "alias", "aliases"),
         domains.join(", "),
         match &srs {
-            // The key count, because rotation is the operation that goes
-            // wrong quietly: a file whose old key was dropped verifies
-            // nothing that is already in flight, and the only moment an
-            // operator can notice is before the restart.
             Some(srs) => format!(
                 ", SRS at {} ({} {}, {} day window)",
                 srs.domain(),
@@ -183,10 +139,6 @@ fn check(cli: &Cli) -> ExitCode {
                 .to_string(),
         },
         match &tls {
-            // The user is part of the answer: the files were read with this
-            // user's permissions, and `run` will read them with the service
-            // user's. Printing it is what lets an operator notice that the
-            // two are not the same before mail is involved.
             Some(holder) => format!(
                 ", STARTTLS with {} (read as {})",
                 holder.paths().certificate.display(),
@@ -194,10 +146,6 @@ fn check(cli: &Cli) -> ExitCode {
             ),
             None => ", no TLS".to_string(),
         },
-        // Whether arriving mail is authenticated, and whether a failure can
-        // cost a message. Printed because it is the one setting in this file
-        // that can refuse somebody else's mail, and an operator who has
-        // turned it off should not have to open the file to find that out.
         match (config.auth.enabled, config.auth.enforce) {
             (false, _) => ", no SPF/DKIM/DMARC check at all".to_string(),
             (true, mxhop::policy::Enforce::Dmarc) =>
@@ -210,8 +158,6 @@ fn check(cli: &Cli) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Reads the certificate, if one is configured, and turns a file problem into
-/// a [`Problem`] at the line of the `[tls]` table.
 fn open_tls(config: &Config) -> Result<Option<Arc<Holder>>, Problem> {
     let Some(paths) = config.tls.clone() else {
         return Ok(None);
@@ -223,19 +169,12 @@ fn open_tls(config: &Config) -> Result<Option<Arc<Holder>>, Problem> {
     })
 }
 
-/// Says so on stderr when the signing key is readable by anyone but its
-/// owner.
-///
-/// Printed rather than returned as a `Problem`, because it is not one: the
-/// configuration is valid and `run` will start. It goes to stderr so that the
-/// `ok` line on stdout stays the one machine-readable thing `check` prints.
 fn warn_about_secret_mode(path: &std::path::Path) {
     let _ = path;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let Ok(mode) = std::fs::metadata(path).map(|m| m.permissions().mode()) else {
-            // Unreadable is already `open_srs`'s problem, and it has said so.
             return;
         };
         let extra = mode & 0o077;
@@ -257,8 +196,6 @@ fn warn_about_secret_mode(path: &std::path::Path) {
     }
 }
 
-/// Reads the SRS secret file, if one is configured, and turns a file problem
-/// into a [`Problem`] at the line of the `[srs]` table.
 fn open_srs(config: &Config) -> Result<Option<Srs>, Problem> {
     let Some(settings) = config.srs.as_ref() else {
         return Ok(None);
@@ -285,11 +222,6 @@ async fn run(cli: &Cli) -> ExitCode {
     };
     telemetry::init(cli.log.as_deref(), cli.log_json);
 
-    // A `[tls]` block whose files cannot be read stops the service. There is
-    // no previous certificate to fall back to, and starting plaintext-only
-    // would downgrade every sender silently for months — the outage that
-    // looks like silence. An MX that is down for a minute loses nothing:
-    // senders retry.
     let tls = match open_tls(&config) {
         Ok(tls) => tls,
         Err(problem) => {
@@ -309,20 +241,11 @@ async fn run(cli: &Cli) -> ExitCode {
     let listener = match TcpListener::bind(config.listen).await {
         Ok(listener) => listener,
         Err(e) => {
-            // The usual cause is port 25 without the capability to bind it.
             error!(address = %config.listen, "cannot listen: {e}");
             return ExitCode::FAILURE;
         }
     };
 
-    // The resolver and the outbound settings every session delivers with.
-    // Built once: a resolver per connection would mean a cache per
-    // connection, which is no cache at all.
-    // The authentication side's own resolver, when `[auth]` is enabled. It
-    // fails the start for the same reason a missing SRS key does: running on
-    // with the check silently absent is the outage that looks like silence,
-    // and an MX that is down for a minute loses nothing because senders
-    // retry.
     let verifier = if config.auth.enabled {
         match mxhop::auth::Verifier::from_system(&config.hostname) {
             Ok(verifier) => Some(verifier),
@@ -342,17 +265,11 @@ async fn run(cli: &Cli) -> ExitCode {
             verifier,
         )),
         Err(e) => {
-            // Without DNS nothing can be delivered, and accepting mail we
-            // cannot hand on would mean answering 250 and dropping it.
             error!("cannot build a DNS resolver: {e}");
             return ExitCode::FAILURE;
         }
     };
 
-    // Without a signing key the service does not start: the alternative is
-    // forwarding every message with the original envelope sender, which is
-    // the failing SPF check this table exists to fix — silently, for as long
-    // as nobody reads a destination's headers.
     let srs = match open_srs(&config) {
         Ok(srs) => srs.map(Arc::new),
         Err(problem) => {
@@ -364,9 +281,6 @@ async fn run(cli: &Cli) -> ExitCode {
     let session_config = Arc::new(SessionConfig::from_config(&config));
     let router = Arc::new(config.router.clone());
     let queued = spool.queued().await.map(|q| q.len()).unwrap_or(0);
-    // The address the listener actually got, not the one that was asked for:
-    // with port 0 they differ, and the honest one is the one a client can
-    // connect to.
     let address = listener
         .local_addr()
         .map_or_else(|_| config.listen.to_string(), |a| a.to_string());
@@ -394,10 +308,6 @@ async fn run(cli: &Cli) -> ExitCode {
         spawn_reload_on_hangup_without_tls();
     }
 
-    // The queue runner, beside the accept loop rather than inside it: a
-    // message is retried because it is on disk, not because another one
-    // arrives, and a host whose mail has stopped coming in is exactly when
-    // the queue has to keep draining.
     tokio::spawn(
         mxhop::queue::Runner::new(
             Arc::clone(&spool),
@@ -412,10 +322,6 @@ async fn run(cli: &Cli) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Rereads the certificate on every SIGHUP. Shaped as one call so that the
-/// alias table can join it later: that needs the `Router` behind its own
-/// `ArcSwap` and a policy for a changed `listen` or `spool_dir` mid-run,
-/// which is a task of its own.
 fn spawn_reload_on_hangup(holder: Arc<Holder>) {
     let Some(mut hangups) = hangups() else {
         return;
@@ -428,9 +334,6 @@ fn spawn_reload_on_hangup(holder: Arc<Holder>) {
                     sha256 = %fingerprint,
                     "TLS certificate reloaded; new connections use it"
                 ),
-                // The running service keeps serving: `reload` never stores a
-                // half-built configuration, and a renewal caught mid-write is
-                // a file that will be whole in a second.
                 Err(e) => warn!("TLS reload failed: {e}; keeping the certificate loaded before"),
             }
         }
@@ -452,19 +355,12 @@ fn hangups() -> Option<tokio::signal::unix::Signal> {
     match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
         Ok(signal) => Some(signal),
         Err(e) => {
-            // Without the handler the default action for SIGHUP would kill the
-            // process, so this is worth saying out loud rather than ignoring.
             warn!("cannot listen for SIGHUP, so the certificate cannot be reloaded: {e}");
             None
         }
     }
 }
 
-/// Delivers one message and prints the whole exchange's result.
-///
-/// Everything is printed rather than logged, and the destination's reply is
-/// printed exactly as it came back: when this is run over ssh to find out why
-/// mail is not arriving, a paraphrase is worse than nothing.
 async fn send_test(cli: &Cli, to: &str, body: &str, from: Option<&str>) -> ExitCode {
     let Some(config) = load(cli) else {
         return ExitCode::FAILURE;
@@ -483,10 +379,6 @@ async fn send_test(cli: &Cli, to: &str, body: &str, from: Option<&str>) -> ExitC
         .map(ToString::to_string)
         .unwrap_or_else(|| format!("postmaster@{}", config.hostname));
 
-    // Enough of a message to arrive in a mailbox and be recognisable there.
-    // There is deliberately no Date: header — the headers mxhop adds to a
-    // forwarded message are a separate piece of work, and inventing one here
-    // would be a second implementation of it.
     let head = format!(
         "From: <{sender}>\r\n\
          To: <{mailbox}>\r\n\

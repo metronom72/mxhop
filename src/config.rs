@@ -1,10 +1,3 @@
-//! The configuration file, and every check that can be made on it before the
-//! service starts listening.
-//!
-//! A typo in a mail forwarder's configuration is an outage that looks like
-//! silence, so `mxhop check` reports *every* problem it can find, each with
-//! the line it is on, rather than stopping at the first.
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
@@ -21,12 +14,8 @@ use crate::policy::Enforce;
 use crate::queue::Schedule;
 use crate::routing::{CATCH_ALL, Mailbox, Route, Router, is_qualified};
 
-/// Gmail's ceiling, and a sane default: a forwarder that accepts more than the
-/// destination will take responsibility for mail it cannot hand over.
 pub const DEFAULT_MAX_MESSAGE_BYTES: u64 = 25 * 1024 * 1024;
 
-/// The configuration as the service uses it: parsed, checked, and with the
-/// alias table turned into a [`Router`].
 #[derive(Debug, Clone)]
 pub struct Config {
     pub hostname: String,
@@ -35,41 +24,19 @@ pub struct Config {
     pub max_message_bytes: u64,
     pub outbound: Outbound,
     pub router: Router,
-    /// Where the certificate lives, when one is configured at all. Absent
-    /// means plaintext only, which is a supported way to run an MX.
     pub tls: Option<TlsPaths>,
-    /// The SRS domain and its secret file, when sender rewriting is
-    /// configured. Absent means forwarded mail keeps the original envelope
-    /// sender — which is how mail arrives at Gmail with a failing SPF check,
-    /// so this is a table an operator wants, not an optional nicety.
     pub srs: Option<SrsSettings>,
-    /// When the queue runner tries a held message again, and how long it
-    /// keeps trying. The `[queue]` table, or [`Schedule::default`] when the
-    /// file leaves it out.
     pub queue: Schedule,
-    /// Whether inbound mail is authenticated, and what a failure is worth.
-    /// Not an `Option`: an absent `[auth]` table is the default, which is on.
     pub auth: AuthSettings,
 }
 
-/// The `[auth]` table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthSettings {
-    /// `false` means no lookups, no header and no refusals at all.
     pub enabled: bool,
     pub enforce: Enforce,
 }
 
 impl Default for AuthSettings {
-    /// On, enforcing DMARC. The argument for that default is in
-    /// [`crate::policy::Limits::default`] and in `crate::auth`'s own
-    /// documentation: it refuses only mail whose own domain asked every
-    /// receiver to refuse it, defers only where a missing answer could have
-    /// been that refusal, and forwards everything else — including every
-    /// `p=none` and `p=quarantine` failure, which is most of what fails.
-    /// Nothing it does is silent: each refusal names the domain and the
-    /// policy, in a sentence the sending server reads while it still holds
-    /// the message.
     fn default() -> Self {
         Self {
             enabled: true,
@@ -78,25 +45,14 @@ impl Default for AuthSettings {
     }
 }
 
-/// The `[srs]` table as the file states it, with the secret still on disk.
-///
-/// The secret is never in the TOML and never in git: this carries the path,
-/// and [`crate::srs::Srs::keys_from`] reads it where the filesystem is
-/// allowed — the same division the `[tls]` paths follow, so that `load_str`
-/// stays a pure function of the file's text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SrsSettings {
     pub domain: String,
     pub secret_file: PathBuf,
     pub max_age_days: u32,
-    /// The line of the `[srs]` table, so a problem found when the secret file
-    /// is *read* can still be reported where the operator typed it.
     pub line: Option<usize>,
 }
 
-/// The two PEM files, and the line of the `[tls]` table so that a problem
-/// found when they are *read* — which happens outside `load_str` — can still
-/// be reported where the operator typed it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TlsPaths {
     pub certificate: PathBuf,
@@ -104,17 +60,11 @@ pub struct TlsPaths {
     pub line: Option<usize>,
 }
 
-/// How mxhop hands mail on. Everything here has a default that is safe to
-/// leave alone, which is why the whole table is optional.
 #[derive(Debug, Clone, Default)]
 pub struct Outbound {
-    /// Whether to deliver over IPv6 to a host that also has an A record.
-    /// Off by default: receivers check the sender's reverse DNS, and a
-    /// VPS's IPv6 PTR record is the one nobody sets up.
     pub ipv6: bool,
 }
 
-/// One thing wrong with the file, and where.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Problem {
     pub line: Option<usize>,
@@ -130,7 +80,6 @@ impl fmt::Display for Problem {
     }
 }
 
-/// Reads and checks a configuration file.
 pub fn load_file(path: &Path) -> Result<Config, Vec<Problem>> {
     match fs::read_to_string(path) {
         Ok(src) => load_str(&src),
@@ -141,13 +90,9 @@ pub fn load_file(path: &Path) -> Result<Config, Vec<Problem>> {
     }
 }
 
-/// Checks configuration already in memory. Every caller goes through here, so
-/// the tests exercise exactly what the service does.
 pub fn load_str(src: &str) -> Result<Config, Vec<Problem>> {
     let raw: Raw = match toml::from_str(src) {
         Ok(raw) => raw,
-        // A file TOML itself cannot read has one problem worth reporting: that
-        // one. Everything after it is guesswork.
         Err(e) => return Err(vec![from_toml(src, &e)]),
     };
 
@@ -264,16 +209,6 @@ pub fn load_str(src: &str) -> Result<Config, Vec<Problem>> {
                 ));
                 crate::srs::DEFAULT_MAX_AGE_DAYS
             }
-            // The other end of the range, and the one that fails silently.
-            // The day an address carries is two base32 characters, so ages
-            // are compared modulo 1024: a window of 1022 or more is older
-            // than every address that exists, every forged address verifies
-            // as in date, and the configuration looks like it tightened
-            // expiry rather than switching it off. The ceiling is a year
-            // rather than 1021, because a replay window measured in years is
-            // wrong whether or not it wraps — and the reason is stated, so
-            // that an operator who typed 1095 learns which of the two
-            // problems they have.
             Some(v) if *v.get_ref() > crate::srs::MAX_AGE_DAYS_CEILING => {
                 problems.push(at(
                     src,
@@ -293,11 +228,6 @@ pub fn load_str(src: &str) -> Result<Config, Vec<Problem>> {
             }
             Some(v) => *v.get_ref(),
         };
-        // Our own alias lookup would shadow the bounce path: `RCPT TO` at a
-        // domain in `[domains]` is resolved against the alias table, and the
-        // signed address would be looked up as an alias name, refused as "no
-        // such address here" — or, with a catch-all, forwarded to a human
-        // instead of to the person the bounce is for.
         if raw
             .domains
             .keys()
@@ -323,10 +253,6 @@ pub fn load_str(src: &str) -> Result<Config, Vec<Problem>> {
         }
     });
 
-    // The `[queue]` table. Every number has a floor of one, and the floor is
-    // worth checking rather than clamping: zero means something different for
-    // each of them, and all three meanings are a queue that quietly stops
-    // being one.
     let queue = match &raw.queue {
         None => Schedule::default(),
         Some(table) => {
@@ -457,12 +383,6 @@ pub fn load_str(src: &str) -> Result<Config, Vec<Problem>> {
         }
     };
 
-    // The two windows have to fit inside one another. A destination that
-    // refuses a forwarded message bounces to the rewritten sender, and that
-    // address only decodes for `srs.max_age_days`: a last attempt made after
-    // it has expired provokes a report that comes back to an address mxhop
-    // answers "not ours", so the one person who could act on it — the
-    // original sender's postmaster — never hears anything at all.
     if let Some(srs) = &srs {
         let lifetime_hours = queue.lifetime.as_secs() / 3_600;
         let window_hours = u64::from(srs.max_age_days) * 24;
@@ -478,8 +398,6 @@ pub fn load_str(src: &str) -> Result<Config, Vec<Problem>> {
             problems.push(
                 match raw.queue.as_ref().and_then(|q| q.lifetime_hours.as_ref()) {
                     Some(v) => at(src, v.span(), message),
-                    // Neither number was stated, or only the srs one was: the
-                    // line that can be pointed at is the table.
                     None => Problem {
                         line: line_of_text(src, "[srs]"),
                         message,
@@ -497,9 +415,6 @@ pub fn load_str(src: &str) -> Result<Config, Vec<Problem>> {
                 Some(word) => match word.get_ref().as_str() {
                     "dmarc" => Enforce::Dmarc,
                     "off" => Enforce::Off,
-                    // Both words named, because the one an operator typed is
-                    // not one of them and guessing which they meant is how a
-                    // typo turns enforcement off without saying so.
                     other => {
                         problems.push(at(
                             src,
@@ -516,12 +431,6 @@ pub fn load_str(src: &str) -> Result<Config, Vec<Problem>> {
                 },
             };
             let enabled = table.enabled.as_ref().is_none_or(|v| *v.get_ref());
-            // The combination that reads as a setting and is not one.
-            // `enabled = false` makes no lookups at all, so there is no
-            // result for `enforce` to act on: an operator who wrote both has
-            // either switched the check off while believing they configured
-            // it, or meant `enforce = "off"` and switched off the header they
-            // wanted to read. Neither is worth guessing between.
             if let Some(word) = table.enforce.as_ref().filter(|_| !enabled) {
                 problems.push(at(
                     src,
@@ -545,8 +454,6 @@ pub fn load_str(src: &str) -> Result<Config, Vec<Problem>> {
     }
 
     let mut router = Router::default();
-    // Where each alias entry sits, so a loop can be reported at its line, and
-    // every local destination, to be checked once the table is whole.
     let mut entry_lines: BTreeMap<(String, String), usize> = BTreeMap::new();
     let mut destinations: Vec<(usize, Mailbox)> = Vec::new();
 
@@ -642,8 +549,6 @@ pub fn load_str(src: &str) -> Result<Config, Vec<Problem>> {
         }
     }
 
-    // A destination inside one of our own domains has to land on a real alias,
-    // or the hop ends in our own 550.
     for (line, mailbox) in &destinations {
         if router.handles_domain(mailbox.domain())
             && router.resolve(mailbox.domain(), mailbox.local()).is_none()
@@ -658,7 +563,6 @@ pub fn load_str(src: &str) -> Result<Config, Vec<Problem>> {
         }
     }
 
-    // Loops. Reported once per cycle, at the first entry that enters it.
     let mut already_in_a_loop: BTreeSet<(String, String)> = BTreeSet::new();
     for (entry, line) in &entry_lines {
         if already_in_a_loop.contains(entry) {
@@ -694,18 +598,11 @@ pub fn load_str(src: &str) -> Result<Config, Vec<Problem>> {
     })
 }
 
-// -------------------------------------------------------------- loop walking
-
 struct Found {
-    /// Every alias on the cycle, so the others are not reported again.
     nodes: Vec<(String, String)>,
-    /// The cycle as an operator reads it.
     chain: Vec<String>,
 }
 
-/// Follows an alias through the table, hop by hop, and reports the first cycle
-/// it walks into. Destinations outside our domains end the walk: once the mail
-/// leaves, it is not our loop any more.
 fn find_loop(router: &Router, domain: &str, local: &str) -> Option<Found> {
     fn go(
         router: &Router,
@@ -743,8 +640,6 @@ fn find_loop(router: &Router, domain: &str, local: &str) -> Option<Found> {
     go(router, domain, local, &mut Vec::new())
 }
 
-// -------------------------------------------------------------- small checks
-
 fn is_usable_local_part(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 64
@@ -759,8 +654,6 @@ fn begins_with_status_code(reply: &str) -> bool {
         && matches!(b[0], b'4' | b'5')
         && (b.len() == 3 || b[3] == b' ' || b[3] == b'-')
 }
-
-// ------------------------------------------------------------------- sources
 
 fn line_at(src: &str, offset: usize) -> usize {
     src.as_bytes()[..offset.min(src.len())]
@@ -777,10 +670,6 @@ fn at(src: &str, span: Range<usize>, message: String) -> Problem {
     }
 }
 
-/// Best effort for things TOML table keys cannot carry a span for — a domain
-/// header. Finds the first line mentioning the name; if the file is strange
-/// enough that this misses, the problem is still reported, just without a
-/// line.
 fn line_of_text(src: &str, needle: &str) -> Option<usize> {
     src.lines()
         .position(|line| line.contains(needle))
@@ -793,8 +682,6 @@ fn from_toml(src: &str, e: &toml::de::Error) -> Problem {
         message: e.message().to_string(),
     }
 }
-
-// ---------------------------------------------------------------- raw shapes
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -873,8 +760,6 @@ impl<'de> Deserialize<'de> for RawTarget {
             Reject { reject: String },
         }
 
-        // serde's own message for a failed untagged enum says only that
-        // nothing matched, which tells an operator nothing about what to type.
         match Shape::deserialize(d) {
             Ok(Shape::One(one)) => Ok(RawTarget::One(one)),
             Ok(Shape::Many(many)) => Ok(RawTarget::Many(many)),
@@ -900,7 +785,6 @@ spool_dir = "/var/lib/mxhop/spool"
 hi = "me@gmail.com"
 "#;
 
-    /// The line a fixture's marker is on, so the tests never hand-count.
     fn line_with(src: &str, needle: &str) -> usize {
         src.lines()
             .position(|l| l.contains(needle))
@@ -917,8 +801,6 @@ hi = "me@gmail.com"
             .collect()
     }
 
-    /// The line a problem is reported on, read back off its own message, so
-    /// a test can say "on the line the operator typed" without hand-counting.
     fn problem_line(problem: &str) -> usize {
         problem
             .strip_prefix("line ")
@@ -950,9 +832,6 @@ hi = "me@gmail.com"
 
     #[test]
     fn outbound_delivery_stays_on_ipv4_unless_the_file_says_otherwise() {
-        // Gmail answers an IPv6 sender whose PTR does not match with
-        // 550-5.7.25, so the safe setting is the one an operator gets by not
-        // mentioning it.
         assert!(!load_str(MINIMAL).expect("the minimal file").outbound.ipv6);
     }
 
@@ -969,8 +848,6 @@ hi = "me@gmail.com"
 
     #[test]
     fn a_misspelled_outbound_key_is_refused_rather_than_ignored() {
-        // A setting silently ignored because of a typo is the worst kind:
-        // the operator believes IPv6 is off, and it is.
         let src = format!("{MINIMAL}\n[outbound]\nipv_6 = true\n");
         assert!(
             only_problem(&src).contains("ipv_6"),
@@ -1375,8 +1252,6 @@ hi = "me-at-gmail.com"
         assert_eq!(found[0].line, None, "there is no line to point at");
     }
 
-    /// TLS is opportunistic: an MX that refused plaintext would lose mail, and
-    /// a configuration without a `[tls]` block has to stay a valid one.
     #[test]
     fn a_tls_block_is_optional() {
         let c = load_str(MINIMAL).expect("minimal configuration should load");
@@ -1400,9 +1275,6 @@ hi = "me-at-gmail.com"
         );
     }
 
-    /// A relative path works at startup and then breaks on the first SIGHUP,
-    /// because the reload reads it again from whatever directory systemd left
-    /// the service in.
     #[test]
     fn tls_paths_must_be_absolute() {
         let src = format!("{MINIMAL}\n[tls]\ncertificate = \"mx.crt\"\nkey = \"mx.key\"\n");
@@ -1443,10 +1315,6 @@ hi = "me-at-gmail.com"
         );
     }
 
-    /// If the SRS domain were also a forwarded domain, every `RCPT TO` at it
-    /// would hit the alias table first and the bounce path would never be
-    /// reached — so bounces would come back and be refused, or worse, land
-    /// silently in a catch-all.
     #[test]
     fn check_refuses_an_srs_domain_that_also_has_aliases() {
         let src = "
@@ -1485,9 +1353,6 @@ hi = \"me@gmail.com\"
 
     #[test]
     fn an_srs_expiry_window_of_zero_days_is_refused() {
-        // Zero would expire every address the moment the clock ticked past
-        // midnight, which looks like SRS working until the first bounce
-        // arrives on the second day.
         let src = format!("{MINIMAL}{SRS}max_age_days = 0\n");
         let p = only_problem(&src);
 
@@ -1496,11 +1361,6 @@ hi = \"me@gmail.com\"
 
     #[test]
     fn an_srs_expiry_window_longer_than_a_year_is_refused() {
-        // The day counter in an address is two base32 characters, so ages are
-        // taken modulo 1024. A window of 1022 or more therefore accepts every
-        // address mxhop has ever issued: expiry is off, and nothing says so.
-        // Refused well below the wrap, because a window measured in years is
-        // a replay window measured in years whether it wraps or not.
         let src = format!("{MINIMAL}{SRS}max_age_days = 1022\n");
         let p = only_problem(&src);
 
@@ -1530,12 +1390,6 @@ hi = \"me@gmail.com\"
         );
     }
 
-    // --------------------------------------------------------- the [auth] table
-
-    /// The default an operator gets by not thinking about it, which is the
-    /// one that matters most. On, enforcing DMARC — see
-    /// `AuthSettings::default` for why that is the safe default rather than
-    /// the bold one.
     #[test]
     fn an_absent_auth_table_means_the_check_is_on_and_enforcing() {
         let c = load_str(MINIMAL).expect("minimal configuration should load");
@@ -1558,10 +1412,6 @@ hi = \"me@gmail.com\"
         assert!(c.auth.enabled, "off is still evaluated and still stamped");
     }
 
-    /// A word that is neither is refused with both of them named. Guessing
-    /// which one was meant is how `enforce = "none"` — a plausible thing to
-    /// type — silently becomes either the strictest or the loosest setting
-    /// without the operator being told which.
     #[test]
     fn an_enforce_that_is_neither_word_is_refused_naming_both() {
         let src = format!("{MINIMAL}\n[auth]\nenforce = \"none\"\n");
@@ -1576,11 +1426,6 @@ hi = \"me@gmail.com\"
         );
     }
 
-    /// `enabled = false` makes no lookups, so there is no result for
-    /// `enforce` to act on. Accepting the pair silently would leave an
-    /// operator who wrote both believing they had configured enforcement when
-    /// they had switched the whole check off — or believing they would still
-    /// get the header, when `enabled = false` writes none.
     #[test]
     fn enforce_together_with_enabled_false_is_refused() {
         let src = format!("{MINIMAL}\n[auth]\nenabled = false\nenforce = \"dmarc\"\n");
@@ -1598,8 +1443,6 @@ hi = \"me@gmail.com\"
         assert!(!c.auth.enabled);
     }
 
-    /// `deny_unknown_fields` on every table in this file is what turns a
-    /// misspelled key into a refusal instead of a setting that does nothing.
     #[test]
     fn a_misspelled_auth_key_is_refused_rather_than_ignored() {
         let src = format!("{MINIMAL}\n[auth]\nenforced = \"off\"\n");
@@ -1609,8 +1452,6 @@ hi = \"me@gmail.com\"
             "a key nobody reads is a setting that silently does not apply"
         );
     }
-
-    // ------------------------------------------------------------ [queue]
 
     #[test]
     fn a_file_without_a_queue_table_gets_the_default_schedule() {
@@ -1651,9 +1492,6 @@ hi = \"me@gmail.com\"
         assert_eq!(c.queue.retries, Schedule::default().retries);
     }
 
-    /// A queue that never retries is a queue that accepts mail and sits on
-    /// it until the lifetime runs out, which is the one thing this table
-    /// must not be able to configure by accident.
     #[test]
     fn an_empty_retry_list_is_refused() {
         let src = format!("{MINIMAL}\n[queue]\nretry_minutes = []\n");
@@ -1723,11 +1561,6 @@ hi = \"me@gmail.com\"
         );
     }
 
-    /// The two windows have to nest. A message still being retried after the
-    /// SRS address it leaves with has expired provokes a bounce that comes
-    /// back to an address mxhop no longer recognises, so the report is lost —
-    /// and the sender's postmaster, the one person who could act, hears
-    /// nothing at all.
     #[test]
     fn a_lifetime_longer_than_the_srs_window_is_refused() {
         let src = format!("{MINIMAL}{SRS}max_age_days = 1\n[queue]\nlifetime_hours = 48\n");
@@ -1741,8 +1574,6 @@ hi = \"me@gmail.com\"
         assert_eq!(problem_line(&problem), line_with(&src, "lifetime_hours"));
     }
 
-    /// The default pair has to be one of the combinations that loads: two
-    /// days of attempts inside a seven-day SRS window.
     #[test]
     fn the_defaults_fit_inside_the_default_srs_window() {
         let src = format!("{MINIMAL}{SRS}");

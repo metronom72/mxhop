@@ -1,5 +1,3 @@
-//! The SMTP side of mxhop: what arrives on port 25, and what is said back.
-
 pub mod client;
 pub mod command;
 pub mod session;
