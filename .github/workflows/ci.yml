@@ -35,3 +35,14 @@ jobs:
           sudo apt-get install -y musl-tools
           rustup target add x86_64-unknown-linux-musl
           cargo build --release --target x86_64-unknown-linux-musl
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build the image
+        run: docker build -t mxhop:test .
+      - name: End to end against the image
+        run: ./deploy/image-test.sh
+        env:
+          IMAGE: mxhop:test

@@ -84,7 +84,8 @@ docker service logs -f mxhop_mxhop
 ```
 
 Then prove it from the node itself — a real delivery says more than the
-healthcheck, which only checks that the listener still answers with a banner:
+healthcheck, which checks the listener, the spool, the queue depth and the
+resolver but never sends anything:
 
 ```sh
 docker exec "$(docker ps -q -f name=mxhop_mxhop)" \
@@ -142,9 +143,10 @@ docker kill --signal=HUP "$(docker ps -q -f name=mxhop_mxhop)"
 ```
 
 A reload that cannot read the files logs a warning and keeps serving the
-certificate already loaded. That is also why the healthcheck does not run
-`mxhop check`: a probe that re-read the files would kill a task that is
-still serving perfectly valid TLS.
+certificate already loaded, and `/healthz` stays `200` throughout. That is
+deliberate: a probe that failed on a bad file would kill a task that is
+still serving perfectly valid TLS, turning a typo in a renewal hook into an
+outage.
 
 ## After a config change
 
@@ -161,3 +163,28 @@ docker service update --force mxhop_mxhop
 No systemd unit, and no `docker-compose.yml` for a non-Swarm host. Both are
 straightforward from the stack file; neither has been tried, so neither is
 shipped as if it had.
+
+## The files here
+
+| | |
+|---|---|
+| `mxhop.service` | systemd unit: `CAP_NET_BIND_SERVICE`, `ExecStartPre=mxhop check`, `ExecReload` for the certificate, and the hardening directives |
+| `mxhop.socket` | socket activation on port 25, so mxhop never needs the capability at all |
+| `compose.yml` | one node, read-only root, all capabilities dropped |
+| `mxhop.stack.yml` | Swarm, with the port published in `host` mode |
+| `image-test.sh` | the end-to-end test CI runs against the built image |
+
+`image-test.sh` runs locally too:
+
+```sh
+docker build -t mxhop:test .
+IMAGE=mxhop:test ./deploy/image-test.sh
+```
+
+It asserts the image has no shell, that a bad config exits non-zero rather
+than serving, that it runs as uid 10001, that `/healthz` and `/metrics`
+answer and that no address appears in the metrics, that a full SMTP
+conversation gets a banner, a relay refusal for a domain we do not serve, an
+acceptance for one we do, `DATA` and `QUIT`, that the session counter moved,
+and that `docker stop` finishes well inside the grace period with exit code
+zero.

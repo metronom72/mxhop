@@ -1,0 +1,13 @@
+[Unit]
+Description=mxhop SMTP socket
+Before=mxhop.service
+
+[Socket]
+ListenStream=0.0.0.0:25
+BindIPv6Only=both
+Accept=no
+NoDelay=true
+Backlog=256
+
+[Install]
+WantedBy=sockets.target
