@@ -1,6 +1,6 @@
 FROM rust:1.99-alpine3.22 AS builder
 
-RUN apk add --no-cache musl-dev build-base
+RUN apk add --no-cache musl-dev build-base ca-certificates
 
 WORKDIR /src
 COPY . .
@@ -19,6 +19,8 @@ COPY --from=builder /passwd.mxhop /etc/passwd
 COPY --from=builder /group.mxhop /etc/group
 COPY --from=builder --chown=10001:10001 /spool /var/lib/mxhop/spool
 COPY --from=builder /mxhop /mxhop
+
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 
 EXPOSE 2525
 
